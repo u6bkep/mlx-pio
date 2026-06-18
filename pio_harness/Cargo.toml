@@ -1,0 +1,13 @@
+[package]
+name = "pio_harness"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rp2350-emu = "0.2.5"
+
+[dev-dependencies]
+pio = "=0.3.0"
+
+[patch.crates-io]
+picoem-common = { path = "../vendor/picoem-common" }

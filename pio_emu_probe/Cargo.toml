@@ -1,0 +1,8 @@
+[package]
+name = "pio_emu_probe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pio = "=0.3.0"
+rp2350-emu = "0.2.5"
