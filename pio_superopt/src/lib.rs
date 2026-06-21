@@ -15,8 +15,12 @@
 //!     every value in the IR encodes to a legal instruction and reserved
 //!     bit patterns are unrepresentable.
 
+pub mod decode;
 pub mod encode;
 pub mod ir;
+pub mod program;
 
+pub use decode::{decode_insn, DecodeError};
 pub use encode::encode_insn;
 pub use ir::{Insn, Op, SideCfg};
+pub use program::{import_program, Config, PinMap, Program, ShiftCfg, ShiftDir};

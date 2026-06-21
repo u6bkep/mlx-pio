@@ -10,6 +10,14 @@ use crate::ir::*;
 /// Encode one instruction to its 16-bit machine word, given the
 /// side-set configuration that governs the delay/side-set split.
 pub fn encode_insn(insn: &Insn, side: &SideCfg) -> u16 {
+    // Decision ②: encoding is a faithful function of *already-legal* IR.
+    // Mutation operators are responsible for staying in range; a violation
+    // here is a bug, not something to silently mask.
+    debug_assert!(
+        insn.validate(side).is_ok(),
+        "encode_insn on illegal IR: {:?}",
+        insn.validate(side)
+    );
     let (opcode, operand) = encode_op(&insn.op);
     let field = pack_delay_sideset(insn.delay, insn.sideset, side);
     ((opcode as u16) << 13) | ((field as u16) << 8) | (operand as u16)
@@ -167,10 +175,14 @@ mod tests {
                 for &ss in &sidesets_for(&cfg) {
                     let insn = Insn { op: op.clone(), delay, sideset: ss };
                     let word = encode_insn(&insn, &cfg);
+                    // (a) the emulator decodes our encoding as intended,
                     let d = decode(word, pinctrl(cfg.count), execctrl(cfg.en));
                     assert_eq!(d.delay, delay, "delay {insn:?} cfg {cfg:?}");
                     assert_eq!(d.sideset, ss, "sideset {insn:?} cfg {cfg:?}");
                     assert_op(&d.op, &op, &insn, &cfg);
+                    // (b) our own decoder is the exact inverse of encode.
+                    let back = crate::decode::decode_insn(word, &cfg).unwrap();
+                    assert_eq!(back, insn, "ir round-trip {insn:?} cfg {cfg:?}");
                 }
             }
         }

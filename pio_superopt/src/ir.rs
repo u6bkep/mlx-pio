@@ -171,4 +171,138 @@ pub struct SideCfg {
 impl SideCfg {
     /// No side-set: the whole 5-bit field is delay.
     pub const NONE: SideCfg = SideCfg { count: 0, en: false };
+
+    /// Bits of the 5-bit field available for `delay` (0..=5).
+    pub fn delay_bits(self) -> u8 {
+        5 - self.count.min(5)
+    }
+    /// Inclusive max `delay` representable in this config.
+    pub fn max_delay(self) -> u8 {
+        (1u16 << self.delay_bits()) as u8 - 1
+    }
+    /// Number of side-set *value* bits (excluding the enable bit). `None`
+    /// if this config has no side-set at all (`count == 0`).
+    pub fn sideset_value_bits(self) -> Option<u8> {
+        match self.count.min(5) {
+            0 => None,
+            c if self.en => Some(c - 1),
+            c => Some(c),
+        }
+    }
+    /// Inclusive max side-set *value*, or `None` if `count == 0`.
+    pub fn max_sideset(self) -> Option<u8> {
+        self.sideset_value_bits().map(|b| (1u16 << b) as u8 - 1)
+    }
+}
+
+// ---- legal-code decoding: `u8` field value -> enum, `None` if reserved ----
+//
+// `as u8` is the encoder; these are the decoder. Each returns `None` for a
+// reserved/undefined field code, which is what makes the legal-code set
+// testable and keeps reserved encodings out of the IR.
+
+impl JmpCond {
+    pub fn from_code(c: u8) -> Option<Self> {
+        use JmpCond::*;
+        Some(match c {
+            0 => Always, 1 => NotX, 2 => XPostDec, 3 => NotY,
+            4 => YPostDec, 5 => XneY, 6 => Pin, 7 => NotOsrEmpty,
+            _ => return None,
+        })
+    }
+}
+impl WaitSrc {
+    pub fn from_code(c: u8) -> Option<Self> {
+        use WaitSrc::*;
+        Some(match c { 0 => GpioAbs, 1 => PinRel, 2 => Irq, 3 => JmpPin, _ => return None })
+    }
+}
+impl InSrc {
+    pub fn from_code(c: u8) -> Option<Self> {
+        use InSrc::*;
+        Some(match c { 0 => Pins, 1 => X, 2 => Y, 3 => Null, 6 => Isr, 7 => Osr, _ => return None })
+    }
+}
+impl OutDst {
+    pub fn from_code(c: u8) -> Option<Self> {
+        use OutDst::*;
+        Some(match c {
+            0 => Pins, 1 => X, 2 => Y, 3 => Null,
+            4 => PinDirs, 5 => Pc, 6 => Isr, 7 => Exec, _ => return None,
+        })
+    }
+}
+impl MovDst {
+    pub fn from_code(c: u8) -> Option<Self> {
+        use MovDst::*;
+        Some(match c {
+            0 => Pins, 1 => X, 2 => Y, 3 => PinDirs,
+            4 => Exec, 5 => Pc, 6 => Isr, 7 => Osr, _ => return None,
+        })
+    }
+}
+impl MovOp {
+    pub fn from_code(c: u8) -> Option<Self> {
+        use MovOp::*;
+        Some(match c { 0 => None, 1 => Invert, 2 => BitReverse, _ => return Option::None })
+    }
+}
+impl MovSrc {
+    pub fn from_code(c: u8) -> Option<Self> {
+        use MovSrc::*;
+        Some(match c { 0 => Pins, 1 => X, 2 => Y, 3 => Null, 5 => Status, 6 => Isr, 7 => Osr, _ => return None })
+    }
+}
+impl SetDst {
+    pub fn from_code(c: u8) -> Option<Self> {
+        use SetDst::*;
+        Some(match c { 0 => Pins, 1 => X, 2 => Y, 4 => PinDirs, _ => return None })
+    }
+}
+
+// ---- range validation: the IR must hold only in-range operands ----------
+//
+// Adopted decision ②: nothing is silently masked. Mutation operators must
+// produce in-range values; `encode` asserts these; `validate` reports them.
+
+impl Op {
+    /// Check that every operand sits in its field width. Bit counts are
+    /// 1..=32; targets/indices/immediates are 0..=31.
+    pub fn validate_ranges(&self) -> Result<(), &'static str> {
+        let in5 = |v: u8| v <= 31;
+        let cnt = |v: u8| (1..=32).contains(&v);
+        match *self {
+            Op::Jmp { target, .. } => in5(target).then_some(()).ok_or("jmp target > 31"),
+            Op::Wait { index, .. } => in5(index).then_some(()).ok_or("wait index > 31"),
+            Op::In { count, .. } => cnt(count).then_some(()).ok_or("in count out of 1..=32"),
+            Op::Out { count, .. } => cnt(count).then_some(()).ok_or("out count out of 1..=32"),
+            Op::Irq { index, .. } => in5(index).then_some(()).ok_or("irq index > 31"),
+            Op::Set { data, .. } => in5(data).then_some(()).ok_or("set data > 31"),
+            Op::Push { .. } | Op::Pull { .. } | Op::Mov { .. } => Ok(()),
+        }
+    }
+}
+
+impl Insn {
+    /// Validate this instruction against a side-set config: operand ranges,
+    /// plus that `delay` and `sideset` fit the shared 5-bit budget. Returns
+    /// the first problem found.
+    pub fn validate(&self, side: &SideCfg) -> Result<(), &'static str> {
+        self.op.validate_ranges()?;
+        if self.delay > side.max_delay() {
+            return Err("delay exceeds field width for this sideset_count");
+        }
+        match (side.sideset_value_bits(), self.sideset) {
+            // No side-set configured: must not request one.
+            (None, Some(_)) => Err("sideset value set but sideset_count == 0"),
+            (None, None) => Ok(()),
+            // Mandatory side-set (no enable bit): every insn must drive it.
+            (Some(_), None) if !side.en => Err("sideset is mandatory (side_en off) but None"),
+            (Some(bits), Some(v)) => {
+                let max = (1u16 << bits) as u8 - 1;
+                if v > max { Err("sideset value exceeds its field width") } else { Ok(()) }
+            }
+            (Some(_), None) => Ok(()), // opt mode: opting out is fine
+        }
+    }
 }
