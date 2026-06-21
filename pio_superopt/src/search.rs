@@ -275,6 +275,249 @@ fn pick_occupied(p: &Program, slots: u8, rng: &mut Rng) -> Option<usize> {
     }
 }
 
+/// The scalar cost: `w * correctness + size`, infinite for an illegal
+/// genome (decision ②). Lower is better.
+fn cost(p: &Program, golden: &[u32], spec: &RunSpec, w: f64) -> f64 {
+    let s = score(p, golden, spec);
+    if !s.valid {
+        f64::INFINITY
+    } else {
+        w * s.correctness as f64 + s.size as f64
+    }
+}
+
+/// A slot's `(delay, sideset)` for re-op'ing it, or the defaults a freshly
+/// filled empty slot must carry.
+fn slot_fields(p: &Program, i: usize, fill_ss: Option<u8>) -> (u8, Option<u8>) {
+    match &p.slots[i] {
+        Some(ins) => (ins.delay, ins.sideset),
+        None => (0, fill_ss),
+    }
+}
+
+/// Legal side-set values for a config (mirrors the encoder's budget).
+fn legal_sidesets(side: &SideCfg) -> Vec<Option<u8>> {
+    match side.sideset_value_bits() {
+        None => vec![None],
+        Some(bits) => {
+            let max = if bits == 0 { 0 } else { (1u16 << bits) - 1 } as u8;
+            let mut v: Vec<Option<u8>> = (0..=max).map(Some).collect();
+            if side.en {
+                v.push(None);
+            }
+            v
+        }
+    }
+}
+
+/// A comprehensive (but bounded) set of candidate ops for local search:
+/// every legal opcode/operand combination, with bit-count/data/index
+/// fields sampled at representative values. Includes `OUT PINS,1` and the
+/// other data-driving ops the polish needs to grind out value residuals.
+fn op_neighbors(slots: u8) -> Vec<Op> {
+    let counts = [1u8, 2, 8, 32];
+    let datas = [0u8, 1, 31];
+    let indices = [0u8, 1];
+    let mut v = Vec::new();
+    for &cond in &JMP_CONDS {
+        for t in 0..slots {
+            v.push(Op::Jmp { cond, target: t });
+        }
+    }
+    for &polarity in &[false, true] {
+        for &src in &WAIT_SRCS {
+            for &index in &indices {
+                v.push(Op::Wait { polarity, src, index });
+            }
+        }
+    }
+    for &src in &IN_SRCS {
+        for &count in &counts {
+            v.push(Op::In { src, count });
+        }
+    }
+    for &dst in &OUT_DSTS {
+        for &count in &counts {
+            v.push(Op::Out { dst, count });
+        }
+    }
+    for &a in &[false, true] {
+        for &block in &[false, true] {
+            v.push(Op::Push { if_full: a, block });
+            v.push(Op::Pull { if_empty: a, block });
+        }
+    }
+    for &dst in &MOV_DSTS {
+        for &op in &MOV_OPS {
+            for &src in &MOV_SRCS {
+                v.push(Op::Mov { dst, op, src });
+            }
+        }
+    }
+    for &clear in &[false, true] {
+        for &wait in &[false, true] {
+            for &index in &indices {
+                v.push(Op::Irq { clear, wait, index });
+            }
+        }
+    }
+    for &dst in &SET_DSTS {
+        for &data in &datas {
+            v.push(Op::Set { dst, data });
+        }
+    }
+    v
+}
+
+fn consider(cand: Program, cur_cost: f64, best: &mut Option<(Program, f64)>, golden: &[u32], spec: &RunSpec, w: f64) {
+    let c = cost(&cand, golden, spec, w);
+    if c < cur_cost && best.as_ref().map_or(true, |(_, bc)| c < *bc) {
+        *best = Some((cand, c));
+    }
+}
+
+/// Deterministic best-improvement local search to a single-move local
+/// optimum. Each sweep tries every single-field neighbor — per slot: every
+/// op (`op_neighbors`), every side-set value, every delay, and clear; plus
+/// every wrap bound and every value of each live config gene — and applies
+/// the single best strict improvement, repeating until none remains.
+///
+/// This grinds out the exact-value residuals annealing leaves on the table
+/// (the data-line needle — see `diagnose_near_misses`): residuals that a
+/// stochastic walk rarely proposes but an exhaustive neighbor sweep finds.
+///
+/// `two_opt`: when a single-move sweep stalls, also try changing **two**
+/// slots' ops jointly. Some optima sit two coordinated op-swaps away with
+/// no improving single-move path (e.g. moving the data `OUT` from one slot
+/// to another while the other becomes a NOP). Costs O(slots² · ops²) per
+/// kick, so reserve it for a final polish, not every restart.
+pub fn polish(
+    start: &Program,
+    space: &Space,
+    golden: &[u32],
+    spec: &RunSpec,
+    w: f64,
+    two_opt: bool,
+) -> Program {
+    let ops = op_neighbors(space.slots);
+    let sidesets = legal_sidesets(&space.side);
+    let max_delay = space.side.max_delay();
+    // Side-set a freshly-filled (previously empty) slot must carry.
+    let fill_ss = if space.side.count.min(5) > 0 && !space.side.en { Some(0) } else { None };
+
+    let mut cur = start.clone();
+    let mut cur_cost = cost(&cur, golden, spec, w);
+
+    loop {
+        let mut best: Option<(Program, f64)> = None;
+
+        for i in 0..space.slots as usize {
+            let (delay, base_ss) = match &cur.slots[i] {
+                Some(ins) => (ins.delay, ins.sideset),
+                None => (0, fill_ss),
+            };
+            for op in &ops {
+                let mut cand = cur.clone();
+                cand.slots[i] = Some(Insn { op: op.clone(), delay, sideset: base_ss });
+                consider(cand, cur_cost, &mut best, golden, spec, w);
+            }
+            if cur.slots[i].is_some() {
+                for &ss in &sidesets {
+                    let mut cand = cur.clone();
+                    if let Some(ins) = &mut cand.slots[i] {
+                        ins.sideset = ss;
+                    }
+                    consider(cand, cur_cost, &mut best, golden, spec, w);
+                }
+                for d in 0..=max_delay {
+                    let mut cand = cur.clone();
+                    if let Some(ins) = &mut cand.slots[i] {
+                        ins.delay = d;
+                    }
+                    consider(cand, cur_cost, &mut best, golden, spec, w);
+                }
+            }
+            let mut cleared = cur.clone();
+            cleared.slots[i] = None;
+            consider(cleared, cur_cost, &mut best, golden, spec, w);
+        }
+
+        if space.search_wrap {
+            for b in 0..space.slots {
+                for t in b..space.slots {
+                    let mut cand = cur.clone();
+                    cand.wrap_bottom = b;
+                    cand.wrap_top = t;
+                    consider(cand, cur_cost, &mut best, golden, spec, w);
+                }
+            }
+        }
+
+        let g = &space.genes;
+        if g.out_dir {
+            for dir in [ShiftDir::Left, ShiftDir::Right] {
+                let mut cand = cur.clone();
+                cand.config.shift.out_dir = dir;
+                consider(cand, cur_cost, &mut best, golden, spec, w);
+            }
+        }
+        if g.autopull {
+            for ap in [false, true] {
+                let mut cand = cur.clone();
+                cand.config.shift.autopull = ap;
+                consider(cand, cur_cost, &mut best, golden, spec, w);
+            }
+        }
+        if g.pull_threshold {
+            for thr in 1..=32u8 {
+                let mut cand = cur.clone();
+                cand.config.shift.pull_threshold = thr;
+                consider(cand, cur_cost, &mut best, golden, spec, w);
+            }
+        }
+        if g.clkdiv {
+            for int in 1..=CLKDIV_INT_MAX {
+                let mut cand = cur.clone();
+                cand.config.clkdiv_int = int;
+                cand.config.clkdiv_frac = 0;
+                consider(cand, cur_cost, &mut best, golden, spec, w);
+            }
+            for frac in 0..=255u8 {
+                let mut cand = cur.clone();
+                cand.config.clkdiv_frac = frac;
+                consider(cand, cur_cost, &mut best, golden, spec, w);
+            }
+        }
+
+        // 2-opt kick: if single-move is stuck, try joint op changes on
+        // every pair of slots — escapes the two-coordinated-swaps traps.
+        if best.is_none() && two_opt {
+            for i in 0..space.slots as usize {
+                let (di, si) = slot_fields(&cur, i, fill_ss);
+                for j in (i + 1)..space.slots as usize {
+                    let (dj, sj) = slot_fields(&cur, j, fill_ss);
+                    for oa in &ops {
+                        for ob in &ops {
+                            let mut cand = cur.clone();
+                            cand.slots[i] = Some(Insn { op: oa.clone(), delay: di, sideset: si });
+                            cand.slots[j] = Some(Insn { op: ob.clone(), delay: dj, sideset: sj });
+                            consider(cand, cur_cost, &mut best, golden, spec, w);
+                        }
+                    }
+                }
+            }
+        }
+
+        match best {
+            Some((c, cc)) => {
+                cur = c;
+                cur_cost = cc;
+            }
+            None => return cur,
+        }
+    }
+}
+
 /// Anneal and return the best program found and its score.
 pub fn anneal(
     template: &Program,
@@ -285,36 +528,38 @@ pub fn anneal(
     seed: u64,
 ) -> (Program, crate::cost::Score) {
     let mut rng = Rng::new(seed);
-    let cost_of = |p: &Program| -> f64 {
-        let s = score(p, golden, spec);
-        if !s.valid {
-            f64::INFINITY
-        } else {
-            params.w * s.correctness as f64 + s.size as f64
-        }
-    };
-
     let mut best: Option<(Program, f64)> = None;
     for _ in 0..params.restarts {
         let mut cur = random_program(template, space, &mut rng);
-        let mut cur_cost = cost_of(&cur);
+        let mut cur_cost = cost(&cur, golden, spec, params.w);
+        let mut local_best = (cur.clone(), cur_cost);
         for i in 0..params.iters {
             let frac = i as f64 / params.iters as f64;
             let t = params.t0 * (params.t_end / params.t0).powf(frac);
             let cand = mutate(&cur, space, &mut rng);
-            let cand_cost = cost_of(&cand);
+            let cand_cost = cost(&cand, golden, spec, params.w);
             let d = cand_cost - cur_cost;
             if d <= 0.0 || rng.unit() < (-d / t).exp() {
                 cur = cand;
                 cur_cost = cand_cost;
             }
-            if best.as_ref().map_or(true, |(_, bc)| cur_cost < *bc) {
-                best = Some((cur.clone(), cur_cost));
+            if cur_cost < local_best.1 {
+                local_best = (cur.clone(), cur_cost);
             }
+        }
+        // Cheap single-move polish of this restart's best, folded into the
+        // global best. (The expensive 2-opt is saved for one final pass.)
+        let polished = polish(&local_best.0, space, golden, spec, params.w, false);
+        let pc = cost(&polished, golden, spec, params.w);
+        if best.as_ref().map_or(true, |(_, bc)| pc < *bc) {
+            best = Some((polished, pc));
         }
     }
 
+    // Final polish of the global best with the 2-opt kick — grinds out
+    // residuals that sit two coordinated op-swaps from the optimum.
     let (p, _) = best.expect("at least one restart");
+    let p = polish(&p, space, golden, spec, params.w, true);
     let s = score(&p, golden, spec);
     (p, s)
 }
@@ -378,9 +623,13 @@ mod tests {
     /// side-set toggles the clock (the other slot is a pin-inert no-op).
     /// The earlier `OUT PINDIRS` exploit — which faked the level by toggling
     /// direction — is rejected because it diverges on the captured OE.
-    /// Slow (~40s); opt-in via `--ignored`.
+    ///
+    /// With the greedy polish appended to annealing, this needs only a tiny
+    /// budget (1000×4) — polish deterministically finishes the data needle
+    /// that previously demanded ~5000×40 of stochastic search. Opt-in
+    /// (a few seconds in debug from the final 2-opt; instant in release).
     #[test]
-    #[ignore = "slow convergence validation; run with: cargo test -- --ignored"]
+    #[ignore = "convergence validation; run with: cargo test --release -- --ignored"]
     fn rediscovers_spi_optimum_fixed_wrap() {
         let spec = spi_spec();
         let golden = run(&spi_reference(), &spec);
@@ -393,12 +642,77 @@ mod tests {
             search_wrap: false,
             genes: Genes::default(),
         };
-        let params = Params { iters: 5000, restarts: 40, ..Params::default() };
+        let params = Params { iters: 1000, restarts: 4, ..Params::default() };
 
         let (best, s) = anneal(&template, &space, &golden, &spec, &params, 0xC0FFEE);
         eprintln!("best: {s:?} span={:?}\n  s0={:?}\n  s1={:?}", best.span(), best.slots[0], best.slots[1]);
         assert_eq!(s.correctness, 0, "search must find a waveform-correct program");
         assert!(s.size <= 2, "should be the 2-slot optimum, got size {}", s.size);
+    }
+
+    /// Cheap 1-opt polish: from a pair of NOPs (clock right via side-set,
+    /// data never driven) a single op-swap fills `OUT PINS,1` into the low
+    /// slot, reaching the optimum. Fast — no 2-opt.
+    #[test]
+    fn polish_1opt_fills_missing_data() {
+        let spec = spi_spec();
+        let golden = run(&spi_reference(), &spec);
+        let space = Space {
+            slots: 2,
+            side: SideCfg { count: 1, en: false },
+            search_wrap: false,
+            genes: Genes::default(),
+        };
+        let nop = |ss| {
+            Some(Insn {
+                op: Op::Mov { dst: MovDst::Y, op: MovOp::None, src: MovSrc::Y },
+                delay: 0,
+                sideset: Some(ss),
+            })
+        };
+        let mut near = spi_template();
+        near.wrap_bottom = 0;
+        near.wrap_top = 1;
+        near.slots[0] = nop(0);
+        near.slots[1] = nop(1);
+        assert!(score(&near, &golden, &spec).correctness > 0);
+        let polished = polish(&near, &space, &golden, &spec, 64.0, false);
+        assert_eq!(score(&polished, &golden, &spec).correctness, 0, "1-opt must fill the data OUT");
+    }
+
+    /// 2-opt polish grinds the documented seed-1 near-miss — data via
+    /// `MOV PINS, BitReverse OSR`, correctness 1 — to the exact optimum. It
+    /// sits two coordinated op-swaps away, so single-move can't reach it.
+    /// Slow (O(ops²) sweep); opt-in.
+    #[test]
+    #[ignore = "2-opt polish (~4s); run with --ignored"]
+    fn polish_grinds_out_data_residual() {
+        let spec = spi_spec();
+        let golden = run(&spi_reference(), &spec);
+        let space = Space {
+            slots: 2,
+            side: SideCfg { count: 1, en: false },
+            search_wrap: false,
+            genes: Genes::default(),
+        };
+        let mut near = spi_template();
+        near.wrap_bottom = 0;
+        near.wrap_top = 1;
+        near.slots[0] = Some(Insn {
+            op: Op::Mov { dst: MovDst::Pins, op: MovOp::BitReverse, src: MovSrc::Osr },
+            delay: 0,
+            sideset: Some(0),
+        });
+        near.slots[1] = Some(Insn {
+            op: Op::Out { dst: OutDst::Pins, count: 1 },
+            delay: 0,
+            sideset: Some(1),
+        });
+        assert!(score(&near, &golden, &spec).correctness > 0, "starts as a near-miss");
+        let polished = polish(&near, &space, &golden, &spec, 64.0, true);
+        let s = score(&polished, &golden, &spec);
+        assert_eq!(s.correctness, 0, "polish must reach the exact optimum");
+        assert!(s.size <= 2);
     }
 
     /// Widened search: free wrap + config genes (out_dir, autopull,
@@ -410,13 +724,13 @@ mod tests {
     /// here: an exact-match oracle makes clkdiv_frac a needle at 0 — that
     /// matters more on protocols with timing slack.)
     ///
-    /// Finding: exact correctness-0 gets harder as the search space grows —
-    /// the rough strict-Hamming landscape needs many more restarts here than
-    /// the fixed-config case (this motivates the planned edge-distance
-    /// metric). Best run in release: `cargo test --release -- --ignored`
-    /// (~9s; ~90s in debug).
+    /// History: before the greedy polish, exact-0 scaled badly with the
+    /// space — the widened case needed ~12000×400 of stochastic search vs
+    /// 5000×40 fixed-config, because the rough strict-Hamming data needle
+    /// got exponentially rarer. With polish appended, the deterministic
+    /// finisher does that work and the budget collapses to 2000×12.
     #[test]
-    #[ignore = "slow widened-search validation; run with: cargo test --release -- --ignored"]
+    #[ignore = "widened-search validation; run with: cargo test --release -- --ignored"]
     fn rediscovers_spi_free_wrap_and_genes() {
         let spec = spi_spec();
         let golden = run(&spi_reference(), &spec);
@@ -426,7 +740,7 @@ mod tests {
             search_wrap: true,
             genes: Genes { clkdiv: false, pull_threshold: true, out_dir: true, autopull: true },
         };
-        let params = Params { iters: 12000, restarts: 400, ..Params::default() };
+        let params = Params { iters: 2000, restarts: 12, ..Params::default() };
 
         let (best, s) = anneal(&spi_template(), &space, &golden, &spec, &params, 0xC0FFEE);
         eprintln!(
@@ -439,5 +753,87 @@ mod tests {
         // The pinned genes must be recovered.
         assert_eq!(best.config.shift.out_dir, ShiftDir::Left, "MSB-first requires Left shift");
         assert!(best.config.shift.autopull, "no data without autopull");
+    }
+
+    /// Diagnostic (not an assertion): collect near-miss champions and
+    /// characterize each residual. For every captured signal it reports how
+    /// many cycles differ, and whether a small linear time-shift of the
+    /// candidate collapses the Hamming distance. If a shift helps a lot, the
+    /// residual is a PHASE error (a metric problem → edge-distance/DTW). If
+    /// not, it's a VALUE error on a correctly-timed waveform (a search/
+    /// operator problem → greedy polish / better neighborhoods).
+    ///
+    /// Fixed config + fixed wrap, so the residual isn't confounded by
+    /// config/wrap drift — it isolates the instruction-search plateau.
+    /// Run: `cargo test --release -- --ignored diagnose_near_misses --nocapture`
+    #[test]
+    #[ignore = "diagnostic; run with --release ... --nocapture"]
+    fn diagnose_near_misses() {
+        let spec = spi_spec();
+        let golden = run(&spi_reference(), &spec);
+        let space = Space {
+            slots: 2,
+            side: SideCfg { count: 1, en: false },
+            search_wrap: false,
+            genes: Genes::default(),
+        };
+        let mut template = spi_template();
+        template.wrap_bottom = 0;
+        template.wrap_top = 1;
+
+        // Bit positions in a trace_pads sample: level in bit j, OE in 16+j;
+        // capture_pins = [DATA, CLK] -> DATA=j0, CLK=j1.
+        let bits = |wave: &[u32], bit: u32| -> String {
+            wave.iter().map(|s| if (s >> bit) & 1 != 0 { '#' } else { '_' }).collect()
+        };
+        // Hamming with the candidate shifted by `k` cycles (out-of-range = 0).
+        let shifted = |g: &[u32], c: &[u32], k: i32| -> u32 {
+            (0..g.len())
+                .map(|i| {
+                    let j = i as i32 + k;
+                    let cv = if j >= 0 && (j as usize) < c.len() { c[j as usize] } else { 0 };
+                    (g[i] ^ cv).count_ones()
+                })
+                .sum()
+        };
+
+        eprintln!("GOLDEN DATA:{} CLK:{}", bits(&golden, 0), bits(&golden, 1));
+        eprintln!("       DATAoe:{} CLKoe:{}", bits(&golden, 16), bits(&golden, 17));
+
+        // Modest budget so most seeds land as near-misses, not exact 0.
+        let params = Params { iters: 2500, restarts: 8, ..Params::default() };
+        for seed in 1u64..=8 {
+            let (best, s) = anneal(&template, &space, &golden, &spec, &params, seed);
+            if s.correctness == 0 {
+                eprintln!("\nseed {seed}: reached correctness 0 (exact) — skipped");
+                continue;
+            }
+            let cand = run(&best, &spec);
+            let strict = shifted(&golden, &cand, 0);
+            let (mut bk, mut bh) = (0i32, strict);
+            for k in -3..=3 {
+                let h = shifted(&golden, &cand, k);
+                if h < bh {
+                    bh = h;
+                    bk = k;
+                }
+            }
+            let dim = |bit: u32| {
+                golden.iter().zip(&cand).filter(|(g, c)| ((*g >> bit) & 1) != ((*c >> bit) & 1)).count()
+            };
+            eprintln!("\nseed {seed}: correctness={} size={}", s.correctness, s.size);
+            eprintln!("  s0={:?}", best.slots[0]);
+            eprintln!("  s1={:?}", best.slots[1]);
+            eprintln!("  CAND   DATA:{} CLK:{}", bits(&cand, 0), bits(&cand, 1));
+            eprintln!("         DATAoe:{} CLKoe:{}", bits(&cand, 16), bits(&cand, 17));
+            eprintln!(
+                "  residual by signal: DATA_lvl={} CLK_lvl={} DATA_oe={} CLK_oe={}",
+                dim(0), dim(1), dim(16), dim(17)
+            );
+            eprintln!(
+                "  strict={strict}  best-over-shift=k{bk}->{bh}  =>  {}",
+                if bh + 2 < strict { "PHASE (shift helps)" } else { "VALUE (shift doesn't help)" }
+            );
+        }
     }
 }
