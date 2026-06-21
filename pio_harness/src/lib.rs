@@ -373,6 +373,27 @@ impl Pio {
         s
     }
 
+    /// Capture `cycles` of several pins **synchronously**: one bitmask per
+    /// cycle where bit `j` is the level of `pins[j]` that cycle. All pins
+    /// are sampled at the same cycle (after each step), so a multi-signal
+    /// waveform (e.g. SPI clock + data) stays phase-aligned — unlike
+    /// calling [`Pio::trace_pin`] per pin, which re-runs different cycles.
+    /// This is the capture the superoptimizer scores against a reference.
+    pub fn trace_pins(&mut self, pins: &[u8], cycles: u64) -> Vec<u32> {
+        let mut out = Vec::with_capacity(cycles as usize);
+        for _ in 0..cycles {
+            self.step();
+            let mut mask = 0u32;
+            for (j, &p) in pins.iter().enumerate() {
+                if self.gpio(p) {
+                    mask |= 1 << j;
+                }
+            }
+            out.push(mask);
+        }
+        out
+    }
+
     pub fn pc(&self) -> u8 {
         self.emu.borrow().bus.pio[self.block].sm[self.sm].pc()
     }
