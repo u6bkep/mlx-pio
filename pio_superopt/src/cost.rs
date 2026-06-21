@@ -9,16 +9,17 @@
 use crate::program::Program;
 use crate::run::{run, RunSpec};
 
-/// Strict cycle-aligned Hamming distance over the low `pin_count` bits.
-/// Differing lengths are compared against an implicit 0 (penalising a
-/// candidate that halts early or runs long).
-pub fn hamming(golden: &[u32], candidate: &[u32], pin_count: usize) -> u32 {
-    let mask: u32 = if pin_count >= 32 { u32::MAX } else { (1u32 << pin_count) - 1 };
+/// Strict cycle-aligned Hamming distance between two captured waveforms.
+/// Each sample already packs only the meaningful bits (pin levels and
+/// output-enables), so every differing bit counts. Differing lengths are
+/// compared against an implicit 0 (penalising a candidate that halts early
+/// or runs long).
+pub fn hamming(golden: &[u32], candidate: &[u32]) -> u32 {
     let n = golden.len().max(candidate.len());
     (0..n)
         .map(|i| {
-            let g = golden.get(i).copied().unwrap_or(0) & mask;
-            let c = candidate.get(i).copied().unwrap_or(0) & mask;
+            let g = golden.get(i).copied().unwrap_or(0);
+            let c = candidate.get(i).copied().unwrap_or(0);
             (g ^ c).count_ones()
         })
         .sum()
@@ -45,7 +46,7 @@ pub fn score(program: &Program, golden: &[u32], spec: &RunSpec) -> Score {
     let wave = run(program, spec);
     Score {
         valid: true,
-        correctness: hamming(golden, &wave, spec.capture_pins.len()),
+        correctness: hamming(golden, &wave),
         size: program.size(),
     }
 }

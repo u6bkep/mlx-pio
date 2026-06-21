@@ -290,13 +290,12 @@ mod tests {
     /// annealer reliably drives cost to zero — a correctness-0, size-2
     /// program — proving the move set + temperature + cost mechanics work.
     ///
-    /// NOTE: the cost-0 program it finds is often NOT canonical SPI (it has
-    /// surfaced e.g. `OUT PINDIRS / IRQ` that merely reproduces the two
-    /// captured pin levels). That is a real finding, not a test bug: a
-    /// 2-pin strict-Hamming oracle is underspecified and the search
-    /// exploits it (the Thompson/emulator-exploit risk). Tightening the
-    /// oracle (capture pin dirs + FIFO consumption, or edge-distance) is
-    /// the next step. Slow (~40s); opt-in via `--ignored`.
+    /// With the level+OE oracle (see `cost`/`trace_pads`) the found program
+    /// is a *real* SPI transmitter: `OUT PINS side 0` drives the data line,
+    /// side-set toggles the clock (the other slot is a pin-inert no-op).
+    /// The earlier `OUT PINDIRS` exploit — which faked the level by toggling
+    /// direction — is rejected because it diverges on the captured OE.
+    /// Slow (~40s); opt-in via `--ignored`.
     #[test]
     #[ignore = "slow convergence validation; run with: cargo test -- --ignored"]
     fn rediscovers_spi_optimum_fixed_wrap() {

@@ -363,6 +363,13 @@ impl Pio {
         self.emu.borrow().gpio_read(pin)
     }
 
+    /// The PIO-driven output-enable (direction) of a low-bank pin on this
+    /// block: true = the PIO is actively driving the pin as an output this
+    /// cycle. Read from the block's merged `pad_oe`.
+    pub fn gpio_oe(&self, pin: u8) -> bool {
+        (self.emu.borrow().bus.pio[self.block].pad_oe >> pin) & 1 != 0
+    }
+
     /// Capture `cycles` of a pin as a `_`/`#` string, stepping as it goes.
     pub fn trace_pin(&mut self, pin: u8, cycles: u64) -> String {
         let mut s = String::with_capacity(cycles as usize);
@@ -390,6 +397,30 @@ impl Pio {
                 }
             }
             out.push(mask);
+        }
+        out
+    }
+
+    /// Capture `cycles` of several pins encoding BOTH level and direction:
+    /// bit `j` is the level of `pins[j]`, bit `16 + j` is its output-enable.
+    /// Scoring against this rejects programs that fake the observed level by
+    /// toggling pin direction instead of driving values — a real transmitter
+    /// keeps its pins driven. Up to 16 pins.
+    pub fn trace_pads(&mut self, pins: &[u8], cycles: u64) -> Vec<u32> {
+        assert!(pins.len() <= 16, "trace_pads supports up to 16 pins");
+        let mut out = Vec::with_capacity(cycles as usize);
+        for _ in 0..cycles {
+            self.step();
+            let mut w = 0u32;
+            for (j, &p) in pins.iter().enumerate() {
+                if self.gpio(p) {
+                    w |= 1 << j;
+                }
+                if self.gpio_oe(p) {
+                    w |= 1 << (16 + j);
+                }
+            }
+            out.push(w);
         }
         out
     }

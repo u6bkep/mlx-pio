@@ -13,7 +13,8 @@ pub struct RunSpec {
     pub inputs: Vec<u32>,
     /// Pins to mark as PIO outputs (data, clock, …).
     pub output_pins: Vec<u8>,
-    /// Pins to capture; bit `j` of each sample is `capture_pins[j]`.
+    /// Pins to capture. Each per-cycle sample packs, for pin `j`, its level
+    /// in bit `j` and its output-enable (direction) in bit `16 + j`.
     pub capture_pins: Vec<u8>,
     /// Number of PIO cycles to run/capture.
     pub cycles: u64,
@@ -67,5 +68,5 @@ pub fn run(program: &Program, spec: &RunSpec) -> Vec<u32> {
         pio.tx_push(w);
     }
 
-    pio.trace_pins(&spec.capture_pins, spec.cycles)
+    pio.trace_pads(&spec.capture_pins, spec.cycles)
 }
