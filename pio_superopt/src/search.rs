@@ -11,19 +11,94 @@
 
 use crate::cost::score;
 use crate::ir::*;
-use crate::program::Program;
+use crate::program::{Config, Program, ShiftDir};
 use crate::rng::Rng;
 use crate::run::RunSpec;
 
-/// What the search may vary: the first `slots` instruction slots and the
-/// wrap bounds. The config (incl. side-set) is taken from the template and
-/// held fixed; `side` is needed to generate legal delay/side-set values.
+/// What the search may vary: the first `slots` instruction slots, the wrap
+/// bounds, and the config `genes`. Everything not searched is taken from
+/// the template and held fixed; `side` is needed to generate legal
+/// delay/side-set values.
 #[derive(Debug, Clone, Copy)]
 pub struct Space {
     pub slots: u8,
     pub side: SideCfg,
     /// If false, wrap bounds are fixed to the template's and not mutated.
     pub search_wrap: bool,
+    /// Which config fields the search may mutate.
+    pub genes: Genes,
+}
+
+/// Which SM-config fields are search genes. Everything else stays at the
+/// template's value (the fixed per-target contract: pin bases, side-set
+/// layout, …). Pin bases are never genes — you can't rewire the board.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Genes {
+    pub clkdiv: bool,
+    pub pull_threshold: bool,
+    pub out_dir: bool,
+    pub autopull: bool,
+}
+
+impl Genes {
+    fn any(self) -> bool {
+        self.clkdiv || self.pull_threshold || self.out_dir || self.autopull
+    }
+    /// Tags of the live genes, for uniform random selection.
+    fn live(self) -> Vec<u8> {
+        let mut v = Vec::new();
+        if self.clkdiv {
+            v.push(0);
+        }
+        if self.pull_threshold {
+            v.push(1);
+        }
+        if self.out_dir {
+            v.push(2);
+        }
+        if self.autopull {
+            v.push(3);
+        }
+        v
+    }
+}
+
+/// Upper bound on clkdiv integer part during search — comms dividers are
+/// small, and int must be >= 1 (0 means 65536; the search avoids it).
+const CLKDIV_INT_MAX: u16 = 8;
+
+/// Set every live gene to a fresh random in-range value.
+fn randomize_config(c: &mut Config, genes: &Genes, rng: &mut Rng) {
+    if genes.clkdiv {
+        c.clkdiv_int = 1 + rng.below(CLKDIV_INT_MAX as u32) as u16;
+        c.clkdiv_frac = rng.below(256) as u8;
+    }
+    if genes.pull_threshold {
+        c.shift.pull_threshold = 1 + rng.below(32) as u8;
+    }
+    if genes.out_dir {
+        c.shift.out_dir = if rng.boolean() { ShiftDir::Left } else { ShiftDir::Right };
+    }
+    if genes.autopull {
+        c.shift.autopull = rng.boolean();
+    }
+}
+
+/// Perturb one randomly-chosen live gene.
+fn mutate_config_gene(c: &mut Config, genes: &Genes, rng: &mut Rng) {
+    let live = genes.live();
+    if live.is_empty() {
+        return;
+    }
+    match *rng.pick(&live) {
+        0 => {
+            c.clkdiv_int = 1 + rng.below(CLKDIV_INT_MAX as u32) as u16;
+            c.clkdiv_frac = rng.below(256) as u8;
+        }
+        1 => c.shift.pull_threshold = 1 + rng.below(32) as u8,
+        2 => c.shift.out_dir = if rng.boolean() { ShiftDir::Left } else { ShiftDir::Right },
+        _ => c.shift.autopull = rng.boolean(),
+    }
 }
 
 /// Annealing schedule and weights.
@@ -122,6 +197,9 @@ fn random_program(template: &Program, space: &Space, rng: &mut Rng) -> Program {
     if space.search_wrap {
         set_random_wrap(&mut p, space.slots, rng);
     }
+    if space.genes.any() {
+        randomize_config(&mut p.config, &space.genes, rng);
+    }
     p
 }
 
@@ -136,6 +214,11 @@ fn set_random_wrap(p: &mut Program, slots: u8, rng: &mut Rng) {
 fn mutate(p: &Program, space: &Space, rng: &mut Rng) -> Program {
     let mut m = p.clone();
     let slots = space.slots;
+    // Roughly one move in five touches config, when any gene is live.
+    if space.genes.any() && rng.below(5) == 0 {
+        mutate_config_gene(&mut m.config, &space.genes, rng);
+        return m;
+    }
     match rng.below(7) {
         0 => {
             // ReplaceOp
@@ -304,12 +387,57 @@ mod tests {
         let mut template = spi_template();
         template.wrap_bottom = 0;
         template.wrap_top = 1;
-        let space = Space { slots: 2, side: SideCfg { count: 1, en: false }, search_wrap: false };
+        let space = Space {
+            slots: 2,
+            side: SideCfg { count: 1, en: false },
+            search_wrap: false,
+            genes: Genes::default(),
+        };
         let params = Params { iters: 5000, restarts: 40, ..Params::default() };
 
         let (best, s) = anneal(&template, &space, &golden, &spec, &params, 0xC0FFEE);
         eprintln!("best: {s:?} span={:?}\n  s0={:?}\n  s1={:?}", best.span(), best.slots[0], best.slots[1]);
         assert_eq!(s.correctness, 0, "search must find a waveform-correct program");
         assert!(s.size <= 2, "should be the 2-slot optimum, got size {}", s.size);
+    }
+
+    /// Widened search: free wrap + config genes (out_dir, autopull,
+    /// pull_threshold), all randomized at init. The search must recover the
+    /// pinned config values (out_dir Left and autopull on are *required* by
+    /// the golden — Right shifts the zero half of the word, autopull-off
+    /// stalls with no data) along with the loop bounds and instructions, and
+    /// still reach a correct program. (clkdiv is a gene too but excluded
+    /// here: an exact-match oracle makes clkdiv_frac a needle at 0 — that
+    /// matters more on protocols with timing slack.)
+    ///
+    /// Finding: exact correctness-0 gets harder as the search space grows —
+    /// the rough strict-Hamming landscape needs many more restarts here than
+    /// the fixed-config case (this motivates the planned edge-distance
+    /// metric). Best run in release: `cargo test --release -- --ignored`
+    /// (~9s; ~90s in debug).
+    #[test]
+    #[ignore = "slow widened-search validation; run with: cargo test --release -- --ignored"]
+    fn rediscovers_spi_free_wrap_and_genes() {
+        let spec = spi_spec();
+        let golden = run(&spi_reference(), &spec);
+        let space = Space {
+            slots: 2,
+            side: SideCfg { count: 1, en: false },
+            search_wrap: true,
+            genes: Genes { clkdiv: false, pull_threshold: true, out_dir: true, autopull: true },
+        };
+        let params = Params { iters: 12000, restarts: 400, ..Params::default() };
+
+        let (best, s) = anneal(&spi_template(), &space, &golden, &spec, &params, 0xC0FFEE);
+        eprintln!(
+            "best: {s:?} span={:?} wrap=({},{}) out_dir={:?} autopull={} pull_thr={}",
+            best.span(), best.wrap_bottom, best.wrap_top,
+            best.config.shift.out_dir, best.config.shift.autopull, best.config.shift.pull_threshold,
+        );
+        assert_eq!(s.correctness, 0, "widened search must still reach a correct program");
+        assert!(s.size <= 2, "should still be the 2-slot optimum, got size {}", s.size);
+        // The pinned genes must be recovered.
+        assert_eq!(best.config.shift.out_dir, ShiftDir::Left, "MSB-first requires Left shift");
+        assert!(best.config.shift.autopull, "no data without autopull");
     }
 }
