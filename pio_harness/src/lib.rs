@@ -176,6 +176,47 @@ impl Pio {
         self.emu.clone()
     }
 
+    /// Reset this handle's PIO block and the shared GPIO stimulus to the
+    /// power-on state a freshly-built [`Pio::new`] would produce, WITHOUT
+    /// rebuilding the [`Emulator`]. This lets one emulator be reused across
+    /// many evaluations (the superoptimizer hot path), skipping the
+    /// ~200µs `Bus`/core allocation of a rebuild.
+    ///
+    /// Clears all per-evaluation PIO state (via `PioBlock::reset`): every
+    /// SM's PC / X / Y / ISR / OSR / shift counters / clkdiv accumulator /
+    /// stall+delay flags / pending forced exec / FIFOs / side-set latches /
+    /// pc_visits / stall_cycles; the block's instr_mem, irq_flags, shared
+    /// pin value+dir latches, pad_out / pad_oe, enable mask, INT registers.
+    /// Also clears the bus-level external GPIO stimulus so input forcing
+    /// from a prior eval cannot leak, and resets the harness-side config
+    /// shadow (wrap/jmp_pin/sideset/pinctrl/start_pc).
+    ///
+    /// Leaves the PIO RESET line deasserted (as `Pio::new` did). The CPU
+    /// cores/SIO are untouched: with no firmware loaded they never drive
+    /// PIO inputs, so they can't affect a captured waveform — verified
+    /// byte-identical to the rebuild path in `tests/reset_reuse.rs`.
+    ///
+    /// Resets only THIS handle's block; multi-block scenarios must reset
+    /// each handle.
+    pub fn reset(&mut self) -> &mut Self {
+        {
+            let mut e = self.emu.borrow_mut();
+            e.bus.pio[self.block].reset();
+            e.bus.gpio_external_in.store(0, Ordering::Relaxed);
+            e.bus.gpio_external_mask = 0;
+            e.bus.gpio_external_in_hi.store(0, Ordering::Relaxed);
+            e.bus.gpio_external_mask_hi = 0;
+        }
+        self.wrap_bottom = 0;
+        self.wrap_top = 0;
+        self.jmp_pin = 0;
+        self.side_en = false;
+        self.side_pindir = false;
+        self.pinctrl = PinCtrl::default();
+        self.start_pc = 0;
+        self
+    }
+
     fn base(&self) -> u32 {
         PIO_BASE[self.block]
     }

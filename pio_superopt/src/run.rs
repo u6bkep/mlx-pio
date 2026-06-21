@@ -1,8 +1,18 @@
 //! Run a [`Program`] in the emulator harness and capture its output
 //! waveform. This is the bridge from the IR genome to a scoreable signal.
 
+use std::cell::RefCell;
+
 use crate::program::{Program, ShiftDir};
 use pio_harness::{PinCtrl, Pio, ShiftCtrl, ShiftDir as HDir};
+
+thread_local! {
+    /// One emulator reused across all evaluations on this thread. Rebuilding
+    /// it (`Pio::new`) costs ~200µs and dominates eval time; resetting it is
+    /// ~17x cheaper. `Pio::reset` is verified to produce byte-identical
+    /// results to a fresh build (pio_harness `tests/reset_reuse.rs`).
+    static RUNNER: RefCell<Option<(usize, usize, Pio)>> = const { RefCell::new(None) };
+}
 
 /// What to feed a program and what to observe.
 #[derive(Debug, Clone)]
@@ -30,8 +40,20 @@ fn hdir(d: ShiftDir) -> HDir {
 /// Assemble, configure, run, and return the per-cycle waveform (one
 /// bitmask per cycle, `capture_pins`-indexed). Deterministic.
 pub fn run(program: &Program, spec: &RunSpec) -> Vec<u32> {
-    let mut pio = Pio::new(spec.block, spec.sm);
+    RUNNER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        // Rebuild only if the target block/SM changed (it doesn't, mid-search).
+        if !matches!(&*slot, Some((b, s, _)) if *b == spec.block && *s == spec.sm) {
+            *slot = Some((spec.block, spec.sm, Pio::new(spec.block, spec.sm)));
+        }
+        let pio = &mut slot.as_mut().unwrap().2;
+        pio.reset();
+        run_on(pio, program, spec)
+    })
+}
 
+/// Configure and run an already-reset `Pio`, returning the waveform.
+fn run_on(pio: &mut Pio, program: &Program, spec: &RunSpec) -> Vec<u32> {
     let code = program.assemble();
     // Slot index == instruction address: load at offset 0, no relocation.
     pio.load_at(0, &code, program.wrap_bottom, program.wrap_top);
