@@ -67,6 +67,50 @@ silicon. The `WaitGpio`/`WaitPin`/`Pull`/`Push`/`IrqWait` arms are unchanged
 
 All `picoem-common` tests pass (314 baseline + 3 added = 317).
 
+## The bug: `CLKDIV_INT == 0` treated as divide-by-1 instead of divide-by-65536
+
+`clock_tick()` computed the fractional clock-divider threshold with a special
+case treating `clkdiv_int == 0` as divisor 1 (`threshold = 256`, the *fastest*
+divisor). This is backwards: a zero integer divisor is the *slowest* divisor.
+
+### Root cause
+
+The RP2350 datasheet (§11, `SMx_CLKDIV` register, INT field) states:
+
+> "Value of 0 is interpreted as 65536. If INT is 0, FRAC must also be 0."
+
+So `clkdiv_int == 0` means divisor 65536, i.e. `threshold = 65536 * 256 =
+16_777_216` (FRAC guaranteed 0, so no frac term). The emulator instead used
+`threshold = 256`, making such an SM run 65536× too fast.
+
+### The fix (`src/pio/sm.rs`, `clock_tick`)
+
+```rust
+// before
+let threshold = if self.clkdiv_int == 0 {
+    256u32
+} else { ... };
+// after
+let threshold = if self.clkdiv_int == 0 {
+    65536u32 * 256
+} else { ... };
+```
+
+`65536 * 256 = 16_777_216` fits in `u32`; `clkdiv_acc` (u32, +256/tick) reaches
+it without overflow. The `else` arm and the rest of the accumulator logic are
+unchanged.
+
+### Regression tests updated
+
+The two existing tests that baked in the wrong divide-by-256 behavior were
+corrected (not deleted) to assert divide-by-65536:
+
+- `src/pio/sm.rs::clock_tick_treats_int_zero_as_65536` (renamed from
+  `clock_tick_treats_int_zero_as_256`) — fires exactly once per 65536 cycles.
+- `src/pio/mod.rs::clkdiv_int_zero_through_block_divides_by_65536` (renamed from
+  `clkdiv_int_zero_through_block_ticks_every_cycle`) — 4 ticks per 4*65536
+  cycles through the full `PioBlock` path.
+
 ## Other changes
 
 - `src/pio/decode.rs`: added `#[derive(Debug)]` on `DecodedInsn` and `PioOp`

@@ -295,7 +295,10 @@ impl StateMachine {
         }
 
         let threshold = if self.clkdiv_int == 0 {
-            256u32
+            // Per RP2350 datasheet (§11, SMx_CLKDIV): "Value of 0 is
+            // interpreted as 65536. If INT is 0, FRAC must also be 0."
+            // So divisor 65536 → threshold 65536 * 256 (frac guaranteed 0).
+            65536u32 * 256
         } else {
             (self.clkdiv_int as u32) * 256 + self.clkdiv_frac as u32
         };
@@ -1253,19 +1256,23 @@ mod tests {
     // listed in `2026.04.23 - CC - Coverage Improvement Plan.md` Stage 4.
     // ====================================================================
 
-    /// Covers `clock_tick` with `clkdiv_int == 0` (threshold=256): this is
-    /// the documented "divide-by-256" fast-path used by firmware that
-    /// programs a zero integer divisor.
+    /// Covers `clock_tick` with `clkdiv_int == 0`. Per the RP2350 datasheet
+    /// (§11, SMx_CLKDIV: "Value of 0 is interpreted as 65536. If INT is 0,
+    /// FRAC must also be 0."), a zero integer divisor means the *slowest*
+    /// divisor of 65536, not the fastest. Threshold is 65536 * 256, so with
+    /// +256 per tick it takes exactly 65536 cycles to fire once.
     #[test]
-    fn clock_tick_treats_int_zero_as_256() {
+    fn clock_tick_treats_int_zero_as_65536() {
         let mut sm = StateMachine::new();
         sm.enabled = true;
         sm.clkdiv_int = 0;
         sm.clkdiv_frac = 0;
-        // With threshold=256 and +256 per tick, every call returns true.
-        for _ in 0..4 {
-            assert!(sm.clock_tick());
+        // First 65535 ticks must NOT fire (acc climbs 256..=65535*256).
+        for _ in 0..(65536 - 1) {
+            assert!(!sm.clock_tick());
         }
+        // The 65536th tick reaches the threshold and fires.
+        assert!(sm.clock_tick());
     }
 
     /// Covers the `enabled = false` short-circuit in `clock_tick`.

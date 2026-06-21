@@ -3317,22 +3317,25 @@ mod tests {
         assert_eq!(ticks, 2560, "frac=255 averages 256/511 ticks per cycle");
     }
 
-    /// CLKDIV at the int=0 (treated as 256) boundary: every cycle ticks
-    /// because acc += 256 and threshold == 256. Independently verified at
-    /// the SM level by `clock_tick_treats_int_zero_as_256`; this variant
-    /// drives the divider through `PioBlock` to exercise the full path.
+    /// CLKDIV at the int=0 boundary. Per the RP2350 datasheet (§11,
+    /// SMx_CLKDIV: "Value of 0 is interpreted as 65536. If INT is 0, FRAC
+    /// must also be 0."), int=0 means the slowest divisor of 65536, not 256.
+    /// Independently verified at the SM level by
+    /// `clock_tick_treats_int_zero_as_65536`; this variant drives the divider
+    /// through `PioBlock` to exercise the full path.
     #[test]
-    fn clkdiv_int_zero_through_block_ticks_every_cycle() {
+    fn clkdiv_int_zero_through_block_divides_by_65536() {
         let mut pio = PioBlock::new();
-        pio.write32(0x0C8, 0, 0); // SM0 CLKDIV: int=0, frac=0 → divisor 256
+        pio.write32(0x0C8, 0, 0); // SM0 CLKDIV: int=0, frac=0 → divisor 65536
         pio.set_sm_enabled(0, true);
         let mut ticks = 0;
-        for _ in 0..1000 {
+        // 4 * 65536 cycles → exactly 4 ticks (one per 65536 cycles).
+        for _ in 0..(4 * 65536) {
             if pio.sm[0].clock_tick() {
                 ticks += 1;
             }
         }
-        assert_eq!(ticks, 1000, "int=0 must mean divide-by-256 → 1.0 effective");
+        assert_eq!(ticks, 4, "int=0 must mean divide-by-65536");
     }
 
     /// CLKDIV maximum integer divisor (int=0xFFFF, frac=0). Verify the
