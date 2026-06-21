@@ -20,7 +20,9 @@ pub mod decode;
 pub mod encode;
 pub mod ir;
 pub mod program;
+pub mod rng;
 pub mod run;
+pub mod search;
 
 pub use cost::{hamming, score, Score};
 pub use decode::{decode_insn, DecodeError};
