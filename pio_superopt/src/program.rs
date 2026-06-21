@@ -128,7 +128,7 @@ impl Program {
     /// slot index (no relocation).
     pub fn assemble(&self) -> [u16; 32] {
         let mut out = [0u16; 32];
-        let nop = Insn::nop();
+        let nop = Insn::nop_for(&self.config.side);
         for (i, slot) in self.slots.iter().enumerate() {
             let insn = slot.as_ref().unwrap_or(&nop);
             out[i] = encode_insn(insn, &self.config.side);

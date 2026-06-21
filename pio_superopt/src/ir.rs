@@ -24,10 +24,19 @@ impl Insn {
         Insn { op, delay: 0, sideset: None }
     }
 
-    /// The canonical NOP: `MOV Y, Y` (delay 0, no side-set). Empty
-    /// program slots encode to this.
+    /// The canonical NOP: `MOV Y, Y` (delay 0, no side-set).
     pub fn nop() -> Self {
         Insn::plain(Op::Mov { dst: MovDst::Y, op: MovOp::None, src: MovSrc::Y })
+    }
+
+    /// A NOP that is *legal under `side`*: when side-set is mandatory
+    /// (`count > 0`, no enable bit) every instruction must drive it, so the
+    /// fill NOP carries `Some(0)`; otherwise it opts out. Used to encode
+    /// empty program slots. (Empty slots sit outside the executed wrap
+    /// region, so the driven 0 is never observed — but it must encode.)
+    pub fn nop_for(side: &SideCfg) -> Self {
+        let sideset = if side.count > 0 && !side.en { Some(0) } else { None };
+        Insn { op: Op::Mov { dst: MovDst::Y, op: MovOp::None, src: MovSrc::Y }, delay: 0, sideset }
     }
 }
 

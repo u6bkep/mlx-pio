@@ -5,8 +5,15 @@ edition = "2021"
 description = "Simulated-annealing superoptimizer for RP2350 PIO programs: symbolic IR + encoder."
 
 [dependencies]
+# The runner drives real programs through the emulator harness.
+pio_harness = { path = "../pio_harness" }
 
 [dev-dependencies]
 # Ground-truth decoder, used to prove the encoder round-trips
-# (decode(encode(ir)) == ir). Same vendored copy the harness patches in.
+# (decode(encode(ir)) == ir).
+picoem-common = "0.2"
+
+# Same patch the harness uses, so the transitive (rp2350-emu -> picoem-common)
+# and direct dev-dependency both resolve to the vendored, fixed copy.
+[patch.crates-io]
 picoem-common = { path = "../vendor/picoem-common" }
