@@ -361,9 +361,6 @@ impl StateMachine {
         // Decode
         let decoded = decode(insn, self.pinctrl, self.execctrl);
 
-        // Apply side-set ALWAYS (even if instruction will stall)
-        self.apply_sideset(&decoded);
-
         // Execute — returns true if instruction set PC directly (JMP, OUT PC, MOV PC)
         let pc_set = self.execute_insn(
             &decoded,
@@ -372,6 +369,16 @@ impl StateMachine {
             shared_pin_values,
             shared_pin_dirs,
         );
+
+        // Apply side-set ALWAYS (even if the instruction stalled). When an
+        // instruction ASSERTS side-set, it writes its value into the SAME
+        // shared pin latch that OUT/SET/MOV write — so it is applied AFTER
+        // the instruction, giving an asserted side-set precedence on any
+        // shared pin (RP2350 §3.5.1). An instruction that OPTS OUT of
+        // side-set (`decoded.sideset == None`, opt mode with enable=0)
+        // performs no side-set this cycle and leaves the OUT/SET write —
+        // and the latched pin value — untouched (HOLD semantics).
+        self.apply_sideset(&decoded, shared_pin_values, shared_pin_dirs);
 
         // If not stalled, set delay and advance PC
         if !self.stalled {
@@ -470,7 +477,26 @@ impl StateMachine {
     }
 
     /// Apply side-set values to pins.
-    fn apply_sideset(&mut self, decoded: &DecodedInsn) {
+    ///
+    /// Side-set, when ASSERTED (`decoded.sideset == Some`), writes its value
+    /// straight into the shared pin latch — `shared_pin_dirs` when SIDE_PINDIR
+    /// drives directions, otherwise `shared_pin_values` — which is the *same*
+    /// register OUT/SET/MOV PINS/PINDIRS write into. The value therefore
+    /// persists until something writes it again (HOLD semantics). When an
+    /// instruction does NOT assert side-set (opt mode, enable bit clear →
+    /// `decoded.sideset == None`), this is a no-op: the pins keep whatever
+    /// value OUT/SET or a previous side-set left there.
+    ///
+    /// The per-SM `sideset_pins` / `sideset_dirs` fields are kept in sync as a
+    /// diagnostic mirror only — they are no longer overlaid by
+    /// `PioBlock::merge_pin_outputs` (the bug this fix removed). The shared
+    /// latch is the authoritative drive path.
+    fn apply_sideset(
+        &mut self,
+        decoded: &DecodedInsn,
+        shared_pin_values: &mut u32,
+        shared_pin_dirs: &mut u32,
+    ) {
         if let Some(ss_val) = decoded.sideset {
             let sideset_count = ((self.pinctrl >> 29) & 7) as u8;
             let side_en = (self.execctrl >> 30) & 1 != 0;
@@ -485,10 +511,16 @@ impl StateMachine {
             let sideset_base = ((self.pinctrl >> 10) & 0x1F) as u8;
             let side_pindir = (self.execctrl >> 29) & 1 != 0;
             if side_pindir {
+                // Direction-drive: write the shared direction latch (flows to
+                // pad_oe), and mirror into the per-SM diagnostic latch.
+                Self::write_pin_field(shared_pin_dirs, ss_val as u32, sideset_base, actual_pins);
                 let mut pd = self.sideset_dirs;
                 Self::write_pin_field(&mut pd, ss_val as u32, sideset_base, actual_pins);
                 self.sideset_dirs = pd;
             } else {
+                // Value-drive: write the shared value latch (flows to pad_out),
+                // and mirror into the per-SM diagnostic latch.
+                Self::write_pin_field(shared_pin_values, ss_val as u32, sideset_base, actual_pins);
                 let mut sp = self.sideset_pins;
                 Self::write_pin_field(&mut sp, ss_val as u32, sideset_base, actual_pins);
                 self.sideset_pins = sp;
@@ -1380,7 +1412,13 @@ mod tests {
             sm.pinctrl,
             sm.execctrl,
         );
-        sm.apply_sideset(&decoded);
+        let mut shared_pins = u32::MAX;
+        let mut shared_dirs = 0u32;
+        sm.apply_sideset(&decoded, &mut shared_pins, &mut shared_dirs);
+        // Direction-drive writes the shared direction latch …
+        assert_ne!(shared_dirs & (1 << 4), 0, "shared_pin_dirs bit 4 set");
+        assert_eq!(shared_pins, u32::MAX, "shared_pin_values untouched");
+        // … and mirrors into the per-SM diagnostic latch.
         assert_ne!(sm.sideset_dirs & (1 << 4), 0, "sideset_dirs bit 4 set");
         assert_eq!(sm.sideset_pins, u32::MAX, "sideset_pins untouched");
     }
