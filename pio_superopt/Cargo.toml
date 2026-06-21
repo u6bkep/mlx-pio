@@ -1,0 +1,12 @@
+[package]
+name = "pio_superopt"
+version = "0.1.0"
+edition = "2021"
+description = "Simulated-annealing superoptimizer for RP2350 PIO programs: symbolic IR + encoder."
+
+[dependencies]
+
+[dev-dependencies]
+# Ground-truth decoder, used to prove the encoder round-trips
+# (decode(encode(ir)) == ir). Same vendored copy the harness patches in.
+picoem-common = { path = "../vendor/picoem-common" }
