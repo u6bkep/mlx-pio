@@ -109,6 +109,10 @@ pub struct Params {
     pub t0: f64,
     pub t_end: f64,
     pub w: f64,
+    /// Optimization mode: every restart starts from the template program
+    /// (a known-correct reference) instead of a random one. Shrinks/improves
+    /// a working program rather than synthesizing from scratch.
+    pub seed_from_template: bool,
 }
 
 impl Default for Params {
@@ -116,7 +120,7 @@ impl Default for Params {
         // Temperature is scaled to the cost gap of a single wrong pin-cycle
         // (= w). t0 ~ 2w lets correctness barriers be crossed early;
         // t_end < w makes the tail greedy on size.
-        Params { iters: 4000, restarts: 24, t0: 128.0, t_end: 1.0, w: 64.0 }
+        Params { iters: 4000, restarts: 24, t0: 128.0, t_end: 1.0, w: 64.0, seed_from_template: false }
     }
 }
 
@@ -530,7 +534,11 @@ pub fn anneal(
     let mut rng = Rng::new(seed);
     let mut best: Option<(Program, f64)> = None;
     for _ in 0..params.restarts {
-        let mut cur = random_program(template, space, &mut rng);
+        let mut cur = if params.seed_from_template {
+            template.clone()
+        } else {
+            random_program(template, space, &mut rng)
+        };
         let mut cur_cost = cost(&cur, golden, spec, params.w);
         let mut local_best = (cur.clone(), cur_cost);
         for i in 0..params.iters {
@@ -835,5 +843,115 @@ mod tests {
                 if bh + 2 < strict { "PHASE (shift helps)" } else { "VALUE (shift doesn't help)" }
             );
         }
+    }
+
+    /// A UART-TX program (8n1) built in IR with framing via `SET PINS`
+    /// rather than side-set:
+    ///   pull                 ; fetch byte
+    ///   set pins, 0  [7]     ; start bit low (8 cycles)
+    ///   set x, 7             ; bit counter
+    /// bitloop:
+    ///   out pins, 1  [6]     ; one data bit (LSB first), 8 cycles
+    ///   jmp x-- bitloop
+    ///   set pins, 1  [7]     ; stop bit high (8 cycles)
+    /// 6 instructions: framing, a counter, a loop, delays — meaningfully
+    /// harder than the 2-instruction SPI. Avoids side-set deliberately: the
+    /// emulator's merge overlays a latched opt side-set value onto OUT pins
+    /// every cycle (mod.rs merge_pin_outputs), so the pico same-pin
+    /// side-set+OUT UART would be mis-emulated. SET and OUT both land in
+    /// shared_pin_values with no overlay, so this is faithful.
+    fn uart_reference() -> (Program, RunSpec) {
+        const TX: u8 = 0;
+        let cfg = Config {
+            side: SideCfg::NONE,
+            side_pindir: false,
+            clkdiv_int: 1,
+            clkdiv_frac: 0,
+            shift: ShiftCfg {
+                autopull: false,
+                pull_threshold: 8,
+                out_dir: ShiftDir::Right, // UART is LSB first
+                ..ShiftCfg::default()
+            },
+            pins: PinMap { out_base: TX, out_count: 1, set_base: TX, set_count: 1, ..PinMap::default() },
+            ..Config::default()
+        };
+        let plain = |op| Some(Insn { op, delay: 0, sideset: None });
+        let delayed = |op, d| Some(Insn { op, delay: d, sideset: None });
+        let mut r = Program::empty(cfg);
+        r.slots[0] = plain(Op::Pull { if_empty: false, block: true });
+        r.slots[1] = delayed(Op::Set { dst: SetDst::Pins, data: 0 }, 7); // start, low, 8 cycles
+        r.slots[2] = plain(Op::Set { dst: SetDst::X, data: 7 });
+        r.slots[3] = delayed(Op::Out { dst: OutDst::Pins, count: 1 }, 6); // data bit, 7 cycles
+        r.slots[4] = plain(Op::Jmp { cond: JmpCond::XPostDec, target: 3 }); // loop -> 8 cycles/bit
+        r.slots[5] = delayed(Op::Set { dst: SetDst::Pins, data: 1 }, 7); // stop, high, 8 cycles
+        r.wrap_bottom = 0;
+        r.wrap_top = 5;
+        let spec = RunSpec {
+            block: 0,
+            sm: 0,
+            // Several distinct bytes (~82 cycles/frame): a program that
+            // ignores the input and replays one fixed pattern (e.g. driving
+            // the pin from the loop counter) can't match all of them. This
+            // is the anti-overfitting guard — a single byte is trivially
+            // overfittable.
+            inputs: vec![0x55, 0x3C, 0xF0, 0x41],
+            output_pins: vec![TX],
+            capture_pins: vec![TX],
+            cycles: 336,
+        };
+        (r, spec)
+    }
+
+    /// EXPERIMENT (not a hard assertion): does optimization-mode shrinking of
+    /// a known-correct UART reference stay tractable, while synthesis from
+    /// scratch falls off a cliff? Validates the scaling strategy before DME.
+    #[test]
+    #[ignore = "experiment; run with: cargo test --release -- --ignored uart_tx --nocapture"]
+    fn uart_tx_optimization_vs_synthesis() {
+        let (reference, spec) = uart_reference();
+        assert!(reference.validate().is_ok(), "{:?}", reference.validate());
+        let golden = run(&reference, &spec);
+        let tx: String = golden.iter().map(|s| if s & 1 != 0 { '#' } else { '_' }).collect();
+        let oe: String = golden.iter().map(|s| if (s >> 16) & 1 != 0 { '#' } else { '_' }).collect();
+        eprintln!("UART TX 0x55 level: {tx}");
+        eprintln!("UART TX 0x55 oe:    {oe}");
+        let rs = score(&reference, &golden, &spec);
+        eprintln!("reference: size={} correctness={}", rs.size, rs.correctness);
+
+        let side = SideCfg::NONE;
+
+        // OPTIMIZATION MODE: every restart starts from the reference; the
+        // search tries to shrink it while staying correct.
+        let opt_space = Space { slots: 7, side, search_wrap: true, genes: Genes::default() };
+        let opt_params = Params { iters: 3000, restarts: 16, seed_from_template: true, ..Params::default() };
+        let (opt_best, opt_s) = anneal(&reference, &opt_space, &golden, &spec, &opt_params, 0x0AA0);
+        eprintln!(
+            "\nOPTIMIZE (seed=reference): correctness={} size={}  [ref size {}]",
+            opt_s.correctness, opt_s.size, rs.size
+        );
+        for i in 0..opt_space.slots as usize {
+            if let Some(ins) = &opt_best.slots[i] {
+                eprintln!("  slot{i}: {:?}", ins);
+            }
+        }
+
+        // SYNTHESIS MODE: same config, but from scratch over a 6-slot window.
+        let syn_template = {
+            let (r, _) = uart_reference();
+            Program::empty(r.config)
+        };
+        let syn_space = Space { slots: 8, side, search_wrap: true, genes: Genes::default() };
+        let syn_params = Params { iters: 8000, restarts: 48, ..Params::default() };
+        let (_syn_best, syn_s) = anneal(&syn_template, &syn_space, &golden, &spec, &syn_params, 0x0AA1);
+        eprintln!(
+            "\nSYNTHESIZE (from scratch): correctness={} size={}  (0 = perfect)",
+            syn_s.correctness, syn_s.size
+        );
+
+        eprintln!(
+            "\n=> optimization residual {} vs synthesis residual {}",
+            opt_s.correctness, syn_s.correctness
+        );
     }
 }
