@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn roundtrip_wait() {
-        for src in [WaitSrc::GpioAbs, WaitSrc::PinRel, WaitSrc::Irq] {
+        for src in [WaitSrc::GpioAbs, WaitSrc::PinRel, WaitSrc::Irq, WaitSrc::JmpPin] {
             for polarity in [false, true] {
                 for index in [0u8, 5, 31] {
                     check_op(Op::Wait { polarity, src, index });
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn roundtrip_mov() {
         for dst in [
-            MovDst::Pins, MovDst::X, MovDst::Y, MovDst::Exec,
+            MovDst::Pins, MovDst::X, MovDst::Y, MovDst::PinDirs, MovDst::Exec,
             MovDst::Pc, MovDst::Isr, MovDst::Osr,
         ] {
             for op in [MovOp::None, MovOp::Invert, MovOp::BitReverse] {

@@ -70,13 +70,17 @@ pub enum JmpCond {
     NotOsrEmpty = 7, // !OSRE
 }
 
-/// WAIT source (operand bits [6:5]); code 3 is reserved and omitted.
+/// WAIT source (operand bits [6:5]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WaitSrc {
     GpioAbs = 0, // absolute GPIO index
     PinRel = 1,  // relative to IN_BASE
     Irq = 2,
+    /// RP2350 only: wait on PINCTRL_JMP_PIN + Index (Index must be 0..=3;
+    /// other Index values are reserved — not yet enforced, like the other
+    /// raw `index` fields).
+    JmpPin = 3,
 }
 
 /// IN source (operand bits [7:5]); codes 4,5 reserved and omitted.
@@ -105,13 +109,14 @@ pub enum OutDst {
     Exec = 7, // execute OSR contents as an instruction
 }
 
-/// MOV destination (operand bits [7:5]); code 3 reserved and omitted.
+/// MOV destination (operand bits [7:5]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MovDst {
     Pins = 0,
     X = 1,
     Y = 2,
+    PinDirs = 3, // RP2350 only (PIO v1); same pin mapping as OUT
     Exec = 4,
     Pc = 5, // computed jump
     Isr = 6,
