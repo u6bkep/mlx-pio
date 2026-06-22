@@ -673,6 +673,84 @@ fn strict_score(g: &Gene, golden: &[u32], mask: &[u32], spec: &RunSpec) -> Score
     score_masked(&g.lower(), golden, mask, spec)
 }
 
+/// The reliable synthesizer: run every `(schedule, seed)` combination and keep
+/// the strict-best gene.
+///
+/// Per-chain synthesis is low-rate and high-variance, and the right tolerance
+/// schedule is target-dependent (a fixed starting radius over-blurs short
+/// frames). A portfolio of diverse schedules crossed with multistart seeds
+/// turns both into non-issues: different schedules cover different targets, and
+/// the seeds cover per-instance variance. Each `synthesize_gene` is itself
+/// parallel (chains per stage), so the combinations run sequentially here.
+#[allow(clippy::too_many_arguments)]
+pub fn synthesize_portfolio(
+    config: Config,
+    golden: &[u32],
+    mask: &[u32],
+    spec: &RunSpec,
+    params: &Params,
+    schedules: &[&[Stage]],
+    max_len: usize,
+    elite_n: usize,
+    seeds: &[u64],
+) -> (Gene, Score) {
+    let mut best: Option<(Gene, Score)> = None;
+    for sch in schedules {
+        for &seed in seeds {
+            let (g, s) = synthesize_gene(config, golden, mask, spec, params, sch, max_len, elite_n, seed);
+            if best.as_ref().map_or(true, |(_, bs)| (s.correctness, s.size) < (bs.correctness, bs.size)) {
+                best = Some((g, s));
+            }
+            if best.as_ref().is_some_and(|(_, s)| s.correctness == 0) {
+                return best.unwrap();
+            }
+        }
+    }
+    best.expect("portfolio must have at least one schedule and seed")
+}
+
+/// Run `n` annealing+polish chains in parallel, each seeded round-robin from
+/// `pool` (or random if empty). Returns each chain's polished gene and cost.
+#[allow(clippy::too_many_arguments)]
+fn run_chains(
+    config: Config,
+    pool: &[Gene],
+    golden: &[u32],
+    mask: &[u32],
+    spec: &RunSpec,
+    params: &Params,
+    obj: &Obj,
+    n: u32,
+    seed: u64,
+) -> Vec<(Gene, f64)> {
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..n)
+            .map(|r| {
+                let start = if pool.is_empty() { None } else { Some(pool[r as usize % pool.len()].clone()) };
+                let cs = seed ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                s.spawn(move || {
+                    let g = anneal_chain(config, start, golden, mask, spec, params, obj, cs);
+                    let g = polish_gene(&g, golden, mask, spec, obj);
+                    let c = cost_gene(&g, golden, mask, spec, obj);
+                    (g, c)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+/// Count of structurally-distinct genes in a scored set.
+fn distinct_count(scored: &[(Gene, f64)]) -> usize {
+    let mut uniq: Vec<&Gene> = Vec::new();
+    for (g, _) in scored {
+        if !uniq.iter().any(|u| *u == g) {
+            uniq.push(g);
+        }
+    }
+    uniq.len()
+}
+
 /// Annealed-tolerance synthesis with **per-stage elitism** (graduated
 /// optimization + a (μ+λ) evolutionary outer loop).
 ///
@@ -699,44 +777,52 @@ pub fn synthesize_gene(
     elite_n: usize,
     seed: u64,
 ) -> (Gene, Score) {
-    let mut population: Vec<Gene> = Vec::new();
     let mut global_best: Option<(Gene, Score)> = None;
-
-    for (idx, stage) in schedule.iter().enumerate() {
-        let obj = Obj { w: params.w, size_weight: stage.size_weight, max_len, k: stage.k };
-        let pop = &population;
-        let scored: Vec<(Gene, f64)> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..params.restarts)
-                .map(|r| {
-                    let start = if pop.is_empty() { None } else { Some(pop[r as usize % pop.len()].clone()) };
-                    let chain_seed = seed
-                        ^ ((idx as u64).wrapping_mul(0x1000_0000_0000_0001))
-                        ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                    s.spawn(move || {
-                        let g = anneal_chain(config, start, golden, mask, spec, params, &obj, chain_seed);
-                        let g = polish_gene(&g, golden, mask, spec, &obj);
-                        let c = cost_gene(&g, golden, mask, spec, &obj);
-                        (g, c)
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-        population = elite(scored, elite_n);
-
-        // Track the globally strict-best across every elite, and early-exit on
-        // a certified-correct solution.
-        for g in &population {
+    // Fold a fresh elite set into the running strict-best; returns true if a
+    // certified-correct (strict 0) solution is now in hand.
+    let absorb = |pop: &[Gene], gb: &mut Option<(Gene, Score)>| -> bool {
+        for g in pop {
             let s = strict_score(g, golden, mask, spec);
-            let better = global_best.as_ref().map_or(true, |(_, bs)| {
-                (s.correctness, s.size) < (bs.correctness, bs.size)
-            });
-            if better {
-                global_best = Some((g.clone(), s));
+            if gb.as_ref().map_or(true, |(_, bs)| (s.correctness, s.size) < (bs.correctness, bs.size)) {
+                *gb = Some((g.clone(), s));
             }
         }
-        if global_best.as_ref().is_some_and(|(_, s)| s.correctness == 0) {
+        gb.as_ref().is_some_and(|(_, s)| s.correctness == 0)
+    };
+
+    // Stage 0 — adaptive diversity gathering. Keep launching batches of chains
+    // until we've collected `diversity_target` structurally-distinct elites or
+    // hit the chain cap. Front-loading basin diversity here is what later
+    // stages need to avoid committing to one stage-1 champion.
+    let s0 = schedule[0];
+    let obj0 = Obj { w: params.w, size_weight: s0.size_weight, max_len, k: s0.k };
+    let diversity_target = 2 * elite_n;
+    let max_chains = params.restarts * 8;
+    let mut scored: Vec<(Gene, f64)> = Vec::new();
+    let mut ran = 0u32;
+    while distinct_count(&scored) < diversity_target && ran < max_chains {
+        let batch = run_chains(
+            config, &[], golden, mask, spec, params, &obj0, params.restarts,
+            seed ^ (ran as u64).wrapping_mul(0x1000_0000_0000_0001),
+        );
+        scored.extend(batch);
+        ran += params.restarts;
+    }
+    let mut population = elite(scored, elite_n);
+    if absorb(&population, &mut global_best) {
+        return global_best.unwrap();
+    }
+
+    // Later stages — sharpen with a larger batch seeded from the elite pool.
+    let late_batch = params.restarts * 2;
+    for (idx, stage) in schedule.iter().enumerate().skip(1) {
+        let obj = Obj { w: params.w, size_weight: stage.size_weight, max_len, k: stage.k };
+        let batch = run_chains(
+            config, &population, golden, mask, spec, params, &obj, late_batch,
+            seed ^ ((idx as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)),
+        );
+        population = elite(batch, elite_n);
+        if absorb(&population, &mut global_best) {
             break;
         }
     }
@@ -893,6 +979,147 @@ mod tests {
             best.1
         );
         eprintln!("  best: {}", show_gene(&best.2));
+    }
+
+    /// DIAGNOSTIC: why does the `data_loop` k=4 near-miss
+    /// `pull / set y,3 / out[3] / jmp y--[3]` score 2, not 0, against the
+    /// reference `pull / set x,3 / out[6] / jmp x--[0]`? They look cycle-for-
+    /// cycle timing-equivalent. Print both waveforms and mark the differing
+    /// cycles — evidence before theories.
+    ///
+    /// Run: `cargo test --release -- --ignored diagnose_residual --nocapture`
+    #[test]
+    #[ignore = "diagnostic; run with --release ... --nocapture"]
+    fn diagnose_residual() {
+        let sp = spec(2 + 8 * 4);
+        let reference = data_loop_gene(4);
+        let near = Gene {
+            config: uart_cfg(),
+            nodes: vec![
+                pull(),
+                Node::Loop {
+                    cond: LoopCond::CountY,
+                    counter_init: Some(3),
+                    body: vec![Node::Prim(Insn {
+                        op: Op::Out { dst: OutDst::Pins, count: 1 },
+                        delay: 3,
+                        sideset: None,
+                    })],
+                    jmp_delay: 3,
+                },
+            ],
+        };
+        let g = run(&reference.lower(), &sp);
+        let c = run(&near.lower(), &sp);
+        let n = g.len().max(c.len());
+        let lvl = |w: &[u32], i: usize| if (w.get(i).copied().unwrap_or(0)) & 1 != 0 { '#' } else { '_' };
+        let oe = |w: &[u32], i: usize| if (w.get(i).copied().unwrap_or(0) >> 16) & 1 != 0 { '#' } else { '_' };
+        let refl: String = (0..n).map(|i| lvl(&g, i)).collect();
+        let nearl: String = (0..n).map(|i| lvl(&c, i)).collect();
+        let diff: String = (0..n).map(|i| if g.get(i) != c.get(i) { '^' } else { ' ' }).collect();
+        eprintln!("ref  lvl: {refl}");
+        eprintln!("near lvl: {nearl}");
+        eprintln!("diff:     {diff}");
+        eprintln!("ref  oe : {}", (0..n).map(|i| oe(&g, i)).collect::<String>());
+        eprintln!("near oe : {}", (0..n).map(|i| oe(&c, i)).collect::<String>());
+        let ndiff = (0..n).filter(|&i| g.get(i) != c.get(i)).count();
+        eprintln!("differing cycles (fresh): {ndiff}");
+
+        // Determinism probe: score `near` repeatedly, each time after running a
+        // DIFFERENT program on the same reused thread-local emulator. If the
+        // score wanders, reset() is leaking state between runs.
+        let golden = run(&reference.lower(), &sp);
+        let mask = full_mask(&golden);
+        let others = [uart_gene(8).lower(), uart_gene(4).lower(), data_loop_gene(8).lower(), near.lower()];
+        eprintln!("\ndeterminism probe (near's strict correctness, each after a different prior run):");
+        for (i, other) in others.iter().enumerate() {
+            let other_spec = spec(40 + i as u64 * 7);
+            let _ = run(other, &other_spec); // perturb the reused emulator
+            let s = score_masked(&near.lower(), &golden, &mask, &sp).correctness;
+            eprintln!("  after prior run {i}: near correctness = {s}");
+        }
+    }
+
+    fn sched(ks: &[(usize, f64)]) -> Vec<Stage> {
+        ks.iter().map(|&(k, size_weight)| Stage { k, size_weight }).collect()
+    }
+
+    /// PORTFOLIO: run diverse schedules × seeds and take the strict-best. The
+    /// sweep showed no single schedule is reliable and the right starting radius
+    /// is target-dependent; a portfolio covers both without knowing it. Reports
+    /// the combined solve over the whole (schedule × seed) set per target.
+    ///
+    /// Run: `cargo test --release -- --ignored gene_portfolio --nocapture`
+    #[test]
+    #[ignore = "portfolio; run with --release ... --nocapture"]
+    fn gene_portfolio() {
+        let params = Params { iters: 5000, restarts: 8, ..Params::default() };
+        let seeds: Vec<u64> = (0..8u64).map(|i| 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        // Two diverse starting radii: covers short frames (k4 start) and long (k8 start).
+        let portfolio = [
+            sched(&[(8, 0.25), (4, 0.25), (2, 0.5), (1, 0.5), (0, 1.0)]),
+            sched(&[(4, 0.25), (2, 0.5), (1, 0.5), (0, 1.0)]),
+        ];
+        for k in [4u8, 8] {
+            let usp = spec(18 + 8 * k as u64);
+            let ugolden = run(&uart_gene(k).lower(), &usp);
+            let umask = full_mask(&ugolden);
+            let mut best = u32::MAX;
+            let mut runs = 0;
+            let mut first_solve = None;
+            for (si, s) in portfolio.iter().enumerate() {
+                for &seed in &seeds {
+                    let c = synthesize_gene(uart_cfg(), &ugolden, &umask, &usp, &params, s, 10, 4, seed).1.correctness;
+                    runs += 1;
+                    if c < best {
+                        best = c;
+                    }
+                    if c == 0 && first_solve.is_none() {
+                        first_solve = Some((si, runs));
+                    }
+                }
+            }
+            eprintln!(
+                "UART k={k}: combined best={best} over {runs} runs | first solve at {:?} (schedule_idx, run#)",
+                first_solve
+            );
+        }
+    }
+
+    /// PARAMETER SWEEP: use parallelism to find a better tolerance schedule, and
+    /// to test the k=4<k=8 inversion theory (a fixed large starting radius
+    /// over-blurs the shorter frame and smears its data). Solve rate over seeds
+    /// for several schedules × both UART targets.
+    ///
+    /// Run: `cargo test --release -- --ignored gene_param_sweep --nocapture`
+    #[test]
+    #[ignore = "parameter sweep; run with --release ... --nocapture"]
+    fn gene_param_sweep() {
+        let params = Params { iters: 5000, restarts: 8, ..Params::default() };
+        let seeds: Vec<u64> = (0..6u64).map(|i| 0xBEEF ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        let schedules: Vec<(&str, Vec<Stage>)> = vec![
+            ("A k8 5-stage (default)", sched(&[(8, 0.25), (4, 0.25), (2, 0.5), (1, 0.5), (0, 1.0)])),
+            ("B k4 4-stage", sched(&[(4, 0.25), (2, 0.5), (1, 0.5), (0, 1.0)])),
+            ("C k2 3-stage", sched(&[(2, 0.5), (1, 0.5), (0, 1.0)])),
+            ("D k8 7-stage fine", sched(&[(8, 0.25), (6, 0.25), (4, 0.25), (3, 0.5), (2, 0.5), (1, 0.5), (0, 1.0)])),
+            ("E k1 2-stage", sched(&[(1, 0.5), (0, 1.0)])),
+        ];
+
+        for k in [4u8, 8] {
+            let usp = spec(18 + 8 * k as u64);
+            let ugolden = run(&uart_gene(k).lower(), &usp);
+            let umask = full_mask(&ugolden);
+            eprintln!("\n=== UART k={k} ===");
+            for (name, s) in &schedules {
+                let solved = seeds
+                    .iter()
+                    .filter(|&&seed| {
+                        synthesize_gene(uart_cfg(), &ugolden, &umask, &usp, &params, s, 10, 4, seed).1.correctness == 0
+                    })
+                    .count();
+                eprintln!("  {name:<24}: solved {solved}/{}", seeds.len());
+            }
+        }
     }
 
     /// RELIABILITY: how often does each target solve across seeds? Characterizes
