@@ -554,6 +554,40 @@ fn polish_gene(start: &Gene, golden: &[u32], mask: &[u32], spec: &RunSpec, obj: 
             }
         }
 
+        // 2-opt kick: when single edits stall, try the joint changes that sit
+        // behind a 2-coordinate barrier — re-counting a loop *and* deleting a
+        // node (the "loop-of-N-1 plus a tail bit" trap), or deleting two nodes
+        // at once. Reserved for the stall so it stays cheap.
+        if best.is_none() {
+            let loops: Vec<usize> =
+                (0..cur.nodes.len()).filter(|&i| matches!(cur.nodes[i], Node::Loop { .. })).collect();
+            for &li in &loops {
+                for c in 0..=31u8 {
+                    for j in 0..cur.nodes.len() {
+                        if j == li {
+                            continue;
+                        }
+                        let mut g = cur.clone();
+                        if let Node::Loop { cond, counter_init, .. } = &mut g.nodes[li] {
+                            if cond.is_counted() {
+                                *counter_init = Some(c);
+                            }
+                        }
+                        g.nodes.remove(j);
+                        consider(g, &mut best);
+                    }
+                }
+            }
+            for i in 0..cur.nodes.len() {
+                for j in (i + 1)..cur.nodes.len() {
+                    let mut g = cur.clone();
+                    g.nodes.remove(j);
+                    g.nodes.remove(i);
+                    consider(g, &mut best);
+                }
+            }
+        }
+
         match best {
             Some((g, c)) => {
                 cur = g;
@@ -564,46 +598,54 @@ fn polish_gene(start: &Gene, golden: &[u32], mask: &[u32], spec: &RunSpec, obj: 
     }
 }
 
-/// Anneal the gene genome at a fixed `size_weight`. Mirrors the slot annealer:
-/// Metropolis, geometric cooling, restarts. Returns the best gene and its cost.
-pub fn anneal_gene(
-    template: &Gene,
+/// One annealing chain: a single Metropolis run with geometric cooling from
+/// `start` (or a fresh random gene). Returns the chain's best gene. Stateless
+/// across chains, so chains parallelize freely.
+fn anneal_chain(
+    config: Config,
+    start: Option<Gene>,
     golden: &[u32],
     mask: &[u32],
     spec: &RunSpec,
     params: &Params,
     obj: &Obj,
     seed: u64,
-) -> (Gene, f64) {
+) -> Gene {
     let mut rng = Rng::new(seed);
-    let mut best: Option<(Gene, f64)> = None;
-    for _ in 0..params.restarts {
-        let mut cur = if params.seed_from_template {
-            template.clone()
-        } else {
-            random_gene(template.config, &mut rng)
-        };
-        let mut cur_cost = cost_gene(&cur, golden, mask, spec, obj);
-        let mut local_best = (cur.clone(), cur_cost);
-        for i in 0..params.iters {
-            let frac = i as f64 / params.iters as f64;
-            let t = params.t0 * (params.t_end / params.t0).powf(frac);
-            let cand = mutate_gene(&cur, &mut rng);
-            let cand_cost = cost_gene(&cand, golden, mask, spec, obj);
-            let d = cand_cost - cur_cost;
-            if d <= 0.0 || rng.unit() < (-d / t).exp() {
-                cur = cand;
-                cur_cost = cand_cost;
-            }
-            if cur_cost < local_best.1 {
-                local_best = (cur.clone(), cur_cost);
-            }
+    let mut cur = start.unwrap_or_else(|| random_gene(config, &mut rng));
+    let mut cur_cost = cost_gene(&cur, golden, mask, spec, obj);
+    let mut local_best = (cur.clone(), cur_cost);
+    for i in 0..params.iters {
+        let frac = i as f64 / params.iters as f64;
+        let t = params.t0 * (params.t_end / params.t0).powf(frac);
+        let cand = mutate_gene(&cur, &mut rng);
+        let cand_cost = cost_gene(&cand, golden, mask, spec, obj);
+        let d = cand_cost - cur_cost;
+        if d <= 0.0 || rng.unit() < (-d / t).exp() {
+            cur = cand;
+            cur_cost = cand_cost;
         }
-        if best.as_ref().map_or(true, |(_, bc)| local_best.1 < *bc) {
-            best = Some(local_best);
+        if cur_cost < local_best.1 {
+            local_best = (cur.clone(), cur_cost);
         }
     }
-    best.expect("at least one restart")
+    local_best.0
+}
+
+/// Top-`n` distinct genes by ascending cost (an elite set, deduplicated so the
+/// next stage keeps real diversity rather than n copies of one champion).
+fn elite(mut scored: Vec<(Gene, f64)>, n: usize) -> Vec<Gene> {
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<Gene> = Vec::new();
+    for (g, _) in scored {
+        if out.len() >= n {
+            break;
+        }
+        if !out.contains(&g) {
+            out.push(g);
+        }
+    }
+    out
 }
 
 /// One stage of the synthesis schedule: a tolerance radius `k` paired with a
@@ -626,11 +668,26 @@ pub const DEFAULT_SCHEDULE: [Stage; 5] = [
     Stage { k: 0, size_weight: 1.0 },
 ];
 
-/// Annealed-tolerance synthesis (graduated optimization). Each stage anneals
-/// (temperature **re-heated** from `params.t0` so the search can re-settle into
-/// the freshly-sharpened basin) then polishes, warm-starting the next, sharper
-/// stage from the result. The first stage starts random; the rest seed from the
-/// running champion. Returns the final gene and its **strict** (`k=0`) score.
+/// Strict (`k=0`) score of a gene — the certifying metric.
+fn strict_score(g: &Gene, golden: &[u32], mask: &[u32], spec: &RunSpec) -> Score {
+    score_masked(&g.lower(), golden, mask, spec)
+}
+
+/// Annealed-tolerance synthesis with **per-stage elitism** (graduated
+/// optimization + a (μ+λ) evolutionary outer loop).
+///
+/// Each stage runs `params.restarts` independent annealing chains **in
+/// parallel** (the thread-local emulator makes this free), polishes each, and
+/// keeps the top `elite_n` *distinct* genes as the seed population for the next,
+/// sharper stage. Carrying a diverse elite — not one champion — stops a chain
+/// from committing to a single stage-1 basin (the funnel that drove the high
+/// variance). Temperature re-heats each stage so the search re-settles into the
+/// freshly-sharpened landscape.
+///
+/// Adaptive: the **strict** (`k=0`) score of every elite is tracked across all
+/// stages, and the globally strict-best is returned — so a correct solution
+/// found early can't be lost to a later blurry stage (the easy-target
+/// regression), and the search exits as soon as it certifies correctness 0.
 pub fn synthesize_gene(
     config: Config,
     golden: &[u32],
@@ -639,18 +696,52 @@ pub fn synthesize_gene(
     params: &Params,
     schedule: &[Stage],
     max_len: usize,
+    elite_n: usize,
     seed: u64,
 ) -> (Gene, Score) {
-    let mut cur = Gene::empty(config);
+    let mut population: Vec<Gene> = Vec::new();
+    let mut global_best: Option<(Gene, Score)> = None;
+
     for (idx, stage) in schedule.iter().enumerate() {
         let obj = Obj { w: params.w, size_weight: stage.size_weight, max_len, k: stage.k };
-        let p = Params { seed_from_template: idx != 0, ..*params };
-        let stage_seed = seed ^ (idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let (g, _) = anneal_gene(&cur, golden, mask, spec, &p, &obj, stage_seed);
-        cur = polish_gene(&g, golden, mask, spec, &obj);
+        let pop = &population;
+        let scored: Vec<(Gene, f64)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..params.restarts)
+                .map(|r| {
+                    let start = if pop.is_empty() { None } else { Some(pop[r as usize % pop.len()].clone()) };
+                    let chain_seed = seed
+                        ^ ((idx as u64).wrapping_mul(0x1000_0000_0000_0001))
+                        ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    s.spawn(move || {
+                        let g = anneal_chain(config, start, golden, mask, spec, params, &obj, chain_seed);
+                        let g = polish_gene(&g, golden, mask, spec, &obj);
+                        let c = cost_gene(&g, golden, mask, spec, &obj);
+                        (g, c)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        population = elite(scored, elite_n);
+
+        // Track the globally strict-best across every elite, and early-exit on
+        // a certified-correct solution.
+        for g in &population {
+            let s = strict_score(g, golden, mask, spec);
+            let better = global_best.as_ref().map_or(true, |(_, bs)| {
+                (s.correctness, s.size) < (bs.correctness, bs.size)
+            });
+            if better {
+                global_best = Some((g.clone(), s));
+            }
+        }
+        if global_best.as_ref().is_some_and(|(_, s)| s.correctness == 0) {
+            break;
+        }
     }
-    let s = score_masked(&cur.lower(), golden, mask, spec);
-    (cur, s)
+
+    global_best.expect("schedule has at least one stage")
 }
 
 #[cfg(test)]
@@ -754,7 +845,7 @@ mod tests {
             let dgolden = run(&data_loop_gene(k).lower(), &dsp);
             let dmask = full_mask(&dgolden);
             // Length cap = reference size (4) + slack; bounds bloat like the slot window.
-            let (dg, ds) = synthesize_gene(uart_cfg(), &dgolden, &dmask, &dsp, &params, sched, 7, 0xDA7A + k as u64);
+            let (dg, ds) = synthesize_gene(uart_cfg(), &dgolden, &dmask, &dsp, &params, sched, 7, 4, 0xDA7A + k as u64);
             eprintln!("\ndata_loop k={k}: correctness={} size={}", ds.correctness, ds.size);
             eprintln!("  {}", show_gene(&dg));
 
@@ -763,7 +854,7 @@ mod tests {
             let ugolden = run(&uart_gene(k).lower(), &usp);
             let umask = full_mask(&ugolden);
             // Length cap = reference size (6) + slack.
-            let (ug, us) = synthesize_gene(uart_cfg(), &ugolden, &umask, &usp, &params, sched, 10, 0x0A27 + k as u64);
+            let (ug, us) = synthesize_gene(uart_cfg(), &ugolden, &umask, &usp, &params, sched, 10, 4, 0x0A27 + k as u64);
             eprintln!("UART k={k}: correctness={} size={}", us.correctness, us.size);
             eprintln!("  {}", show_gene(&ug));
         }
@@ -781,19 +872,16 @@ mod tests {
         max_len: usize,
         seeds: &[u64],
     ) {
-        let results: Vec<(u32, u8, Gene)> = std::thread::scope(|s| {
-            let handles: Vec<_> = seeds
-                .iter()
-                .map(|&seed| {
-                    s.spawn(move || {
-                        let (g, sc) =
-                            synthesize_gene(uart_cfg(), golden, mask, spec, params, &DEFAULT_SCHEDULE, max_len, seed);
-                        (sc.correctness, sc.size, g)
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
+        // Each synthesis is internally parallel (chains per stage), so run the
+        // seeds sequentially to avoid nested thread oversubscription.
+        let results: Vec<(u32, u8, Gene)> = seeds
+            .iter()
+            .map(|&seed| {
+                let (g, sc) =
+                    synthesize_gene(uart_cfg(), golden, mask, spec, params, &DEFAULT_SCHEDULE, max_len, 4, seed);
+                (sc.correctness, sc.size, g)
+            })
+            .collect();
         let solved = results.iter().filter(|(c, _, _)| *c == 0).count();
         let mut corrs: Vec<u32> = results.iter().map(|(c, _, _)| *c).collect();
         corrs.sort_unstable();
