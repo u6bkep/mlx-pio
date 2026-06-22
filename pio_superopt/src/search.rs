@@ -113,6 +113,11 @@ pub struct Params {
     /// (a known-correct reference) instead of a random one. Shrinks/improves
     /// a working program rather than synthesizing from scratch.
     pub seed_from_template: bool,
+    /// Enable building-block macro moves (e.g. insert a counted loop as one
+    /// atomic mutation). Targets the conjunctive bottleneck — assembling the
+    /// counted-loop spine — that point moves can't reach. Off by default so
+    /// the baseline experiments stay reproducible.
+    pub macro_moves: bool,
 }
 
 impl Default for Params {
@@ -120,7 +125,15 @@ impl Default for Params {
         // Temperature is scaled to the cost gap of a single wrong pin-cycle
         // (= w). t0 ~ 2w lets correctness barriers be crossed early;
         // t_end < w makes the tail greedy on size.
-        Params { iters: 4000, restarts: 24, t0: 128.0, t_end: 1.0, w: 64.0, seed_from_template: false }
+        Params {
+            iters: 4000,
+            restarts: 24,
+            t0: 128.0,
+            t_end: 1.0,
+            w: 64.0,
+            seed_from_template: false,
+            macro_moves: false,
+        }
     }
 }
 
@@ -214,16 +227,77 @@ fn set_random_wrap(p: &mut Program, slots: u8, rng: &mut Rng) {
     p.wrap_top = top;
 }
 
+/// Insert a **counted serialization** building block as one atomic move: fetch,
+/// counter init, a one-instruction shift body, and a post-decrement jump that
+/// closes the loop, with `wrap` set to enclose it —
+///
+///   pull            ; slot t    (fetch a word)
+///   set x, N        ; slot t+1  (N searchable — bit count)
+///   out pins, 1 [d] ; slot t+2  (the body; search may extend/replace it)
+///   jmp x-- ->t+2   ; slot t+3  (loop back to the body top)
+///
+/// This is the spine the diagnostics pinned as the synthesis bottleneck (see
+/// the decomposition experiments): point moves can't assemble it because the
+/// pieces are spatially separated with no gradient between them. Critically the
+/// block is **self-sufficient** — it includes `pull`, so when it lands it
+/// immediately serializes *real* data (not zeros from an empty OSR), giving it
+/// fitness to survive selection and accrete framing around. The search still
+/// chooses the count, delays, body, and how the loop integrates with framing,
+/// so novelty is preserved (it injects the idiom, not the solution).
+fn insert_counted_loop(m: &mut Program, space: &Space, rng: &mut Rng) {
+    let slots = space.slots as usize;
+    if slots < 4 {
+        return;
+    }
+    // Top slot leaves room for pull + set x + body + the closing jmp.
+    let t = rng.below(slots as u32 - 3) as usize;
+    let ss = |rng: &mut Rng| random_sideset(rng, &space.side);
+    m.slots[t] = Some(Insn { op: Op::Pull { if_empty: false, block: true }, delay: 0, sideset: ss(rng) });
+    m.slots[t + 1] = Some(Insn { op: Op::Set { dst: SetDst::X, data: rng.below(32) as u8 }, delay: 0, sideset: ss(rng) });
+    m.slots[t + 2] = Some(Insn { op: Op::Out { dst: OutDst::Pins, count: 1 }, delay: random_delay(rng, &space.side), sideset: ss(rng) });
+    m.slots[t + 3] = Some(Insn { op: Op::Jmp { cond: JmpCond::XPostDec, target: (t + 2) as u8 }, delay: 0, sideset: ss(rng) });
+    if space.search_wrap {
+        m.wrap_bottom = t as u8;
+        m.wrap_top = (t + 3) as u8;
+    }
+}
+
+/// Re-roll the immediate operand of an occupied slot's op **without changing
+/// the op kind** — the loop count in `set x,N`, an `out`/`in` bit count, a
+/// `jmp` target, a `wait`/`irq` index. Point moves otherwise can only change an
+/// immediate by re-rolling the whole op (losing the op), so a well-placed
+/// counted loop could never have its count dialed in. Ops with no immediate
+/// (mov, push, pull) are left unchanged.
+fn mutate_immediate(insn: &mut Insn, slots: u8, rng: &mut Rng) {
+    let new = match &insn.op {
+        Op::Set { dst, .. } => Op::Set { dst: *dst, data: rng.below(32) as u8 },
+        Op::Out { dst, .. } => Op::Out { dst: *dst, count: 1 + rng.below(32) as u8 },
+        Op::In { src, .. } => Op::In { src: *src, count: 1 + rng.below(32) as u8 },
+        Op::Jmp { cond, .. } => Op::Jmp { cond: *cond, target: rng.below(slots as u32) as u8 },
+        Op::Wait { polarity, src, .. } => Op::Wait { polarity: *polarity, src: *src, index: rng.below(32) as u8 },
+        Op::Irq { clear, wait, .. } => Op::Irq { clear: *clear, wait: *wait, index: rng.below(32) as u8 },
+        _ => return,
+    };
+    insn.op = new;
+}
+
 /// One mutation move. Always yields legal IR (range-aware by construction).
-fn mutate(p: &Program, space: &Space, rng: &mut Rng) -> Program {
+/// With `macros`, a fraction of moves insert a building-block idiom (see
+/// [`insert_counted_loop`]) instead of a single-field point edit.
+fn mutate(p: &Program, space: &Space, macros: bool, rng: &mut Rng) -> Program {
     let mut m = p.clone();
     let slots = space.slots;
+    // Building-block move: ~1 in 8 when enabled and the window has room.
+    if macros && slots >= 4 && rng.below(8) == 0 {
+        insert_counted_loop(&mut m, space, rng);
+        return m;
+    }
     // Roughly one move in five touches config, when any gene is live.
     if space.genes.any() && rng.below(5) == 0 {
         mutate_config_gene(&mut m.config, &space.genes, rng);
         return m;
     }
-    match rng.below(7) {
+    match rng.below(8) {
         0 => {
             // ReplaceOp
             let i = rng.below(slots as u32) as usize;
@@ -257,7 +331,15 @@ fn mutate(p: &Program, space: &Space, rng: &mut Rng) -> Program {
                 }
             }
         }
-        5 if space.search_wrap => set_random_wrap(&mut m, slots, rng), // Retarget wrap
+        5 => {
+            // MutateImmediate: re-roll an op's immediate, keep the op kind
+            if let Some(i) = pick_occupied(&m, slots, rng) {
+                if let Some(insn) = &mut m.slots[i] {
+                    mutate_immediate(insn, slots, rng);
+                }
+            }
+        }
+        6 if space.search_wrap => set_random_wrap(&mut m, slots, rng), // Retarget wrap
         _ => {
             // MutateOperand: re-roll the op, keep delay/sideset
             if let Some(i) = pick_occupied(&m, slots, rng) {
@@ -584,7 +666,7 @@ pub fn anneal_masked(
         for i in 0..params.iters {
             let frac = i as f64 / params.iters as f64;
             let t = params.t0 * (params.t_end / params.t0).powf(frac);
-            let cand = mutate(&cur, space, &mut rng);
+            let cand = mutate(&cur, space, params.macro_moves, &mut rng);
             let cand_cost = cost(&cand, golden, mask, spec, params.w);
             let d = cand_cost - cur_cost;
             if d <= 0.0 || rng.unit() < (-d / t).exp() {
@@ -1309,6 +1391,89 @@ mod tests {
         let (b, s) = best.unwrap();
         eprintln!("autopull serializer: best correctness={} size={}", s.correctness, s.size);
         eprintln!("  {}", show(&b, 3));
+    }
+
+    /// BUILDING-BLOCK MOVES on the SPINE (A/B, fast): does the self-sufficient
+    /// counted-serialization macro + immediate-tuning crack the framing-free
+    /// data loop (baseline ~6 at k=4)? This isolates the spine from framing for
+    /// a clean, fast signal. Macro off vs on, same budget/seeds.
+    ///
+    /// Run: `cargo test --release -- --ignored data_loop_macro --nocapture`
+    #[test]
+    #[ignore = "building-block A/B; run with --release ... --nocapture"]
+    fn data_loop_macro_moves() {
+        let side = SideCfg::NONE;
+        for k in [4u8, 8] {
+            let (reference, spec) = data_loop_reference(k);
+            let golden = run(&reference, &spec);
+            let slots = k + 3;
+            let space = Space { slots, side, search_wrap: true, genes: Genes::default() };
+            let template = Program::empty(reference.config);
+            eprintln!("\n===== data loop k={k}  window={slots}  ref-size={} =====", reference.size());
+            for macros in [false, true] {
+                let params = Params {
+                    iters: 6000,
+                    restarts: 16,
+                    seed_from_template: false,
+                    macro_moves: macros,
+                    ..Params::default()
+                };
+                let mut best: Option<(Program, crate::cost::Score)> = None;
+                for seed in 1u64..=3 {
+                    let (b, s) = anneal(&template, &space, &golden, &spec, &params, 0xD10 + seed);
+                    if best.as_ref().map_or(true, |(_, bs)| s.correctness < bs.correctness) {
+                        best = Some((b, s));
+                    }
+                }
+                let (b, s) = best.unwrap();
+                eprintln!("  macros={:<5} best correctness={:>3} size={}", macros, s.correctness, s.size);
+                eprintln!("    {}", show(&b, slots));
+            }
+        }
+    }
+
+    /// BUILDING-BLOCK MOVES (A/B): does injecting the counted-loop idiom as one
+    /// atomic move let the *full* UART frame synthesize from scratch, where
+    /// point-move synthesis cliffs? Same budget/seeds, macro_moves off vs on.
+    /// Off is the committed baseline (full UART plateaus ~67; the spine is the
+    /// wall). On reaching 0 (or far lower) confirms the lever.
+    ///
+    /// Run: `cargo test --release -- --ignored uart_macro_moves --nocapture`
+    #[test]
+    #[ignore = "building-block A/B; run with --release ... --nocapture"]
+    fn uart_macro_moves() {
+        let side = SideCfg::NONE;
+        for k in [4u8, 8] {
+            let (reference, spec) = k_bit_uart_reference(k);
+            let golden = run(&reference, &spec);
+            let slots = k + 4;
+            let space = Space { slots, side, search_wrap: true, genes: Genes::default() };
+            let template = Program::empty(reference.config);
+            eprintln!("\n===== full UART k={k}  window={slots}  ref-size={} =====", reference.size());
+
+            for macros in [false, true] {
+                let params = Params {
+                    iters: 6000,
+                    restarts: 16,
+                    seed_from_template: false,
+                    macro_moves: macros,
+                    ..Params::default()
+                };
+                let mut best: Option<(Program, crate::cost::Score)> = None;
+                for seed in 1u64..=3 {
+                    let (b, s) = anneal(&template, &space, &golden, &spec, &params, 0x6A60 + seed);
+                    if best.as_ref().map_or(true, |(_, bs)| s.correctness < bs.correctness) {
+                        best = Some((b, s));
+                    }
+                }
+                let (b, s) = best.unwrap();
+                eprintln!(
+                    "  macros={:<5} best correctness={:>3} size={}",
+                    macros, s.correctness, s.size
+                );
+                eprintln!("    {}", show(&b, slots));
+            }
+        }
     }
 
     /// FORK A, STEP 1 (premise + fragment): does the framing-free data loop
