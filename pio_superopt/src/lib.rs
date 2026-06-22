@@ -24,7 +24,7 @@ pub mod rng;
 pub mod run;
 pub mod search;
 
-pub use cost::{hamming, score, Score};
+pub use cost::{hamming, hamming_masked, score, score_masked, Score};
 pub use decode::{decode_insn, DecodeError};
 pub use encode::encode_insn;
 pub use ir::{Insn, Op, SideCfg};

@@ -9,7 +9,7 @@
 //! The first validation fixes the SM config and searches only the
 //! instruction slots + wrap, within a small slot window.
 
-use crate::cost::score;
+use crate::cost::score_masked;
 use crate::ir::*;
 use crate::program::{Config, Program, ShiftDir};
 use crate::rng::Rng;
@@ -280,14 +280,22 @@ fn pick_occupied(p: &Program, slots: u8, rng: &mut Rng) -> Option<usize> {
 }
 
 /// The scalar cost: `w * correctness + size`, infinite for an illegal
-/// genome (decision ②). Lower is better.
-fn cost(p: &Program, golden: &[u32], spec: &RunSpec, w: f64) -> f64 {
-    let s = score(p, golden, spec);
+/// genome (decision ②). Lower is better. `correctness` is masked Hamming —
+/// a full (all-ones) mask is the strict metric; a partial mask scores one
+/// sub-waveform (e.g. framing only) for the curriculum.
+fn cost(p: &Program, golden: &[u32], mask: &[u32], spec: &RunSpec, w: f64) -> f64 {
+    let s = score_masked(p, golden, mask, spec);
     if !s.valid {
         f64::INFINITY
     } else {
         w * s.correctness as f64 + s.size as f64
     }
+}
+
+/// An all-ones mask over a golden's length — the strict metric, where every
+/// captured bit must match.
+fn full_mask(golden: &[u32]) -> Vec<u32> {
+    vec![u32::MAX; golden.len()]
 }
 
 /// A slot's `(delay, sideset)` for re-op'ing it, or the defaults a freshly
@@ -373,8 +381,8 @@ fn op_neighbors(slots: u8) -> Vec<Op> {
     v
 }
 
-fn consider(cand: Program, cur_cost: f64, best: &mut Option<(Program, f64)>, golden: &[u32], spec: &RunSpec, w: f64) {
-    let c = cost(&cand, golden, spec, w);
+fn consider(cand: Program, cur_cost: f64, best: &mut Option<(Program, f64)>, golden: &[u32], mask: &[u32], spec: &RunSpec, w: f64) {
+    let c = cost(&cand, golden, mask, spec, w);
     if c < cur_cost && best.as_ref().map_or(true, |(_, bc)| c < *bc) {
         *best = Some((cand, c));
     }
@@ -403,6 +411,20 @@ pub fn polish(
     w: f64,
     two_opt: bool,
 ) -> Program {
+    polish_masked(start, space, golden, &full_mask(golden), spec, w, two_opt)
+}
+
+/// Masked variant of [`polish`]: local search against a partial-credit mask.
+/// The strict [`polish`] is this with a full mask.
+pub fn polish_masked(
+    start: &Program,
+    space: &Space,
+    golden: &[u32],
+    mask: &[u32],
+    spec: &RunSpec,
+    w: f64,
+    two_opt: bool,
+) -> Program {
     let ops = op_neighbors(space.slots);
     let sidesets = legal_sidesets(&space.side);
     let max_delay = space.side.max_delay();
@@ -410,7 +432,7 @@ pub fn polish(
     let fill_ss = if space.side.count.min(5) > 0 && !space.side.en { Some(0) } else { None };
 
     let mut cur = start.clone();
-    let mut cur_cost = cost(&cur, golden, spec, w);
+    let mut cur_cost = cost(&cur, golden, mask, spec, w);
 
     loop {
         let mut best: Option<(Program, f64)> = None;
@@ -423,7 +445,7 @@ pub fn polish(
             for op in &ops {
                 let mut cand = cur.clone();
                 cand.slots[i] = Some(Insn { op: op.clone(), delay, sideset: base_ss });
-                consider(cand, cur_cost, &mut best, golden, spec, w);
+                consider(cand, cur_cost, &mut best, golden, mask, spec, w);
             }
             if cur.slots[i].is_some() {
                 for &ss in &sidesets {
@@ -431,19 +453,19 @@ pub fn polish(
                     if let Some(ins) = &mut cand.slots[i] {
                         ins.sideset = ss;
                     }
-                    consider(cand, cur_cost, &mut best, golden, spec, w);
+                    consider(cand, cur_cost, &mut best, golden, mask, spec, w);
                 }
                 for d in 0..=max_delay {
                     let mut cand = cur.clone();
                     if let Some(ins) = &mut cand.slots[i] {
                         ins.delay = d;
                     }
-                    consider(cand, cur_cost, &mut best, golden, spec, w);
+                    consider(cand, cur_cost, &mut best, golden, mask, spec, w);
                 }
             }
             let mut cleared = cur.clone();
             cleared.slots[i] = None;
-            consider(cleared, cur_cost, &mut best, golden, spec, w);
+            consider(cleared, cur_cost, &mut best, golden, mask, spec, w);
         }
 
         if space.search_wrap {
@@ -452,7 +474,7 @@ pub fn polish(
                     let mut cand = cur.clone();
                     cand.wrap_bottom = b;
                     cand.wrap_top = t;
-                    consider(cand, cur_cost, &mut best, golden, spec, w);
+                    consider(cand, cur_cost, &mut best, golden, mask, spec, w);
                 }
             }
         }
@@ -462,21 +484,21 @@ pub fn polish(
             for dir in [ShiftDir::Left, ShiftDir::Right] {
                 let mut cand = cur.clone();
                 cand.config.shift.out_dir = dir;
-                consider(cand, cur_cost, &mut best, golden, spec, w);
+                consider(cand, cur_cost, &mut best, golden, mask, spec, w);
             }
         }
         if g.autopull {
             for ap in [false, true] {
                 let mut cand = cur.clone();
                 cand.config.shift.autopull = ap;
-                consider(cand, cur_cost, &mut best, golden, spec, w);
+                consider(cand, cur_cost, &mut best, golden, mask, spec, w);
             }
         }
         if g.pull_threshold {
             for thr in 1..=32u8 {
                 let mut cand = cur.clone();
                 cand.config.shift.pull_threshold = thr;
-                consider(cand, cur_cost, &mut best, golden, spec, w);
+                consider(cand, cur_cost, &mut best, golden, mask, spec, w);
             }
         }
         if g.clkdiv {
@@ -484,12 +506,12 @@ pub fn polish(
                 let mut cand = cur.clone();
                 cand.config.clkdiv_int = int;
                 cand.config.clkdiv_frac = 0;
-                consider(cand, cur_cost, &mut best, golden, spec, w);
+                consider(cand, cur_cost, &mut best, golden, mask, spec, w);
             }
             for frac in 0..=255u8 {
                 let mut cand = cur.clone();
                 cand.config.clkdiv_frac = frac;
-                consider(cand, cur_cost, &mut best, golden, spec, w);
+                consider(cand, cur_cost, &mut best, golden, mask, spec, w);
             }
         }
 
@@ -505,7 +527,7 @@ pub fn polish(
                             let mut cand = cur.clone();
                             cand.slots[i] = Some(Insn { op: oa.clone(), delay: di, sideset: si });
                             cand.slots[j] = Some(Insn { op: ob.clone(), delay: dj, sideset: sj });
-                            consider(cand, cur_cost, &mut best, golden, spec, w);
+                            consider(cand, cur_cost, &mut best, golden, mask, spec, w);
                         }
                     }
                 }
@@ -522,11 +544,29 @@ pub fn polish(
     }
 }
 
-/// Anneal and return the best program found and its score.
+/// Anneal against the strict (all-bits) metric and return the best program
+/// and its score. Thin wrapper over [`anneal_masked`] with a full mask.
 pub fn anneal(
     template: &Program,
     space: &Space,
     golden: &[u32],
+    spec: &RunSpec,
+    params: &Params,
+    seed: u64,
+) -> (Program, crate::cost::Score) {
+    anneal_masked(template, space, golden, &full_mask(golden), spec, params, seed)
+}
+
+/// Anneal against a partial-credit `mask` (see [`hamming_masked`]). A curriculum
+/// stage masks out the not-yet-targeted cycles (e.g. data) so the search scores
+/// only the sub-waveform it should solve now; warm-starting the next stage
+/// (`seed_from_template`) from this stage's champion carries the structure
+/// forward. The returned `Score.correctness` is measured under the same mask.
+pub fn anneal_masked(
+    template: &Program,
+    space: &Space,
+    golden: &[u32],
+    mask: &[u32],
     spec: &RunSpec,
     params: &Params,
     seed: u64,
@@ -539,13 +579,13 @@ pub fn anneal(
         } else {
             random_program(template, space, &mut rng)
         };
-        let mut cur_cost = cost(&cur, golden, spec, params.w);
+        let mut cur_cost = cost(&cur, golden, mask, spec, params.w);
         let mut local_best = (cur.clone(), cur_cost);
         for i in 0..params.iters {
             let frac = i as f64 / params.iters as f64;
             let t = params.t0 * (params.t_end / params.t0).powf(frac);
             let cand = mutate(&cur, space, &mut rng);
-            let cand_cost = cost(&cand, golden, spec, params.w);
+            let cand_cost = cost(&cand, golden, mask, spec, params.w);
             let d = cand_cost - cur_cost;
             if d <= 0.0 || rng.unit() < (-d / t).exp() {
                 cur = cand;
@@ -557,8 +597,8 @@ pub fn anneal(
         }
         // Cheap single-move polish of this restart's best, folded into the
         // global best. (The expensive 2-opt is saved for one final pass.)
-        let polished = polish(&local_best.0, space, golden, spec, params.w, false);
-        let pc = cost(&polished, golden, spec, params.w);
+        let polished = polish_masked(&local_best.0, space, golden, mask, spec, params.w, false);
+        let pc = cost(&polished, golden, mask, spec, params.w);
         if best.as_ref().map_or(true, |(_, bc)| pc < *bc) {
             best = Some((polished, pc));
         }
@@ -567,14 +607,15 @@ pub fn anneal(
     // Final polish of the global best with the 2-opt kick — grinds out
     // residuals that sit two coordinated op-swaps from the optimum.
     let (p, _) = best.expect("at least one restart");
-    let p = polish(&p, space, golden, spec, params.w, true);
-    let s = score(&p, golden, spec);
+    let p = polish_masked(&p, space, golden, mask, spec, params.w, true);
+    let s = score_masked(&p, golden, mask, spec);
     (p, s)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cost::score;
     use crate::program::*;
     use crate::run::run;
 
@@ -953,5 +994,426 @@ mod tests {
             "\n=> optimization residual {} vs synthesis residual {}",
             opt_s.correctness, syn_s.correctness
         );
+    }
+
+    /// A k-data-bit UART-TX frame (8n1 framing, k bits of payload). Same
+    /// structure as `uart_reference` for every k — only the bit counter
+    /// (`set x, k-1`) changes. The golden waveform is start-low (8 cyc), then
+    /// k data bits (8 cyc each, LSB first), then stop-high (8 cyc), per byte.
+    ///
+    /// This is the rung generator for the bit-count curriculum: rung k targets
+    /// a k-bit frame. The loop-free optimum unrolls to `pull / set0 / out[7]×k
+    /// / set1` (k+3 slots, grows by one `out` per rung); the looped optimum is
+    /// the 6-slot reference for *every* k (only `set x` differs). Either way,
+    /// rung k's solution is a short edit from rung k+1's.
+    /// Framing-free **data loop**: serialize a k-bit byte LSB-first to the pin,
+    /// 8 cycles per bit, back-to-back across bytes — no start/stop framing. This
+    /// is the conjunctive core of UART (FIFO read + counted shift loop) in
+    /// isolation; structurally it's SPI-TX without the clock, which we know
+    /// synthesizes from scratch. Fork A synthesizes this fragment, then composes
+    /// framing around it.
+    ///
+    ///   pull          ; fetch byte
+    ///   set x, k-1    ; bit counter
+    /// loop:
+    ///   out pins, 1 [6]   ; one bit, 7 cyc
+    ///   jmp x-- loop      ; +1 = 8 cyc/bit
+    fn data_loop_reference(k: u8) -> (Program, RunSpec) {
+        const TX: u8 = 0;
+        let cfg = Config {
+            side: SideCfg::NONE,
+            side_pindir: false,
+            clkdiv_int: 1,
+            clkdiv_frac: 0,
+            shift: ShiftCfg {
+                autopull: false,
+                pull_threshold: 8,
+                out_dir: ShiftDir::Right, // LSB first
+                ..ShiftCfg::default()
+            },
+            pins: PinMap { out_base: TX, out_count: 1, set_base: TX, set_count: 1, ..PinMap::default() },
+            ..Config::default()
+        };
+        let plain = |op| Some(Insn { op, delay: 0, sideset: None });
+        let delayed = |op, d| Some(Insn { op, delay: d, sideset: None });
+        let mut r = Program::empty(cfg);
+        r.slots[0] = plain(Op::Pull { if_empty: false, block: true });
+        r.slots[1] = plain(Op::Set { dst: SetDst::X, data: k - 1 });
+        r.slots[2] = delayed(Op::Out { dst: OutDst::Pins, count: 1 }, 6); // 7 cyc
+        r.slots[3] = plain(Op::Jmp { cond: JmpCond::XPostDec, target: 2 }); // +1 = 8 cyc/bit
+        r.wrap_bottom = 0;
+        r.wrap_top = 3;
+        // Per byte: pull(1) + setx(1) + k*(out[6]=7 + jmp=1).
+        let frame = 2 + 8 * k as u64;
+        let spec = RunSpec {
+            block: 0,
+            sm: 0,
+            inputs: vec![0x55, 0x3C, 0xF0, 0x41],
+            output_pins: vec![TX],
+            capture_pins: vec![TX],
+            cycles: 4 * frame,
+        };
+        (r, spec)
+    }
+
+    fn k_bit_uart_reference(k: u8) -> (Program, RunSpec) {
+        const TX: u8 = 0;
+        let cfg = Config {
+            side: SideCfg::NONE,
+            side_pindir: false,
+            clkdiv_int: 1,
+            clkdiv_frac: 0,
+            shift: ShiftCfg {
+                autopull: false,
+                pull_threshold: 8,
+                out_dir: ShiftDir::Right, // UART is LSB first
+                ..ShiftCfg::default()
+            },
+            pins: PinMap { out_base: TX, out_count: 1, set_base: TX, set_count: 1, ..PinMap::default() },
+            ..Config::default()
+        };
+        let plain = |op| Some(Insn { op, delay: 0, sideset: None });
+        let delayed = |op, d| Some(Insn { op, delay: d, sideset: None });
+        let mut r = Program::empty(cfg);
+        r.slots[0] = plain(Op::Pull { if_empty: false, block: true });
+        r.slots[1] = delayed(Op::Set { dst: SetDst::Pins, data: 0 }, 7); // start, low, 8 cyc
+        r.slots[2] = plain(Op::Set { dst: SetDst::X, data: k - 1 }); // bit counter
+        r.slots[3] = delayed(Op::Out { dst: OutDst::Pins, count: 1 }, 6); // data bit, 7+jmp = 8 cyc
+        r.slots[4] = plain(Op::Jmp { cond: JmpCond::XPostDec, target: 3 });
+        r.slots[5] = delayed(Op::Set { dst: SetDst::Pins, data: 1 }, 7); // stop, high, 8 cyc
+        r.wrap_bottom = 0;
+        r.wrap_top = 5;
+        // Per byte: pull(1) + set0[7](8) + setx(1) + k*(out[6]=7 + jmp=1) + set1[7](8).
+        let frame = 18 + 8 * k as u64;
+        let spec = RunSpec {
+            block: 0,
+            sm: 0,
+            // Distinct low bits across the four bytes defeat the "ignore the
+            // input, replay a constant" exploit even at k=1 (low bits 1,0,0,1).
+            inputs: vec![0x55, 0x3C, 0xF0, 0x41],
+            output_pins: vec![TX],
+            capture_pins: vec![TX],
+            cycles: 4 * frame,
+        };
+        (r, spec)
+    }
+
+    /// Compact one-line rendering of a program's occupied slots + wrap, for
+    /// experiment logs.
+    fn brief(ins: &Insn) -> String {
+        let d = if ins.delay > 0 { format!("[{}]", ins.delay) } else { String::new() };
+        let ss = match ins.sideset {
+            Some(v) => format!(".s{v}"),
+            None => String::new(),
+        };
+        let op = match &ins.op {
+            Op::Jmp { cond, target } => format!("jmp {cond:?}->{target}"),
+            Op::Wait { polarity, src, index } => format!("wait{} {src:?}{index}", *polarity as u8),
+            Op::In { src, count } => format!("in {src:?},{count}"),
+            Op::Out { dst, count } => format!("out {dst:?},{count}"),
+            Op::Push { .. } => "push".into(),
+            Op::Pull { .. } => "pull".into(),
+            Op::Mov { dst, op, src } => format!("mov {dst:?},{op:?}{src:?}"),
+            Op::Irq { index, .. } => format!("irq {index}"),
+            Op::Set { dst, data } => format!("set {dst:?},{data}"),
+        };
+        format!("{op}{ss}{d}")
+    }
+
+    fn show(p: &Program, slots: u8) -> String {
+        let parts: Vec<String> = (0..slots as usize)
+            .filter_map(|i| p.slots[i].as_ref().map(|ins| format!("{i}:{}", brief(ins))))
+            .collect();
+        format!("wrap({},{}) [{}]", p.wrap_bottom, p.wrap_top, parts.join("  "))
+    }
+
+    /// DIAGNOSTIC: is the *base* of the bit-count curriculum — a single 1-bit
+    /// UART frame — even synthesizable from scratch? The full ramp plateaued at
+    /// rung 1 (correctness 16, a degenerate pin-toggle). This isolates whether
+    /// that's a budget problem (5-slot window + free delays + required `pull` is
+    /// a far bigger space than SPI's 2 slots) or a conjunction wall (a 1-bit
+    /// frame is still load+drive+frame+time simultaneously, with no partial
+    /// credit). Tight 4-slot window, large budget, several seeds.
+    ///
+    /// Run: `cargo test --release -- --ignored uart_k1_base --nocapture`
+    #[test]
+    #[ignore = "diagnostic; run with --release ... --nocapture"]
+    fn uart_k1_base_solvable() {
+        let side = SideCfg::NONE;
+        let (reference, spec) = k_bit_uart_reference(1);
+        let golden = run(&reference, &spec);
+
+        // Sanity: the true reference scores 0, and optimization-mode holds it.
+        let rs = score(&reference, &golden, &spec);
+        eprintln!("reference: correctness={} size={}  [{}]", rs.correctness, rs.size, show(&reference, 6));
+        assert_eq!(rs.correctness, 0, "reference must match itself");
+
+        // From scratch, tight window, big budget, multiple seeds.
+        let space = Space { slots: 4, side, search_wrap: true, genes: Genes::default() };
+        let params = Params { iters: 15000, restarts: 48, seed_from_template: false, ..Params::default() };
+        let template = Program::empty(reference.config);
+        let mut best_overall = u32::MAX;
+        for seed in 1u64..=6 {
+            let (best, s) = anneal(&template, &space, &golden, &spec, &params, seed);
+            best_overall = best_overall.min(s.correctness);
+            eprintln!("seed {seed}: correctness={:>3} size={} | {}", s.correctness, s.size, show(&best, 4));
+        }
+        eprintln!("\n=> best correctness over 6 seeds: {best_overall} (0 = base is synthesizable)");
+    }
+
+    /// CURRICULUM EXPERIMENT (not a hard assertion): does a bit-count ramp,
+    /// warm-starting each rung from the previous rung's champion, bridge the
+    /// synthesis cliff that defeats cold UART synthesis (correctness ~67)?
+    ///
+    /// Rung k targets a k-bit UART frame in a (k+4)-slot window. Rung 1 is cold
+    /// synthesis (no prior). Rungs 2..8 seed every restart from the previous
+    /// champion. A cold-synthesis control at k=8 measures the cliff in this same
+    /// harness for comparison. Reports correctness/size/structure per rung —
+    /// where (if anywhere) the ladder cliffs tells us whether the barrier is
+    /// reach (warm-start bridges it) or a structural seam (needs composition).
+    ///
+    /// Run: `cargo test --release -- --ignored uart_curriculum --nocapture`
+    #[test]
+    #[ignore = "curriculum experiment; run with --release ... --nocapture"]
+    fn uart_curriculum_bit_ramp() {
+        let side = SideCfg::NONE;
+        let mut champion: Option<Program> = None;
+
+        eprintln!("k | win | seed | correctness | size | structure");
+        eprintln!("--+-----+------+-------------+------+----------");
+        for k in 1u8..=8 {
+            let (reference, spec) = k_bit_uart_reference(k);
+            assert!(reference.validate().is_ok(), "{:?}", reference.validate());
+            let golden = run(&reference, &spec);
+            let slots = k + 4; // unrolled (k+3) plus a slack slot
+            let space = Space { slots, side, search_wrap: true, genes: Genes::default() };
+
+            let (template, seed_kind, params) = match &champion {
+                Some(c) => (
+                    c.clone(),
+                    "warm",
+                    Params { iters: 3000, restarts: 8, seed_from_template: true, ..Params::default() },
+                ),
+                None => (
+                    Program::empty(reference.config),
+                    "cold",
+                    Params { iters: 6000, restarts: 24, seed_from_template: false, ..Params::default() },
+                ),
+            };
+
+            let (best, s) = anneal(&template, &space, &golden, &spec, &params, 0xC0FFEE + k as u64);
+            eprintln!(
+                "{k} | {slots:>3} | {seed_kind} | {:>11} | {:>4} | {}",
+                s.correctness,
+                s.size,
+                show(&best, slots),
+            );
+            champion = Some(best);
+        }
+
+        // CONTROL: cold synthesis straight at k=8, same harness, comparable
+        // total budget to the curriculum (~8 rungs worth). Expected to cliff.
+        let (reference, spec) = k_bit_uart_reference(8);
+        let golden = run(&reference, &spec);
+        let space = Space { slots: 12, side, search_wrap: true, genes: Genes::default() };
+        let template = Program::empty(reference.config);
+        let params = Params { iters: 8000, restarts: 48, seed_from_template: false, ..Params::default() };
+        let (cold, cs) = anneal(&template, &space, &golden, &spec, &params, 0x0AA1);
+        eprintln!("\nCONTROL cold k=8: correctness={} size={}", cs.correctness, cs.size);
+        eprintln!("  {}", show(&cold, 12));
+    }
+
+    /// Per-cycle, per-bit "framing" mask: care about every captured bit that is
+    /// **data-independent** — identical across two input sets that differ in
+    /// every data bit. Running the reference on the real bytes and on their
+    /// complement, the cycles/bits that agree are framing/idle/OE (not data);
+    /// the data cycles diverge and become don't-care. No hardcoded cycle math —
+    /// this derives the mask from the protocol's own behavior, so it generalizes.
+    fn framing_mask(reference: &Program, spec: &RunSpec) -> (Vec<u32>, Vec<u32>) {
+        let golden_a = run(reference, spec);
+        let spec_b = RunSpec {
+            inputs: spec.inputs.iter().map(|w| w ^ 0xFF).collect(), // flip all 8 data bits
+            ..spec.clone()
+        };
+        let golden_b = run(reference, &spec_b);
+        let mask: Vec<u32> = golden_a
+            .iter()
+            .zip(&golden_b)
+            .map(|(a, b)| !(a ^ b)) // care where the two runs agree
+            .collect();
+        (golden_a, mask)
+    }
+
+    /// Autopull serializer: continuous LSB-first serialization with **autopull
+    /// ON** (threshold 8) and a free `wrap` loop — no explicit `pull`, no
+    /// counter. This is the SPI-style structure that avoids the counted-loop
+    /// spine. Contrast with `data_loop_reference` (explicit pull+counter+jmp).
+    ///
+    ///   out pins, 1 [7]   ; wrap(0,0); OSR auto-refills every 8 bits
+    fn serializer_autopull_reference() -> (Program, RunSpec) {
+        const TX: u8 = 0;
+        let cfg = Config {
+            side: SideCfg::NONE,
+            side_pindir: false,
+            clkdiv_int: 1,
+            clkdiv_frac: 0,
+            shift: ShiftCfg {
+                autopull: true,
+                pull_threshold: 8,
+                out_dir: ShiftDir::Right,
+                ..ShiftCfg::default()
+            },
+            pins: PinMap { out_base: TX, out_count: 1, set_base: TX, set_count: 1, ..PinMap::default() },
+            ..Config::default()
+        };
+        let mut r = Program::empty(cfg);
+        r.slots[0] = Some(Insn { op: Op::Out { dst: OutDst::Pins, count: 1 }, delay: 7, sideset: None });
+        r.wrap_bottom = 0;
+        r.wrap_top = 0;
+        let spec = RunSpec {
+            block: 0,
+            sm: 0,
+            inputs: vec![0x55, 0x3C, 0xF0, 0x41],
+            output_pins: vec![TX],
+            capture_pins: vec![TX],
+            cycles: 4 * 8 * 8, // 4 bytes * 8 bits * 8 cyc/bit
+        };
+        (r, spec)
+    }
+
+    /// CONTROL for the spine hypothesis: the autopull serializer (no spine)
+    /// should synthesize to ~0, where the explicit-spine `data_loop` plateaus
+    /// at 6/26. If so, the conjunctive obstacle is the FIFO-management +
+    /// counted-loop spine, not framing and not length.
+    ///
+    /// Run: `cargo test --release -- --ignored serializer_autopull --nocapture`
+    #[test]
+    #[ignore = "control; run with --release ... --nocapture"]
+    fn serializer_autopull_synthesizes() {
+        let side = SideCfg::NONE;
+        let (reference, spec) = serializer_autopull_reference();
+        assert!(reference.validate().is_ok(), "{:?}", reference.validate());
+        let golden = run(&reference, &spec);
+        assert_eq!(score(&reference, &golden, &spec).correctness, 0);
+
+        let space = Space { slots: 3, side, search_wrap: true, genes: Genes::default() };
+        let template = Program::empty(reference.config);
+        let params = Params { iters: 4000, restarts: 12, seed_from_template: false, ..Params::default() };
+        let mut best: Option<(Program, crate::cost::Score)> = None;
+        for seed in 1u64..=4 {
+            let (b, s) = anneal(&template, &space, &golden, &spec, &params, 0x5E21A1 + seed);
+            if best.as_ref().map_or(true, |(_, bs)| s.correctness < bs.correctness) {
+                best = Some((b, s));
+            }
+        }
+        let (b, s) = best.unwrap();
+        eprintln!("autopull serializer: best correctness={} size={}", s.correctness, s.size);
+        eprintln!("  {}", show(&b, 3));
+    }
+
+    /// FORK A, STEP 1 (premise + fragment): does the framing-free data loop
+    /// synthesize from scratch? It's the conjunctive core of UART in isolation.
+    /// If this reaches strict-0 where cold *full*-UART synthesis cliffs, the
+    /// decomposition boundary is confirmed: the hard part is the data loop, and
+    /// framing is a cheap wrap. Prints the synthesized fragment so the
+    /// composition operator can be designed around its actual structure.
+    ///
+    /// Run: `cargo test --release -- --ignored uart_data_loop --nocapture`
+    #[test]
+    #[ignore = "fragment synthesis; run with --release ... --nocapture"]
+    fn uart_data_loop_synthesizes() {
+        let side = SideCfg::NONE;
+        for k in [4u8, 8] {
+            let (reference, spec) = data_loop_reference(k);
+            assert!(reference.validate().is_ok(), "{:?}", reference.validate());
+            let golden = run(&reference, &spec);
+            let rs = score(&reference, &golden, &spec);
+            assert_eq!(rs.correctness, 0, "reference must match itself");
+
+            let slots = k + 3; // room for the looped (4) or a short unroll
+            let space = Space { slots, side, search_wrap: true, genes: Genes::default() };
+            let template = Program::empty(reference.config);
+            let params =
+                Params { iters: 8000, restarts: 24, seed_from_template: false, ..Params::default() };
+            let mut best: Option<(Program, crate::cost::Score)> = None;
+            for seed in 1u64..=4 {
+                let (b, s) = anneal(&template, &space, &golden, &spec, &params, 0xDA7A + seed);
+                if best.as_ref().map_or(true, |(_, bs)| s.correctness < bs.correctness) {
+                    best = Some((b, s));
+                }
+            }
+            let (b, s) = best.unwrap();
+            eprintln!(
+                "k={k} window={slots} ref-size={}: best correctness={} size={}",
+                rs.size, s.correctness, s.size
+            );
+            eprintln!("  {}", show(&b, slots));
+        }
+    }
+
+    /// MASKED CURRICULUM EXPERIMENT (not a hard assertion): the central test of
+    /// the decomposition thesis. The flat conjunctive landscape has no partial
+    /// credit until load+drive+frame+time all align at once — cold synthesis of
+    /// even a 1-bit frame plateaus (see `uart_k1_base_solvable`, residual ~10).
+    ///
+    /// Manufacture a gradient with a two-stage curriculum on one program:
+    ///   Stage A (framing): data cycles masked don't-care, so the search solves
+    ///     only start/stop framing + frame timing + keep-pin-driven (OE). The
+    ///     hardest conjunct — exact data values — is removed.
+    ///   Stage B (strict): warm-start every restart from Stage A's champion and
+    ///     score all bits. Framing is already held, so the *only* unsatisfied
+    ///     conjunct is the data path — and each correctly-driven bit now yields
+    ///     immediate partial credit. The gradient we lacked.
+    ///
+    /// If Stage B reaches strict correctness 0 where cold synthesis cliffs, the
+    /// barrier was reach (the curriculum bridges it) and no composition operator
+    /// is needed. Reports both stages per k; the cold control is in
+    /// `uart_curriculum_bit_ramp` / `uart_k1_base_solvable`.
+    ///
+    /// Run: `cargo test --release -- --ignored uart_masked_curriculum --nocapture`
+    #[test]
+    #[ignore = "curriculum experiment; run with --release ... --nocapture"]
+    fn uart_masked_curriculum() {
+        let side = SideCfg::NONE;
+
+        for k in [1u8, 4, 8] {
+            let (reference, spec) = k_bit_uart_reference(k);
+            assert!(reference.validate().is_ok(), "{:?}", reference.validate());
+            let (golden, mask) = framing_mask(&reference, &spec);
+            let strict = full_mask(&golden);
+            let cared: u32 = mask.iter().map(|m| m.count_ones()).sum();
+            let total: u32 = strict.iter().map(|m| m.count_ones()).sum();
+            let slots = k + 4;
+            let space = Space { slots, side, search_wrap: true, genes: Genes::default() };
+
+            eprintln!(
+                "\n===== k={k}  window={slots}  framing-mask cares {cared}/{total} bits =====",
+            );
+
+            // Stage A: framing only, cold synthesis.
+            let template = Program::empty(reference.config);
+            let a_params =
+                Params { iters: 6000, restarts: 16, seed_from_template: false, ..Params::default() };
+            let (champ_a, sa) =
+                anneal_masked(&template, &space, &golden, &mask, &spec, &a_params, 0xC0FFEE + k as u64);
+            // How good/bad is the framing champion under the *strict* metric?
+            let a_strict = score_masked(&champ_a, &golden, &strict, &spec).correctness;
+            eprintln!(
+                "  A framing : masked-correctness={} size={} | strict-residual={}",
+                sa.correctness, sa.size, a_strict
+            );
+            eprintln!("    {}", show(&champ_a, slots));
+
+            // Stage B: strict, warm-started from the framing champion.
+            let b_params =
+                Params { iters: 4000, restarts: 12, seed_from_template: true, ..Params::default() };
+            let (champ_b, sb) =
+                anneal_masked(&champ_a, &space, &golden, &strict, &spec, &b_params, 0xBEEF + k as u64);
+            eprintln!(
+                "  B strict  : correctness={} size={}  (0 = full frame solved)",
+                sb.correctness, sb.size
+            );
+            eprintln!("    {}", show(&champ_b, slots));
+        }
     }
 }

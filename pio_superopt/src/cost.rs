@@ -25,6 +25,27 @@ pub fn hamming(golden: &[u32], candidate: &[u32]) -> u32 {
         .sum()
 }
 
+/// Masked cycle-aligned Hamming: count only bits the `mask` cares about
+/// (a set bit = "this bit, this cycle, must match"). Missing samples
+/// (length mismatch) and missing mask entries are treated as 0 / don't-care.
+///
+/// This is the curriculum primitive. A flat conjunctive landscape has no
+/// partial credit until *every* piece aligns; a mask lets us score one
+/// sub-waveform at a time (e.g. framing only, data don't-care), manufacturing
+/// a gradient toward structure before the values are right. The strict metric
+/// is the all-ones mask (the final validation stage).
+pub fn hamming_masked(golden: &[u32], candidate: &[u32], mask: &[u32]) -> u32 {
+    let n = golden.len().max(candidate.len());
+    (0..n)
+        .map(|i| {
+            let g = golden.get(i).copied().unwrap_or(0);
+            let c = candidate.get(i).copied().unwrap_or(0);
+            let m = mask.get(i).copied().unwrap_or(0);
+            ((g ^ c) & m).count_ones()
+        })
+        .sum()
+}
+
 /// The decomposed score of a candidate. The MH loop combines these into a
 /// scalar (correctness gated ahead of size); kept separate here so the
 /// weighting policy lives with the search, not the metric.
@@ -38,7 +59,7 @@ pub struct Score {
     pub size: u8,
 }
 
-/// Score `program` against a `golden` waveform produced under `spec`.
+/// Score `program` against a `golden` waveform produced under `spec`, strict.
 pub fn score(program: &Program, golden: &[u32], spec: &RunSpec) -> Score {
     if program.validate().is_err() {
         return Score { valid: false, correctness: u32::MAX, size: program.size() };
@@ -47,6 +68,22 @@ pub fn score(program: &Program, golden: &[u32], spec: &RunSpec) -> Score {
     Score {
         valid: true,
         correctness: hamming(golden, &wave),
+        size: program.size(),
+    }
+}
+
+/// Score `program` against `golden` under a `mask` (see [`hamming_masked`]).
+/// `correctness` counts only masked-in bit mismatches, so a stage that masks
+/// out the data cycles scores purely on framing. The strict [`score`] is this
+/// with an all-ones mask.
+pub fn score_masked(program: &Program, golden: &[u32], mask: &[u32], spec: &RunSpec) -> Score {
+    if program.validate().is_err() {
+        return Score { valid: false, correctness: u32::MAX, size: program.size() };
+    }
+    let wave = run(program, spec);
+    Score {
+        valid: true,
+        correctness: hamming_masked(golden, &wave, mask),
         size: program.size(),
     }
 }
