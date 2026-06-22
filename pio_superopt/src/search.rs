@@ -140,20 +140,20 @@ impl Default for Params {
 // Legal operand alphabets. Data-dependent control flow (MOV/OUT to PC,
 // EXEC) is deliberately excluded from proposals — still representable in
 // the IR, just not explored early (review gating decision).
-const JMP_CONDS: [JmpCond; 8] = [
+pub(crate) const JMP_CONDS: [JmpCond; 8] = [
     JmpCond::Always, JmpCond::NotX, JmpCond::XPostDec, JmpCond::NotY,
     JmpCond::YPostDec, JmpCond::XneY, JmpCond::Pin, JmpCond::NotOsrEmpty,
 ];
-const WAIT_SRCS: [WaitSrc; 4] = [WaitSrc::GpioAbs, WaitSrc::PinRel, WaitSrc::Irq, WaitSrc::JmpPin];
-const IN_SRCS: [InSrc; 6] = [InSrc::Pins, InSrc::X, InSrc::Y, InSrc::Null, InSrc::Isr, InSrc::Osr];
-const OUT_DSTS: [OutDst; 6] =
+pub(crate) const WAIT_SRCS: [WaitSrc; 4] = [WaitSrc::GpioAbs, WaitSrc::PinRel, WaitSrc::Irq, WaitSrc::JmpPin];
+pub(crate) const IN_SRCS: [InSrc; 6] = [InSrc::Pins, InSrc::X, InSrc::Y, InSrc::Null, InSrc::Isr, InSrc::Osr];
+pub(crate) const OUT_DSTS: [OutDst; 6] =
     [OutDst::Pins, OutDst::X, OutDst::Y, OutDst::Null, OutDst::PinDirs, OutDst::Isr];
-const MOV_DSTS: [MovDst; 6] =
+pub(crate) const MOV_DSTS: [MovDst; 6] =
     [MovDst::Pins, MovDst::X, MovDst::Y, MovDst::PinDirs, MovDst::Isr, MovDst::Osr];
-const MOV_OPS: [MovOp; 3] = [MovOp::None, MovOp::Invert, MovOp::BitReverse];
-const MOV_SRCS: [MovSrc; 7] =
+pub(crate) const MOV_OPS: [MovOp; 3] = [MovOp::None, MovOp::Invert, MovOp::BitReverse];
+pub(crate) const MOV_SRCS: [MovSrc; 7] =
     [MovSrc::Pins, MovSrc::X, MovSrc::Y, MovSrc::Null, MovSrc::Status, MovSrc::Isr, MovSrc::Osr];
-const SET_DSTS: [SetDst; 4] = [SetDst::Pins, SetDst::X, SetDst::Y, SetDst::PinDirs];
+pub(crate) const SET_DSTS: [SetDst; 4] = [SetDst::Pins, SetDst::X, SetDst::Y, SetDst::PinDirs];
 
 fn random_op(rng: &mut Rng, slots: u8) -> Op {
     match rng.below(8) {
@@ -174,11 +174,11 @@ fn random_op(rng: &mut Rng, slots: u8) -> Op {
     }
 }
 
-fn random_delay(rng: &mut Rng, side: &SideCfg) -> u8 {
+pub(crate) fn random_delay(rng: &mut Rng, side: &SideCfg) -> u8 {
     rng.below(side.max_delay() as u32 + 1) as u8
 }
 
-fn random_sideset(rng: &mut Rng, side: &SideCfg) -> Option<u8> {
+pub(crate) fn random_sideset(rng: &mut Rng, side: &SideCfg) -> Option<u8> {
     match side.sideset_value_bits() {
         None => None,
         Some(bits) => {

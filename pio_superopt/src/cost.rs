@@ -46,6 +46,53 @@ pub fn hamming_masked(golden: &[u32], candidate: &[u32], mask: &[u32]) -> u32 {
         .sum()
 }
 
+/// **Tolerance-band Hamming** — the sharpness-parameterized metric for the
+/// synthesis schedule. `k` is the allowed per-bit timing slack in cycles.
+///
+/// For each cared (`mask`) bit at cycle `i`: cost 0 if the candidate matches
+/// exactly; otherwise the cost is `δ/(k+1)` where `δ` is the distance to the
+/// nearest cycle within `±k` at which the candidate *does* carry the golden's
+/// value, or `1` if no such cycle exists. So a right-value-slightly-mistimed
+/// bit pays a small graded penalty instead of a full one — the partial credit
+/// strict Hamming refuses to give.
+///
+/// **`k = 0` is exactly [`hamming_masked`]** (no window ⇒ every mismatch costs
+/// 1), so this is one knob spanning blurry→strict: anneal `k` down during
+/// synthesis, finish at `k = 0` (or the protocol's real jitter spec) to certify.
+pub fn hamming_tolerant(golden: &[u32], candidate: &[u32], mask: &[u32], k: usize) -> f64 {
+    let n = golden.len().max(candidate.len());
+    let denom = k as f64 + 1.0;
+    let mut total = 0.0;
+    for i in 0..n {
+        let m = mask.get(i).copied().unwrap_or(0);
+        if m == 0 {
+            continue;
+        }
+        let g = golden.get(i).copied().unwrap_or(0);
+        let mut bits = m;
+        while bits != 0 {
+            let bit = bits.trailing_zeros();
+            bits &= bits - 1;
+            let gb = (g >> bit) & 1;
+            // Nearest cycle within ±k carrying the golden's value here.
+            let mut cost = 1.0;
+            'search: for d in 0..=k {
+                for j in [i.checked_sub(d), Some(i + d)].into_iter().flatten() {
+                    if j < n {
+                        let cb = (candidate.get(j).copied().unwrap_or(0) >> bit) & 1;
+                        if cb == gb {
+                            cost = d as f64 / denom;
+                            break 'search;
+                        }
+                    }
+                }
+            }
+            total += cost;
+        }
+    }
+    total
+}
+
 /// The decomposed score of a candidate. The MH loop combines these into a
 /// scalar (correctness gated ahead of size); kept separate here so the
 /// weighting policy lives with the search, not the metric.
@@ -142,6 +189,31 @@ mod tests {
             capture_pins: vec![DATA, CLK], // bit0 = data, bit1 = clock
             cycles: 24,
         }
+    }
+
+    #[test]
+    fn tolerant_at_k0_equals_strict_masked() {
+        let golden = [0b1u32, 0b1, 0b0, 0b1, 0b0];
+        let cand = [0b1u32, 0b0, 0b0, 0b1, 0b1]; // differs at cycles 1 and 4
+        let mask = [u32::MAX; 5];
+        assert_eq!(
+            hamming_tolerant(&golden, &cand, &mask, 0),
+            hamming_masked(&golden, &cand, &mask) as f64,
+            "k=0 must equal strict masked Hamming"
+        );
+    }
+
+    #[test]
+    fn tolerant_gives_partial_credit_for_timing_slip() {
+        // Golden rises at cycle 2; candidate rises at cycle 3 (one cycle late).
+        let golden = [0b0u32, 0b0, 0b1, 0b1, 0b1];
+        let cand = [0b0u32, 0b0, 0b0, 0b1, 0b1];
+        let mask = [1u32; 5];
+        let strict = hamming_tolerant(&golden, &cand, &mask, 0);
+        let tol = hamming_tolerant(&golden, &cand, &mask, 4);
+        assert_eq!(strict, 1.0, "one cycle differs under strict");
+        assert!(tol < strict, "a one-cycle slip should cost less under tolerance (got {tol})");
+        assert!(tol > 0.0, "but still a nonzero penalty");
     }
 
     #[test]

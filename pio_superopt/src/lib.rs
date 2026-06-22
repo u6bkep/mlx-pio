@@ -18,13 +18,15 @@
 pub mod cost;
 pub mod decode;
 pub mod encode;
+pub mod gene;
+pub mod gene_search;
 pub mod ir;
 pub mod program;
 pub mod rng;
 pub mod run;
 pub mod search;
 
-pub use cost::{hamming, hamming_masked, score, score_masked, Score};
+pub use cost::{hamming, hamming_masked, hamming_tolerant, score, score_masked, Score};
 pub use decode::{decode_insn, DecodeError};
 pub use encode::encode_insn;
 pub use ir::{Insn, Op, SideCfg};
