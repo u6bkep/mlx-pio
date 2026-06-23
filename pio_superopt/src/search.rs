@@ -9,7 +9,7 @@
 //! The first validation fixes the SM config and searches only the
 //! instruction slots + wrap, within a small slot window.
 
-use crate::cost::{edge_cost, score_masked, Metric};
+use crate::cost::{edge_cost, edge_cost_w, score_masked, Metric};
 use crate::ir::*;
 use crate::program::{Config, Program, ShiftDir};
 use crate::rng::Rng;
@@ -967,6 +967,149 @@ pub fn synthesize_flat_pt(
     }
 
     finalize(global_best.expect("at least one window/restart").0)
+}
+
+/// Densify bias for the breeding engine: a spurious edge costs less than a
+/// missing one, so the search attempts edges instead of hiding at a sparse
+/// no-spurious local optimum (the trap the plateau diagnosis exposed).
+const DENSIFY_SPURIOUS_W: f64 = 0.5;
+
+/// Edge cost with the densify bias, for the breeding engine.
+fn edge_breed_cost(p: &Program, golden: &[u32], mask: &[u32], spec: &RunSpec, w: f64, window: usize) -> f64 {
+    if p.validate().is_err() {
+        return f64::INFINITY;
+    }
+    let wave = run(p, spec);
+    w * edge_cost_w(golden, &wave, mask, window, DENSIFY_SPURIOUS_W) + p.size() as f64
+}
+
+/// Single-range slot crossover: child = `a` with a random contiguous slot range
+/// overwritten by `b`'s. Splicing can break `JMP` targets — that's the point:
+/// selection discards broken offspring, and recombining slot regions is how a
+/// "has clock" parent and a "has a mid fragment" parent can yield a child with
+/// both — crossing the conjunctive gap no gradient reaches. Occasionally also
+/// inherits `b`'s wrap.
+fn crossover(a: &Program, b: &Program, slots: u8, rng: &mut Rng) -> Program {
+    let mut child = a.clone();
+    let s = slots as u32;
+    if s == 0 {
+        return child;
+    }
+    let lo = rng.below(s) as usize;
+    let len = 1 + rng.below(s - lo as u32) as usize;
+    for i in lo..(lo + len).min(slots as usize) {
+        child.slots[i] = b.slots[i].clone();
+    }
+    if rng.boolean() {
+        child.wrap_bottom = b.wrap_bottom;
+        child.wrap_top = b.wrap_top;
+    }
+    child
+}
+
+/// One continuous breeding island: a long anneal on the densified edge objective
+/// at a *fixed* `window` (no staging), interleaving local moves with
+/// **recombination** — periodically pull a peer's posted program and splice it
+/// with the current via [`crossover`], accepting the child by Metropolis. Posts
+/// its current to the shared board for peers to breed with.
+#[allow(clippy::too_many_arguments)]
+fn flat_breed_chain(
+    template: &Program,
+    space: &Space,
+    golden: &[u32],
+    mask: &[u32],
+    spec: &RunSpec,
+    params: &Params,
+    window: usize,
+    seed: u64,
+    board: &FlatMigration,
+    idx: usize,
+) -> (Program, f64) {
+    let mut rng = Rng::new(seed);
+    let mut cur = random_program(template, space, &mut rng);
+    let mut cur_cost = edge_breed_cost(&cur, golden, mask, spec, params.w, window);
+    let mut local_best = (cur.clone(), cur_cost);
+    let cfg = board.cfg;
+    for i in 0..params.iters {
+        let t = params.t0 * (params.t_end / params.t0).powf(i as f64 / params.iters as f64);
+        // local move
+        let cand = mutate(&cur, space, false, &mut rng);
+        let cc = edge_breed_cost(&cand, golden, mask, spec, params.w, window);
+        if cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / t).exp() {
+            cur = cand;
+            cur_cost = cc;
+        }
+        // cross-breeding: publish, then recombine with a peer
+        if i % cfg.post_rate == 0 {
+            board.post(idx, &cur, cur_cost);
+        }
+        if i % cfg.poll_rate == 0 {
+            if let Some((peer, _)) = board.sample_peer(idx, &mut rng) {
+                let child = crossover(&cur, &peer, space.slots, &mut rng);
+                let ch = edge_breed_cost(&child, golden, mask, spec, params.w, window);
+                if ch - cur_cost <= 0.0 || rng.unit() < (-(ch - cur_cost) / t).exp() {
+                    cur = child;
+                    cur_cost = ch;
+                }
+            }
+        }
+        if cur_cost < local_best.1 {
+            local_best = (cur.clone(), cur_cost);
+        }
+    }
+    local_best
+}
+
+/// **Continuous cross-breeding island engine** — the post-staging path. One
+/// persistent island per `windows` entry (a *fixed window ladder*: hot islands
+/// explore with loose edge timing, cold islands certify — replacing the staged
+/// graduated schedule that overstayed its welcome), each a long continuous
+/// anneal on the densified edge objective. Islands share a board and
+/// **recombine** (slot-range crossover) rather than copy, so conjunctive
+/// structure assembled across different islands can be merged. Certified by
+/// strict (window 0) edge cost. Runs the islands as persistent parallel threads
+/// (one long-lived emulator each), so it scales to large per-island iteration
+/// budgets.
+pub fn synthesize_flat_breed(
+    template: &Program,
+    space: &Space,
+    golden: &[u32],
+    mask: &[u32],
+    spec: &RunSpec,
+    params: &Params,
+    windows: &[usize],
+    seed: u64,
+) -> (Program, crate::cost::Score) {
+    let n = windows.len() as u32;
+    let cfg = params.migrate.unwrap_or_default(); // breeding always on; reuse the rate knobs
+    let board = FlatMigration::new(n, cfg);
+    let board_ref = &board;
+    let bests: Vec<(Program, f64)> = std::thread::scope(|s| {
+        let handles: Vec<_> = windows
+            .iter()
+            .enumerate()
+            .map(|(i, &window)| {
+                let cs = seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                s.spawn(move || flat_breed_chain(template, space, golden, mask, spec, params, window, cs, board_ref, i))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    // Global best by strict (window 0) edge cost — the correctness certifier.
+    let mut best: Option<(Program, f64)> = None;
+    for (p, _) in &bests {
+        if p.validate().is_err() {
+            continue;
+        }
+        let wave = run(p, spec);
+        let ec = edge_cost(golden, &wave, mask, 0) + p.size() as f64 * 1e-6;
+        if best.as_ref().map_or(true, |(_, bc)| ec < *bc) {
+            best = Some((p.clone(), ec));
+        }
+    }
+    let (p, _) = best.expect("at least one island");
+    let sc = score_masked(&p, golden, mask, spec);
+    (p, sc)
 }
 
 /// Anneal against a partial-credit `mask` (see [`hamming_masked`]). A curriculum

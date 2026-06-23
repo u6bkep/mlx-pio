@@ -129,18 +129,23 @@ fn channel_edges(wave: &[u32], bit: u32, n: usize) -> Vec<(usize, u32)> {
 
 /// Banded edit distance between two edge sequences. A matched pair (same
 /// direction, within `window` cycles) costs `Δ/(window+1)`; a deleted golden
-/// edge (missing) or inserted candidate edge (spurious) costs 1. Wrong-direction
-/// or out-of-window pairs are not matchable and resolve to delete+insert.
-fn align_edges(eg: &[(usize, u32)], ec: &[(usize, u32)], window: usize) -> f64 {
+/// edge (missing) costs 1; an inserted candidate edge (spurious) costs
+/// `spurious_w`. Wrong-direction or out-of-window pairs are not matchable and
+/// resolve to delete+insert.
+///
+/// `spurious_w < 1` makes attempting an edge (and being wrong) cheaper than
+/// leaving a golden edge unmatched — a **densify** bias that breaks the
+/// "emit few edges, avoid spurious" trap symmetric penalties create.
+fn align_edges(eg: &[(usize, u32)], ec: &[(usize, u32)], window: usize, spurious_w: f64) -> f64 {
     let (n, m) = (eg.len(), ec.len());
     let denom = window as f64 + 1.0;
     // dp[i][j] = min cost to align eg[..i] with ec[..j].
     let mut dp = vec![vec![0.0f64; m + 1]; n + 1];
     for i in 0..=n {
-        dp[i][0] = i as f64;
+        dp[i][0] = i as f64; // i golden edges deleted (missing), cost 1 each
     }
     for j in 0..=m {
-        dp[0][j] = j as f64;
+        dp[0][j] = j as f64 * spurious_w; // j candidate edges inserted (spurious)
     }
     for i in 1..=n {
         for j in 1..=m {
@@ -149,8 +154,8 @@ fn align_edges(eg: &[(usize, u32)], ec: &[(usize, u32)], window: usize) -> f64 {
             let d = (gc as isize - cc as isize).unsigned_abs();
             let match_cost = if gv == cv && d <= window { d as f64 / denom } else { f64::INFINITY };
             dp[i][j] = (dp[i - 1][j - 1] + match_cost)
-                .min(dp[i - 1][j] + 1.0)
-                .min(dp[i][j - 1] + 1.0);
+                .min(dp[i - 1][j] + 1.0) // delete golden edge i (missing)
+                .min(dp[i][j - 1] + spurious_w); // insert candidate edge j (spurious)
         }
     }
     dp[n][m]
@@ -164,6 +169,15 @@ fn align_edges(eg: &[(usize, u32)], ec: &[(usize, u32)], window: usize) -> f64 {
 /// free partial credit that level-Hamming hands out. `window` is the timing
 /// slack (annealed like `k`); `window = 0` certifies exact edge structure.
 pub fn edge_cost(golden: &[u32], candidate: &[u32], mask: &[u32], window: usize) -> f64 {
+    edge_cost_w(golden, candidate, mask, window, 1.0)
+}
+
+/// [`edge_cost`] with an explicit spurious-edge weight (see [`align_edges`]).
+/// `spurious_w < 1` biases the search to *densify* (attempt edges) rather than
+/// hide at a sparse no-spurious local optimum. Edge-cost 0 at window 0 still
+/// implies an exact waveform regardless of `spurious_w` (both missing and
+/// spurious counts must be 0), so certification is unaffected.
+pub fn edge_cost_w(golden: &[u32], candidate: &[u32], mask: &[u32], window: usize, spurious_w: f64) -> f64 {
     let n = golden.len().max(candidate.len());
     let mut care = 0u32;
     for i in 0..n {
@@ -179,7 +193,7 @@ pub fn edge_cost(golden: &[u32], candidate: &[u32], mask: &[u32], window: usize)
         if eg.is_empty() && ec.is_empty() {
             continue;
         }
-        total += align_edges(&eg, &ec, window);
+        total += align_edges(&eg, &ec, window, spurious_w);
     }
     total
 }

@@ -1112,6 +1112,45 @@ mod tests {
         (sp, golden, mask)
     }
 
+    /// Bit-0 transition edges of a waveform: `(cycle, rising?)`.
+    fn dme_edges01(wave: &[u32]) -> Vec<(usize, bool)> {
+        let mut out = Vec::new();
+        let mut prev = 0u32;
+        for (i, &s) in wave.iter().enumerate() {
+            let v = s & 1;
+            if v != prev {
+                out.push((i, v == 1));
+                prev = v;
+            }
+        }
+        out
+    }
+
+    /// Print a champion's boundary(clock)/mid(data-conditional) edge breakdown.
+    /// `boundaries` = edges of the all-zeros-corpus reference (the clock grid).
+    fn dme_diagnose_wave(golden: &[u32], cwave: &[u32], mask: &[u32], boundaries: &[(usize, bool)]) {
+        let ge = dme_edges01(golden);
+        let ce = dme_edges01(cwave);
+        let near = |c: usize| boundaries.iter().any(|&(e, _)| e.abs_diff(c) <= 2);
+        let (mut bt, mut bh, mut mt, mut mh) = (0, 0, 0, 0);
+        for &(c, dir) in &ge {
+            let matched = ce.iter().any(|&(cc, cd)| cd == dir && cc.abs_diff(c) <= 3);
+            if near(c) {
+                bt += 1;
+                bh += matched as i32;
+            } else {
+                mt += 1;
+                mh += matched as i32;
+            }
+        }
+        let spurious = ce.iter().filter(|&&(cc, cd)| !ge.iter().any(|&(c, d)| d == cd && c.abs_diff(cc) <= 3)).count();
+        eprintln!(
+            "    edges {} | boundary(clock) {bh}/{bt} | mid(data) {mh}/{mt} | spurious {spurious} | strict edge-cost {:.1}",
+            ce.len(),
+            edge_cost(golden, cwave, mask, 0)
+        );
+    }
+
     /// A multi-code corpus (diverse 4B/5B data codes, varied bit patterns and
     /// popcounts) so a thin oracle can't be gamed — the recurring overfitting
     /// hazard. Processed back-to-back: the loop wraps to `pull` between codes.
@@ -1361,6 +1400,159 @@ mod tests {
         eprintln!("\nDME flat PT engine (n={} seeds; gene+edge ref edge-cost=34):", seeds.len());
         run_arm("flat baseline ", &base);
         run_arm("flat migration", &migr);
+    }
+
+    /// POINT 3: crank the scale. The flat PT engine does a full search in ~2s,
+    /// so throw 20-40x compute at it — big iters/restarts/elite, a wider window
+    /// start — to see whether scale alone drives the flat+edge search toward a
+    /// solve (edge-cost → 0), and whether migration earns its keep with more
+    /// chains. Run: `cargo test --release -- --ignored dme_flat_scale --nocapture`
+    #[test]
+    #[ignore = "flat PT engine at scale; run with --release ... --nocapture"]
+    fn dme_flat_scale() {
+        use crate::program::Program;
+        let (sp, golden, mask) = dme_golden();
+        let template = Program::empty(dme_cfg());
+        let space = crate::search::Space {
+            slots: 20,
+            side: SideCfg::NONE,
+            search_wrap: true,
+            genes: crate::search::Genes::default(),
+        };
+        let base = Params { iters: 80_000, restarts: 32, ..Params::default() };
+        let migr = Params { migrate: Some(MigrateCfg::default()), ..base };
+        let windows = [16usize, 8, 4, 2, 1, 0];
+        let seeds: Vec<u64> = (0..3u64).map(|i| 0x5CA1 ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+
+        let run_arm = |name: &str, p: &Params| {
+            let mut best: Option<(f64, u32, Program)> = None;
+            let mut ecs = Vec::new();
+            for &seed in &seeds {
+                let (prog, s) = crate::search::synthesize_flat_pt(&template, &space, &golden, &mask, &sp, p, &windows, 6, seed);
+                let w = run(&prog, &sp);
+                let ec = edge_cost(&golden, &w, &mask, 0);
+                ecs.push(ec);
+                if best.as_ref().map_or(true, |(bc, _, _)| ec < *bc) {
+                    best = Some((ec, s.correctness, prog));
+                }
+            }
+            let (be, bl, bp) = best.unwrap();
+            let mut parts = Vec::new();
+            for i in 0..32usize {
+                if let Some(insn) = &bp.slots[i] {
+                    parts.push(format!("{i}:{}", brief_insn(insn)));
+                }
+            }
+            eprintln!("  {name}: best edge-cost={be:.1} (level-Hamming {bl}) | edge spread {ecs:?} | wrap {}..{}", bp.wrap_bottom, bp.wrap_top);
+            eprintln!("    [{}]", parts.join("  "));
+        };
+        eprintln!("\nDME flat PT at scale (iters=80k, restarts=32, n={} seeds; golden ~30 edges):", seeds.len());
+        run_arm("baseline ", &base);
+        run_arm("migration", &migr);
+    }
+
+    /// THE NEW PATH: continuous cross-breeding island engine (no staging,
+    /// densified edge objective, recombination instead of copy-migration). Does
+    /// it birth the data-conditional mids the staged engine never reached, and
+    /// beat the ~22 plateau? Reports the boundary/mid breakdown.
+    ///
+    /// Run: `cargo test --release -- --ignored dme_breed --nocapture`
+    #[test]
+    #[ignore = "cross-breeding island engine; run with --release ... --nocapture"]
+    fn dme_breed() {
+        use crate::program::Program;
+        let (sp, golden, mask) = dme_golden();
+        let zsp = RunSpec { inputs: vec![0, 0, 0, 0], ..sp.clone() };
+        let boundaries = dme_edges01(&run(&dme_ref(DME_H).lower(), &zsp));
+
+        let template = Program::empty(dme_cfg());
+        let space = crate::search::Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        let params = Params { iters: 200_000, ..Params::default() };
+        let windows = [8usize, 8, 6, 6, 4, 4, 2, 2, 1, 1, 0, 0]; // fixed window ladder, 12 islands
+        let seeds: Vec<u64> = (0..3u64).map(|i| 0xB433 ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+
+        let mut best: Option<(f64, Program)> = None;
+        for &seed in &seeds {
+            let (champ, _) = crate::search::synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &params, &windows, seed);
+            let cw = run(&champ, &sp);
+            let ec = edge_cost(&golden, &cw, &mask, 0);
+            eprintln!("  seed{seed:#018x}:");
+            dme_diagnose_wave(&golden, &cw, &mask, &boundaries);
+            if best.as_ref().map_or(true, |(bc, _)| ec < *bc) {
+                best = Some((ec, champ));
+            }
+        }
+        let (be, bp) = best.unwrap();
+        let mut parts = Vec::new();
+        for i in 0..32usize {
+            if let Some(insn) = &bp.slots[i] {
+                parts.push(format!("{i}:{}", brief_insn(insn)));
+            }
+        }
+        eprintln!("\nbreed best edge-cost={be:.1} (staged plateau was ~22) wrap {}..{}", bp.wrap_bottom, bp.wrap_top);
+        eprintln!("  [{}]", parts.join("  "));
+    }
+
+    /// PLATEAU DIAGNOSIS: take a flat-engine champion and decompose its edge
+    /// errors against golden. Golden edges are classified **boundary** (the
+    /// data-independent clock — present in an all-zeros-corpus reference) vs
+    /// **mid** (the data-conditional transition — the extra edges real data
+    /// adds). Answers: does the champion have the clock but miss the data
+    /// modulation? Run: `cargo test --release -- --ignored dme_diagnose --nocapture`
+    #[test]
+    #[ignore = "plateau diagnosis; run with --release ... --nocapture"]
+    fn dme_diagnose() {
+        use crate::program::Program;
+        // (cycle, rising?) edges of bit 0.
+        fn edges01(wave: &[u32]) -> Vec<(usize, bool)> {
+            let mut out = Vec::new();
+            let mut prev = 0u32;
+            for (i, &s) in wave.iter().enumerate() {
+                let v = s & 1;
+                if v != prev {
+                    out.push((i, v == 1));
+                    prev = v;
+                }
+            }
+            out
+        }
+        let near = |edges: &[(usize, bool)], c: usize, tol: usize| edges.iter().any(|&(e, _)| e.abs_diff(c) <= tol);
+
+        let (sp, golden, mask) = dme_golden();
+        // Boundary grid: same corpus length, all-zero codes → only boundary edges.
+        let zsp = RunSpec { inputs: vec![0, 0, 0, 0], ..sp.clone() };
+        let bwave = run(&dme_ref(DME_H).lower(), &zsp);
+        let boundaries = edges01(&bwave);
+
+        // A representative plateau champion.
+        let template = Program::empty(dme_cfg());
+        let space = crate::search::Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        let params = Params { iters: 40_000, restarts: 32, ..Params::default() };
+        let (champ, _) = crate::search::synthesize_flat_pt(&template, &space, &golden, &mask, &sp, &params, &[16usize, 8, 4, 2, 1, 0], 6, 0x5CA1);
+        let cwave = run(&champ, &sp);
+
+        let ge = edges01(&golden);
+        let ce = edges01(&cwave);
+        eprintln!("\ngolden: {} edges ({} boundary-grid)  champion: {} edges  edge-cost={:.1}", ge.len(), boundaries.len(), ce.len(), edge_cost(&golden, &cwave, &mask, 0));
+
+        let (mut b_tot, mut b_hit, mut m_tot, mut m_hit) = (0, 0, 0, 0);
+        let mut misses = Vec::new();
+        for &(c, dir) in &ge {
+            let is_boundary = near(&boundaries, c, 2);
+            let matched = ce.iter().any(|&(cc, cd)| cd == dir && cc.abs_diff(c) <= 3);
+            if is_boundary { b_tot += 1; b_hit += matched as i32; } else { m_tot += 1; m_hit += matched as i32; }
+            if !matched { misses.push((c, if is_boundary { 'B' } else { 'M' }, if dir { '^' } else { 'v' })); }
+        }
+        // spurious: champion edges with no golden edge of same dir nearby
+        let spurious = ce.iter().filter(|&&(cc, cd)| !ge.iter().any(|&(c, d)| d == cd && c.abs_diff(cc) <= 3)).count();
+
+        eprintln!("  boundary (clock) edges matched: {b_hit}/{b_tot}");
+        eprintln!("  mid (data-conditional) edges matched: {m_hit}/{m_tot}");
+        eprintln!("  spurious champion edges: {spurious}");
+        eprintln!("  unmatched golden edges (cycle/class/dir): {misses:?}");
+        let mut parts = Vec::new();
+        for i in 0..32usize { if let Some(insn) = &champ.slots[i] { parts.push(format!("{i}:{}", brief_insn(insn))); } }
+        eprintln!("  champion [{}] wrap {}..{}", parts.join("  "), champ.wrap_bottom, champ.wrap_top);
     }
 
     /// DIAGNOSTIC: run the DME reference on a few line codes and print the pin
