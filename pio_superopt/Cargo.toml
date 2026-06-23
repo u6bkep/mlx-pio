@@ -24,3 +24,5 @@ harness = false
 # and direct dev-dependency both resolve to the vendored, fixed copy.
 [patch.crates-io]
 picoem-common = { path = "../vendor/picoem-common" }
+# Vendored emulator (see pio_harness): forked for a PIO-only fast step.
+rp2350-emu = { path = "../vendor/rp2350-emu" }

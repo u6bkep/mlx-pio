@@ -11,3 +11,7 @@ pio = "=0.3.0"
 
 [patch.crates-io]
 picoem-common = { path = "../vendor/picoem-common" }
+# Vendored so we can add a PIO-only fast-path step that skips the CPU cores and
+# non-PIO peripherals — the superoptimizer runs one SM and no firmware, so the
+# full per-cycle emulation is ~95% wasted work (ticket 004).
+rp2350-emu = { path = "../vendor/rp2350-emu" }

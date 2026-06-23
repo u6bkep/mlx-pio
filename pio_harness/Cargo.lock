@@ -476,8 +476,6 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rp2350-emu"
 version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f24f2ff5bac5300cd4596d2a35aae2617bf36d0c93ad6fae779648e836e9a0a"
 dependencies = [
  "picoem-common",
  "sha2",
