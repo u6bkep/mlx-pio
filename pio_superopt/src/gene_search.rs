@@ -1311,6 +1311,58 @@ mod tests {
         eprintln!("  [{}]  wrap {}..{}", parts.join("  "), bp.wrap_bottom, bp.wrap_top);
     }
 
+    /// POINTS 2+3: the parallel/elitist/PT flat engine on DME, at scale —
+    /// migration off vs on. Tests whether the full mlx86-style flat search
+    /// (parallel chains + diverse elitism + island migration, edge objective,
+    /// no priors) escapes the degenerate traps the bare `synthesize_flat` fell
+    /// into, and whether migration (PT) helps on the flat substrate.
+    ///
+    /// Run: `cargo test --release -- --ignored dme_flat_pt --nocapture`
+    #[test]
+    #[ignore = "flat PT engine on DME; run with --release ... --nocapture"]
+    fn dme_flat_pt() {
+        use crate::program::Program;
+        let (sp, golden, mask) = dme_golden();
+        let template = Program::empty(dme_cfg());
+        let space = crate::search::Space {
+            slots: 18,
+            side: SideCfg::NONE,
+            search_wrap: true,
+            genes: crate::search::Genes::default(),
+        };
+        let base = Params { iters: 12000, restarts: 16, ..Params::default() };
+        let migr = Params { migrate: Some(MigrateCfg::default()), ..base };
+        let windows = [8usize, 4, 2, 1, 0];
+        let seeds: Vec<u64> = (0..4u64).map(|i| 0xF1A7 ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+
+        let run_arm = |name: &str, p: &Params| {
+            let mut best: Option<(u32, f64, Program)> = None;
+            let mut corrs = Vec::new();
+            for &seed in &seeds {
+                let (prog, s) = crate::search::synthesize_flat_pt(&template, &space, &golden, &mask, &sp, p, &windows, 4, seed);
+                let w = run(&prog, &sp);
+                let ec = edge_cost(&golden, &w, &mask, 0);
+                corrs.push(s.correctness);
+                if best.as_ref().map_or(true, |(bc, _, _)| s.correctness < *bc) {
+                    best = Some((s.correctness, ec, prog));
+                }
+            }
+            let (bc, be, bp) = best.unwrap();
+            let mut parts = Vec::new();
+            for i in 0..32usize {
+                if let Some(insn) = &bp.slots[i] {
+                    parts.push(format!("{i}:{}", brief_insn(insn)));
+                }
+            }
+            corrs.sort_unstable();
+            eprintln!("  {name}: best level-Hamming={bc} edge-cost={be:.1} | spread {corrs:?} | wrap {}..{}", bp.wrap_bottom, bp.wrap_top);
+            eprintln!("    [{}]", parts.join("  "));
+        };
+        eprintln!("\nDME flat PT engine (n={} seeds; gene+edge ref edge-cost=34):", seeds.len());
+        run_arm("flat baseline ", &base);
+        run_arm("flat migration", &migr);
+    }
+
     /// DIAGNOSTIC: run the DME reference on a few line codes and print the pin
     /// waveform + per-bit transition counts, to eyeball correctness and tune
     /// timing. Run: `cargo test --release -- --ignored dme_inspect --nocapture`

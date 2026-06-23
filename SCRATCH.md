@@ -1,7 +1,7 @@
 # Superoptimizer — scratch / thinking doc
 
 > Uncommitted working notes. Where we are, what's broken, directions to try.
-> Not a spec; a place to think. Last updated 2026-06-21.
+> Not a spec; a place to think. Last updated 2026-06-22.
 
 ## The goal (unchanged)
 
@@ -134,12 +134,67 @@ comes from **parallelism**, not a higher per-chain rate:
 Net: the engine is **capable + parallel-reliable**. Per-chain elitism/2-opt help
 specific cases (data_loop k=8 7/8) but parallel portfolio is the mechanism.
 
+## mlx86 detour → novelty pivot → flat edge engine (2026-06-22)
+
+Surveyed `reference/mlx86` (a friend's x86-asm superoptimizer) for prior art →
+`tickets/` (001 parallel tempering, 002 meta-tuning, 003 hash tabu). It searches
+a flat raw-byte space yet solves hello-world / a 4-fn calculator and finds
+genuinely creative solutions (e.g. misaligned jumps that re-decode bytes). Three
+things that flowed from it:
+
+**1. Targets: UART is solved; aim at DME.** UART has one hard structure (the
+spine) and we already find good ones — it can't discriminate search ideas (PT
+A/B on it was neutral-to-negative noise). The real target is 10BASE-T1S DME
+(`reference/.../rs485-eth`). Stepping stone = **single-SM Differential
+Manchester TX** (biphase-mark: transition every bit boundary + a *data-conditional*
+mid-bit transition). The data-conditional mid-transition is the coupled second
+structure UART lacked.
+
+**2. v2 IR — structured conditional (`Node::Cond`, committed).** The gene IR v1
+banned all non-structural JMPs, so it **could not express** DME's data-conditional
+branch. Added `Cond{cond,then,els,…}` (structured selection, dual of `Loop`),
+label-free, lowers with a past-end→wrap fixup. The DME reference encoder
+(`dme_ref`, biphase-mark, tracks line level in Y, `mov y,~y`/`mov pins,y` to
+toggle, `jmp x--` on the data bit) runs correctly: mid-transitions are
+**popcount-exact**. Locked golden + corpus + guard test.
+
+**3. The macro trap, and the real reframing.** Macros (counted-loop, etc.) were
+right for UART — a *solved* problem where encoding the known structure is fine —
+but they **inject human priors at the expense of the novelty we're after**. The
+gene IR itself is a prior: it forbids the creative control-flow reuse mlx86
+thrives on. Diagnosis, in order of leverage:
+- **Objective (biggest).** We scored the cycle-by-cycle *level* trajectory;
+  mlx86 scores *output*. Level-Hamming on a transition code is **deceptive**: a
+  slowly-varying signal matches ~half the cycles for free, so the search falls
+  into a `out Pins` data-dump basin (best ~31-44/278, never climbs). **Fix:
+  `Metric::Edge`** (`cost.rs`) — represent each channel as a transition-event
+  sequence (cycle,new_value; pre-level 0 ⇒ complete encoding) and score a banded
+  edit distance (shift = Δ/(W+1), miss/spurious = 1; W annealed = old `k`).
+  Edge-cost 0 at W=0 ⟺ exact waveform, so it also certifies. **A/B: the level
+  metric steers to `out Pins`; the edge metric steers to a pin-toggling loop
+  (`mov Pins,~Pins`) — a real transition generator.** Necessary, not sufficient:
+  it reaches the periodic-clock skeleton, not yet the data-conditional mid.
+- **Representation.** The creativity (instruction reuse, overlapping jumps) lives
+  in the **flat slot search**, which the gene IR forbids. So: revive flat search.
+- **Diversity/scale.** mlx86's flat power = PT + migration + millions of trials.
+
+**Flat edge engine (`synthesize_flat_pt`, search.rs).** Parallel chains
+(thread-local emu), per-stage diverse elitism, adaptive stage-0 diversity, ported
+island migration (PT) — edge objective, window-annealed, **no priors/macros**,
+arbitrary jumps. Selects/certifies by edge-cost (not level — fixed a straggler
+bug). First A/B on DME (n=4): **flat+edge edge-cost ≈24 beats gene+edge ≈34**
+(not compute-controlled, but 8 full runs in **15 s** — huge scale headroom).
+**Migration still a wash** (24 vs 23, noise) — within-stage PT hasn't earned its
+keep on either UART or flat-DME; if PT is to pay off it likely needs knob tuning
+or the cross-*seed* variant (deferred "plan 2"), not more within-stage migration.
+Neither solves yet (edge ~23, need 0). **Next: crank scale (point 3).**
+
 ## Other directions (held)
 - **Population + crossover (GP)**: combine a "has spine" with a "has framing"
   individual. The per-stage elitism above is a step toward this.
-- **DTW (banded)**: held in reserve behind the tolerance band — only needed if
-  early-synthesis *global* drift exceeds a fixed window (band can't realign
-  unbounded drift; DTW can). Don't build until the band demonstrably stalls.
+- **DTW (banded)**: partly realized — `Metric::Edge` is a banded edit distance
+  over transition events (a DTW cousin). Full DTW (continuous time-warp) still in
+  reserve if edge alignment proves too rigid for *global* drift.
 - **Structural reward shaping**: removable synthesis scaffolding; lower priority.
 
 ## The endgame: hybrid

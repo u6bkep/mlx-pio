@@ -14,6 +14,7 @@ use crate::ir::*;
 use crate::program::{Config, Program, ShiftDir};
 use crate::rng::Rng;
 use crate::run::{run, RunSpec};
+use std::sync::Mutex;
 
 /// What the search may vary: the first `slots` instruction slots, the wrap
 /// bounds, and the config `genes`. Everything not searched is taken from
@@ -748,6 +749,224 @@ pub fn synthesize_flat(
     let p = global_best.map(|(p, _)| p).or(champ).expect("at least one window/restart");
     let s = score_masked(&p, golden, mask, spec);
     (p, s)
+}
+
+/// Shared blackboard for async island migration between flat chains (ticket
+/// 001, ported from the gene engine). One slot per chain holds its posted
+/// current program + edge cost.
+struct FlatMigration {
+    slots: Vec<Mutex<Option<(Program, f64)>>>,
+    cfg: MigrateCfg,
+}
+
+impl FlatMigration {
+    fn new(n: u32, cfg: MigrateCfg) -> Self {
+        FlatMigration { slots: (0..n).map(|_| Mutex::new(None)).collect(), cfg }
+    }
+    fn post(&self, idx: usize, p: &Program, cost: f64) {
+        *self.slots[idx].lock().unwrap() = Some((p.clone(), cost));
+    }
+    fn sample_peer(&self, idx: usize, rng: &mut Rng) -> Option<(Program, f64)> {
+        let n = self.slots.len();
+        if n < 2 {
+            return None;
+        }
+        let mut j = rng.below(n as u32) as usize;
+        if j == idx {
+            j = (j + 1) % n;
+        }
+        self.slots[j].lock().unwrap().clone()
+    }
+}
+
+/// One flat annealing chain on the edge objective at a fixed `window`, with
+/// optional async migration (adopt a better peer with prob `1-exp(-intensity·
+/// gap/t)`). Returns the chain's best program by edge cost.
+#[allow(clippy::too_many_arguments)]
+fn flat_chain(
+    start: Option<Program>,
+    template: &Program,
+    space: &Space,
+    golden: &[u32],
+    mask: &[u32],
+    spec: &RunSpec,
+    params: &Params,
+    window: usize,
+    seed: u64,
+    migrate: Option<(&FlatMigration, usize)>,
+) -> (Program, f64) {
+    let mut rng = Rng::new(seed);
+    let mut cur = start.unwrap_or_else(|| random_program(template, space, &mut rng));
+    let mut cur_cost = edge_flat_cost(&cur, golden, mask, spec, params.w, window);
+    let mut local_best = (cur.clone(), cur_cost);
+    for i in 0..params.iters {
+        let frac = i as f64 / params.iters as f64;
+        let t = params.t0 * (params.t_end / params.t0).powf(frac);
+        let cand = mutate(&cur, space, false, &mut rng); // macros OFF — no priors
+        let cand_cost = edge_flat_cost(&cand, golden, mask, spec, params.w, window);
+        let d = cand_cost - cur_cost;
+        if d <= 0.0 || rng.unit() < (-d / t).exp() {
+            cur = cand;
+            cur_cost = cand_cost;
+        }
+        if let Some((board, idx)) = migrate {
+            let cfg = board.cfg;
+            if i % cfg.post_rate == 0 {
+                board.post(idx, &cur, cur_cost);
+            }
+            if i % cfg.poll_rate == 0 {
+                if let Some((pg, pc)) = board.sample_peer(idx, &mut rng) {
+                    if pc < cur_cost {
+                        let gap = (cur_cost - pc) * cfg.intensity;
+                        if rng.unit() < 1.0 - (-gap / t).exp() {
+                            cur = pg;
+                            cur_cost = pc;
+                        }
+                    }
+                }
+            }
+        }
+        if cur_cost < local_best.1 {
+            local_best = (cur.clone(), cur_cost);
+        }
+    }
+    local_best
+}
+
+/// Run `n` flat chains in parallel (thread-local emulator), seeded round-robin
+/// from `pool` (random if empty), sharing a migration board when `params.migrate`
+/// is set.
+#[allow(clippy::too_many_arguments)]
+fn run_flat_chains(
+    pool: &[Program],
+    template: &Program,
+    space: &Space,
+    golden: &[u32],
+    mask: &[u32],
+    spec: &RunSpec,
+    params: &Params,
+    window: usize,
+    n: u32,
+    seed: u64,
+) -> Vec<(Program, f64)> {
+    let board = params.migrate.map(|cfg| FlatMigration::new(n, cfg));
+    let board_ref = board.as_ref();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..n)
+            .map(|r| {
+                let start = if pool.is_empty() { None } else { Some(pool[r as usize % pool.len()].clone()) };
+                let cs = seed ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let migrate = board_ref.map(|b| (b, r as usize));
+                s.spawn(move || flat_chain(start, template, space, golden, mask, spec, params, window, cs, migrate))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+/// Top-`n` distinct programs by ascending cost (the flat elite set).
+fn elite_flat(mut scored: Vec<(Program, f64)>, n: usize) -> Vec<Program> {
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<Program> = Vec::new();
+    for (p, _) in scored {
+        if out.len() >= n {
+            break;
+        }
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn distinct_flat(scored: &[(Program, f64)]) -> usize {
+    let mut uniq: Vec<&Program> = Vec::new();
+    for (p, _) in scored {
+        if !uniq.iter().any(|u| *u == p) {
+            uniq.push(p);
+        }
+    }
+    uniq.len()
+}
+
+/// **Parallel, elitist, migration-capable flat-slot edge engine** (mlx86 points
+/// 2+3). Parallel chains (thread-local emulator), per-stage elitism (a diverse
+/// elite carried forward — not one champion, which was the premature-convergence
+/// trap of [`synthesize_flat`]), optional async migration (PT), over a window
+/// schedule. Stage 0 adaptively gathers diversity; later stages sharpen the
+/// window seeded from the elite pool. Certified with strict level-Hamming;
+/// exits as soon as correctness 0 is in hand.
+#[allow(clippy::too_many_arguments)]
+pub fn synthesize_flat_pt(
+    template: &Program,
+    space: &Space,
+    golden: &[u32],
+    mask: &[u32],
+    spec: &RunSpec,
+    params: &Params,
+    windows: &[usize],
+    elite_n: usize,
+    seed: u64,
+) -> (Program, crate::cost::Score) {
+    // Champion is tracked by *strict edge cost* (window 0) — the same metric the
+    // chains climb, so we return what the search actually optimized (not a
+    // level-best straggler). Edge-cost 0 at window 0 means identical edge
+    // sequences, i.e. an exact waveform match, so it doubles as the correctness
+    // certifier. Returns true once a correct (edge-cost 0) program is in hand.
+    let mut global_best: Option<(Program, f64)> = None;
+    let absorb = |pop: &[Program], gb: &mut Option<(Program, f64)>| -> bool {
+        for p in pop {
+            if p.validate().is_err() {
+                continue;
+            }
+            let wave = run(p, spec);
+            // Tie-break edge cost by program size so equal-structure picks smaller.
+            let ec = edge_cost(golden, &wave, mask, 0) + p.size() as f64 * 1e-6;
+            if gb.as_ref().map_or(true, |(_, bc)| ec < *bc) {
+                *gb = Some((p.clone(), ec));
+            }
+        }
+        gb.as_ref().is_some_and(|(_, ec)| *ec < 1e-3)
+    };
+
+    // Stage 0 — adaptive diversity gathering: launch batches until enough
+    // structurally-distinct elites (or the chain cap) so later stages don't
+    // commit to one stage-0 basin.
+    let w0 = windows[0];
+    let diversity_target = 2 * elite_n;
+    let max_chains = params.restarts * 8;
+    let mut scored: Vec<(Program, f64)> = Vec::new();
+    let mut ran = 0u32;
+    while distinct_flat(&scored) < diversity_target && ran < max_chains {
+        let batch = run_flat_chains(
+            &[], template, space, golden, mask, spec, params, w0, params.restarts,
+            seed ^ (ran as u64).wrapping_mul(0x1000_0000_0000_0001),
+        );
+        scored.extend(batch);
+        ran += params.restarts;
+    }
+    let mut population = elite_flat(scored, elite_n);
+    let finalize = |p: Program| -> (Program, crate::cost::Score) {
+        let s = score_masked(&p, golden, mask, spec);
+        (p, s)
+    };
+    if absorb(&population, &mut global_best) {
+        return finalize(global_best.unwrap().0);
+    }
+
+    // Later stages — sharpen the window, re-seed from the elite pool.
+    for (si, &window) in windows.iter().enumerate().skip(1) {
+        let batch = run_flat_chains(
+            &population, template, space, golden, mask, spec, params, window, params.restarts,
+            seed ^ ((si as u64) << 40).wrapping_add(0xABCD),
+        );
+        population = elite_flat(batch, elite_n);
+        if absorb(&population, &mut global_best) {
+            return finalize(global_best.unwrap().0);
+        }
+    }
+
+    finalize(global_best.expect("at least one window/restart").0)
 }
 
 /// Anneal against a partial-credit `mask` (see [`hamming_masked`]). A curriculum
