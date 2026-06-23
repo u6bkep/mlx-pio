@@ -1493,6 +1493,96 @@ mod tests {
         eprintln!("  [{}]", parts.join("  "));
     }
 
+    /// META-TUNE (ticket 002): let the optimizer tune the breeding engine's own
+    /// hyperparameters (densify weight, temps, breeding rate, ladder spread, w)
+    /// via a fixed-seed mini-trial objective — instead of hand-tuning. Then
+    /// validate the tuned set at full scale. Mirrors mlx86's *_hyperparameters.
+    ///
+    /// Run: `cargo test --release -- --ignored dme_meta_tune --nocapture`
+    #[test]
+    #[ignore = "meta-tune the breeding engine (~2min); run with --release ... --nocapture"]
+    fn dme_meta_tune() {
+        use crate::program::Program;
+        use crate::search::{meta_anneal, synthesize_flat_breed, BreedHp};
+        let (sp, golden, mask) = dme_golden();
+        let template = Program::empty(dme_cfg());
+        let space = crate::search::Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+
+        // Mini-trial: 32 islands (all cores), short budget, fixed seeds for a
+        // fair comparison; objective = mean strict edge-cost (rewards reliability).
+        let inner_iters = 40_000u32;
+        let inner_seeds = [0xA1u64, 0xB2u64];
+        let eval = |hp: &BreedHp| -> f64 {
+            let params = hp.to_params(inner_iters);
+            let windows = hp.ladder(32);
+            let mut tot = 0.0;
+            for &s in &inner_seeds {
+                let (champ, _) = synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &params, &windows, s);
+                tot += edge_cost(&golden, &run(&champ, &sp), &mask, 0);
+            }
+            tot / inner_seeds.len() as f64
+        };
+
+        let default_cost = eval(&BreedHp::default());
+        let (best_hp, best_cost) = meta_anneal(&eval, 24, 0x3E7A);
+        eprintln!("\nmeta-tune (inner: 32 islands × {inner_iters} iters × {} seeds, mean edge-cost):", inner_seeds.len());
+        eprintln!("  default HP mini-cost: {default_cost:.1}");
+        eprintln!("  tuned   HP mini-cost: {best_cost:.1}");
+        eprintln!("  tuned HP: {best_hp:?}");
+
+        // Validate the tuned HP at full scale.
+        let (champ, _) = synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &best_hp.to_params(800_000), &best_hp.ladder(32), 0x5EED);
+        eprintln!("  tuned HP @ full scale (32 islands × 800k): edge-cost {:.1}", edge_cost(&golden, &run(&champ, &sp), &mask, 0));
+    }
+
+    /// CRANK: the breeding engine at scale — 32 islands (one per core), a
+    /// cold-weighted window ladder, ~1.2M iters/island. Does scale + the wider
+    /// ladder turn the "mids get born sometimes" breakthrough into reliable,
+    /// lower-cost solutions? Run: `cargo test --release -- --ignored dme_breed_scale --nocapture`
+    #[test]
+    #[ignore = "breeding engine at scale (~2min); run with --release ... --nocapture"]
+    fn dme_breed_scale() {
+        use crate::program::Program;
+        let (sp, golden, mask) = dme_golden();
+        let zsp = RunSpec { inputs: vec![0, 0, 0, 0], ..sp.clone() };
+        let boundaries = dme_edges01(&run(&dme_ref(DME_H).lower(), &zsp));
+
+        let template = Program::empty(dme_cfg());
+        let space = crate::search::Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        let params = Params { iters: 1_200_000, ..Params::default() };
+        // 32 islands (one per core), cold-weighted: more window-0/1 islands to
+        // lock exact timing, a few hot ones to keep exploring.
+        let mut windows = Vec::new();
+        for &(win, count) in &[(8usize, 4), (6, 4), (4, 4), (3, 4), (2, 4), (1, 6), (0, 6)] {
+            for _ in 0..count {
+                windows.push(win);
+            }
+        }
+        assert_eq!(windows.len(), 32);
+        let seeds: Vec<u64> = (0..3u64).map(|i| 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+
+        let mut best: Option<(f64, Program)> = None;
+        for &seed in &seeds {
+            let (champ, _) = crate::search::synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &params, &windows, seed);
+            let cw = run(&champ, &sp);
+            let ec = edge_cost(&golden, &cw, &mask, 0);
+            eprintln!("  seed{seed:#018x}:");
+            dme_diagnose_wave(&golden, &cw, &mask, &boundaries);
+            if best.as_ref().map_or(true, |(bc, _)| ec < *bc) {
+                best = Some((ec, champ));
+            }
+        }
+        let (be, bp) = best.unwrap();
+        let mut parts = Vec::new();
+        for i in 0..32usize {
+            if let Some(insn) = &bp.slots[i] {
+                parts.push(format!("{i}:{}", brief_insn(insn)));
+            }
+        }
+        eprintln!("\nbreed@scale best edge-cost={be:.1} (staged plateau ~22; small-breed ~23) wrap {}..{}", bp.wrap_bottom, bp.wrap_top);
+        eprintln!("  [{}]", parts.join("  "));
+    }
+
     /// PLATEAU DIAGNOSIS: take a flat-engine champion and decompose its edge
     /// errors against golden. Golden edges are classified **boundary** (the
     /// data-independent clock — present in an all-zeros-corpus reference) vs

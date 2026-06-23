@@ -131,6 +131,9 @@ pub struct Params {
     /// instead of per-cycle levels (for transition codes like DME, where level
     /// matching is deceptive).
     pub metric: Metric,
+    /// Spurious-edge weight for the breeding engine's densified edge cost
+    /// (`< 1` biases toward attempting edges). Only affects `synthesize_flat_breed`.
+    pub densify_w: f64,
 }
 
 /// Async migration knobs for the gene-search chains (ticket 001). Modeled on
@@ -170,6 +173,7 @@ impl Default for Params {
             macro_moves: false,
             migrate: None,
             metric: Metric::LevelTolerant,
+            densify_w: 0.5,
         }
     }
 }
@@ -969,18 +973,13 @@ pub fn synthesize_flat_pt(
     finalize(global_best.expect("at least one window/restart").0)
 }
 
-/// Densify bias for the breeding engine: a spurious edge costs less than a
-/// missing one, so the search attempts edges instead of hiding at a sparse
-/// no-spurious local optimum (the trap the plateau diagnosis exposed).
-const DENSIFY_SPURIOUS_W: f64 = 0.5;
-
-/// Edge cost with the densify bias, for the breeding engine.
-fn edge_breed_cost(p: &Program, golden: &[u32], mask: &[u32], spec: &RunSpec, w: f64, window: usize) -> f64 {
+/// Edge cost with the densify bias (`spurious_w < 1`), for the breeding engine.
+fn edge_breed_cost(p: &Program, golden: &[u32], mask: &[u32], spec: &RunSpec, w: f64, window: usize, spurious_w: f64) -> f64 {
     if p.validate().is_err() {
         return f64::INFINITY;
     }
     let wave = run(p, spec);
-    w * edge_cost_w(golden, &wave, mask, window, DENSIFY_SPURIOUS_W) + p.size() as f64
+    w * edge_cost_w(golden, &wave, mask, window, spurious_w) + p.size() as f64
 }
 
 /// Single-range slot crossover: child = `a` with a random contiguous slot range
@@ -1027,14 +1026,14 @@ fn flat_breed_chain(
 ) -> (Program, f64) {
     let mut rng = Rng::new(seed);
     let mut cur = random_program(template, space, &mut rng);
-    let mut cur_cost = edge_breed_cost(&cur, golden, mask, spec, params.w, window);
+    let mut cur_cost = edge_breed_cost(&cur, golden, mask, spec, params.w, window, params.densify_w);
     let mut local_best = (cur.clone(), cur_cost);
     let cfg = board.cfg;
     for i in 0..params.iters {
         let t = params.t0 * (params.t_end / params.t0).powf(i as f64 / params.iters as f64);
         // local move
         let cand = mutate(&cur, space, false, &mut rng);
-        let cc = edge_breed_cost(&cand, golden, mask, spec, params.w, window);
+        let cc = edge_breed_cost(&cand, golden, mask, spec, params.w, window, params.densify_w);
         if cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / t).exp() {
             cur = cand;
             cur_cost = cc;
@@ -1046,7 +1045,7 @@ fn flat_breed_chain(
         if i % cfg.poll_rate == 0 {
             if let Some((peer, _)) = board.sample_peer(idx, &mut rng) {
                 let child = crossover(&cur, &peer, space.slots, &mut rng);
-                let ch = edge_breed_cost(&child, golden, mask, spec, params.w, window);
+                let ch = edge_breed_cost(&child, golden, mask, spec, params.w, window, params.densify_w);
                 if ch - cur_cost <= 0.0 || rng.unit() < (-(ch - cur_cost) / t).exp() {
                     cur = child;
                     cur_cost = ch;
@@ -1110,6 +1109,106 @@ pub fn synthesize_flat_breed(
     let (p, _) = best.expect("at least one island");
     let sc = score_masked(&p, golden, mask, spec);
     (p, sc)
+}
+
+// ---- meta-optimization: tune the breeding engine's hyperparameters (ticket
+// 002), modeled on mlx86's *_hyperparameters.cpp — the optimizer optimizes its
+// own knobs. Multiplicative (scale-invariant) perturbation + hard clamps; the
+// objective is a fixed-seed mini-trial of the inner search.
+
+/// The tunable hyperparameters of the breeding engine — the meta-genome.
+#[derive(Clone, Copy, Debug)]
+pub struct BreedHp {
+    pub w: f64,
+    pub t0: f64,
+    pub t_end: f64,
+    pub densify_w: f64,
+    pub post_rate: u32,
+    pub poll_rate: u32,
+    /// Hottest island's window; the ladder ramps this down to 0 across islands.
+    pub max_window: usize,
+}
+
+impl Default for BreedHp {
+    fn default() -> Self {
+        BreedHp { w: 64.0, t0: 128.0, t_end: 1.0, densify_w: 0.5, post_rate: 20, poll_rate: 50, max_window: 8 }
+    }
+}
+
+/// A uniform multiplier in [0.5, 2) — scale-invariant perturbation (mlx86).
+fn meta_mult(rng: &mut Rng) -> f64 {
+    let x = rng.unit() + 1.0; // [1, 2)
+    if rng.boolean() {
+        1.0 / x
+    } else {
+        x
+    }
+}
+
+impl BreedHp {
+    /// Perturb one field multiplicatively, then clamp to a sane range.
+    fn perturb(&self, rng: &mut Rng) -> BreedHp {
+        let mut h = *self;
+        match rng.below(7) {
+            0 => h.w = (h.w * meta_mult(rng)).clamp(8.0, 4096.0),
+            1 => h.t0 = (h.t0 * meta_mult(rng)).clamp(2.0, 8192.0),
+            2 => h.t_end = (h.t_end * meta_mult(rng)).clamp(0.01, 64.0),
+            3 => h.densify_w = (h.densify_w * meta_mult(rng)).clamp(0.05, 1.0),
+            4 => h.post_rate = ((h.post_rate as f64 * meta_mult(rng)).round() as u32).clamp(1, 500),
+            5 => h.poll_rate = ((h.poll_rate as f64 * meta_mult(rng)).round() as u32).clamp(2, 1000),
+            _ => h.max_window = ((h.max_window as f64 * meta_mult(rng)).round() as usize).clamp(1, 16),
+        }
+        if h.t_end >= h.t0 {
+            h.t_end = h.t0 * 0.5;
+        }
+        h
+    }
+
+    /// The breeding `Params` for this HP set at a given iteration budget.
+    pub fn to_params(&self, iters: u32) -> Params {
+        Params {
+            iters,
+            w: self.w,
+            t0: self.t0,
+            t_end: self.t_end,
+            densify_w: self.densify_w,
+            migrate: Some(MigrateCfg { post_rate: self.post_rate, poll_rate: self.poll_rate, intensity: 1.0 }),
+            ..Params::default()
+        }
+    }
+
+    /// A window ladder of `n` islands ramping linearly from `max_window` to 0.
+    pub fn ladder(&self, n: usize) -> Vec<usize> {
+        let denom = (n.max(2) - 1) as f64;
+        (0..n).map(|i| ((self.max_window as f64) * (1.0 - i as f64 / denom)).round() as usize).collect()
+    }
+}
+
+/// **Meta-anneal** over [`BreedHp`]: SA in hyperparameter space, minimizing a
+/// fixed-seed mini-trial `eval` of the inner search. Returns the best HP set
+/// found and its meta-cost. Problem-agnostic — the caller supplies `eval`
+/// (run the breeding engine on a target at a reduced budget, return mean
+/// edge-cost). Starts from [`BreedHp::default`].
+pub fn meta_anneal<F: Fn(&BreedHp) -> f64>(eval: F, meta_iters: u32, seed: u64) -> (BreedHp, f64) {
+    let mut rng = Rng::new(seed);
+    let mut cur = BreedHp::default();
+    let mut cur_cost = eval(&cur);
+    let mut best = (cur, cur_cost);
+    // Meta-temperature: edge-cost lives in ~10-30; cool a few → ~0.3.
+    let (t0, t_end) = (4.0_f64, 0.3_f64);
+    for i in 0..meta_iters {
+        let t = t0 * (t_end / t0).powf(i as f64 / meta_iters.max(1) as f64);
+        let cand = cur.perturb(&mut rng);
+        let cc = eval(&cand);
+        if cc <= cur_cost || rng.unit() < (-(cc - cur_cost) / t).exp() {
+            cur = cand;
+            cur_cost = cc;
+        }
+        if cc < best.1 {
+            best = (cand, cc);
+        }
+    }
+    best
 }
 
 /// Anneal against a partial-credit `mask` (see [`hamming_masked`]). A curriculum
