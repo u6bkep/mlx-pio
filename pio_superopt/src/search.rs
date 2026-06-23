@@ -9,7 +9,7 @@
 //! The first validation fixes the SM config and searches only the
 //! instruction slots + wrap, within a small slot window.
 
-use crate::cost::score_masked;
+use crate::cost::{score_masked, Metric};
 use crate::ir::*;
 use crate::program::{Config, Program, ShiftDir};
 use crate::rng::Rng;
@@ -125,6 +125,11 @@ pub struct Params {
     /// chains converge onto the best basin (late-stage consensus). Makes a run
     /// non-deterministic (adoption depends on inter-thread timing).
     pub migrate: Option<MigrateCfg>,
+    /// The smooth search-gradient metric. Default [`Metric::LevelTolerant`]
+    /// preserves prior behavior; [`Metric::Edge`] scores transition events
+    /// instead of per-cycle levels (for transition codes like DME, where level
+    /// matching is deceptive).
+    pub metric: Metric,
 }
 
 /// Async migration knobs for the gene-search chains (ticket 001). Modeled on
@@ -163,6 +168,7 @@ impl Default for Params {
             seed_from_template: false,
             macro_moves: false,
             migrate: None,
+            metric: Metric::LevelTolerant,
         }
     }
 }

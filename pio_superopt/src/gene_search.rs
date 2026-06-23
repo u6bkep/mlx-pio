@@ -12,7 +12,7 @@
 //! correct. Phase 2 reintroduces size on the phase-1 champion and greedily
 //! shrinks while `W·correctness` holds correctness fixed.
 
-use crate::cost::{hamming_tolerant, score_masked, Score};
+use crate::cost::{edge_cost, hamming, hamming_tolerant, score_masked, Metric, Score};
 use crate::gene::{CondKind, Gene, LoopCond, Node};
 use crate::ir::{Insn, Op, OutDst, SetDst, SideCfg};
 use crate::program::Config;
@@ -110,6 +110,26 @@ fn random_loop(rng: &mut Rng, side: &SideCfg) -> Node {
 fn insert_serializer(nodes: &mut Vec<Node>, pos: usize, rng: &mut Rng, side: &SideCfg) {
     nodes.insert(pos, Node::Prim(Insn::plain(Op::Pull { if_empty: false, block: true })));
     nodes.insert(pos + 1, random_loop(rng, side));
+}
+
+/// The **thin** structural move for selection: insert a minimal conditional —
+/// `if(<cond>) { <prim> }`, empty else, zero delays. Deliberately tiny: the
+/// search grows and wires the branch (the toggle idiom, the data-bit dispatch,
+/// the timing balance) from here via the node-level mutations and polish. We
+/// hand it the *capability* (a forward conditional) but not the *answer* (a
+/// pre-assembled DME cell), so the coordination — the thing PT is meant to help
+/// with — stays in the problem.
+fn insert_cond(nodes: &mut Vec<Node>, pos: usize, rng: &mut Rng, side: &SideCfg) {
+    nodes.insert(
+        pos,
+        Node::Cond {
+            cond: random_cond_kind(rng),
+            then: vec![Node::Prim(random_prim_insn(rng, side))],
+            els: vec![],
+            dispatch_delay: 0,
+            skip_delay: 0,
+        },
+    );
 }
 
 fn keep_counter_consistent(node: &mut Node) {
@@ -294,7 +314,7 @@ fn mutate_gene(g: &Gene, rng: &mut Rng) -> Gene {
         }
         return m;
     }
-    match rng.below(9) {
+    match rng.below(10) {
         0 => {
             let pos = rng.below(n as u32 + 1) as usize;
             m.nodes.insert(pos, Node::Prim(random_prim_insn(rng, &m.config.side)));
@@ -304,9 +324,13 @@ fn mutate_gene(g: &Gene, rng: &mut Rng) -> Gene {
             insert_serializer(&mut m.nodes, pos, rng, &m.config.side);
         }
         2 => {
-            m.nodes.remove(rng.below(n as u32) as usize);
+            let pos = rng.below(n as u32 + 1) as usize;
+            insert_cond(&mut m.nodes, pos, rng, &m.config.side);
         }
         3 => {
+            m.nodes.remove(rng.below(n as u32) as usize);
+        }
+        4 => {
             let i = rng.below(n as u32) as usize;
             m.nodes[i] = if rng.boolean() {
                 Node::Prim(random_prim_insn(rng, &m.config.side))
@@ -315,9 +339,9 @@ fn mutate_gene(g: &Gene, rng: &mut Rng) -> Gene {
             };
         }
         // Timing-aware moves: restructure at constant total duration.
-        4 => insert_compensated(&mut m.nodes, rng, &m.config.side),
-        5 => remove_compensated(&mut m.nodes, rng),
-        6 => shift_cycles(&mut m.nodes, rng),
+        5 => insert_compensated(&mut m.nodes, rng, &m.config.side),
+        6 => remove_compensated(&mut m.nodes, rng),
+        7 => shift_cycles(&mut m.nodes, rng),
         _ => {
             let i = rng.below(n as u32) as usize;
             mutate_node(&mut m.nodes[i], rng, &m.config.side);
@@ -346,25 +370,31 @@ fn random_gene(config: Config, rng: &mut Rng) -> Gene {
 /// - `size_weight` is the parsimony gradient (reduced during synthesis, 1 at
 ///   the end). `max_len` is the hard length bound that prevents bloat — the
 ///   gene analogue of the slot search's fixed window.
-/// - `k` is the tolerance-band radius (see [`hamming_tolerant`]): large early
-///   to smooth the landscape, annealed to 0 (strict) to certify.
+/// - `k` is the tolerance band (see [`hamming_tolerant`]) / edge-matching window
+///   (see [`edge_cost`]): large early to smooth the landscape, annealed to 0
+///   (strict) to certify.
+/// - `metric` selects the smooth gradient (level-tolerant vs transition-event).
 #[derive(Debug, Clone, Copy)]
 pub struct Obj {
     pub w: f64,
     pub size_weight: f64,
     pub max_len: usize,
     pub k: usize,
+    pub metric: Metric,
 }
 
 /// Scalar cost: `∞` if the gene exceeds `max_len` or lowers to an illegal
-/// program, else `w·correctness + size_weight·lowered_len`, where correctness
-/// is the tolerance-band metric at radius `obj.k`.
+/// program, else `w·correctness + size_weight·lowered_len`, where correctness is
+/// the chosen smooth metric at radius/window `obj.k`.
 fn cost_gene(g: &Gene, golden: &[u32], mask: &[u32], spec: &RunSpec, obj: &Obj) -> f64 {
     if g.lowered_len() > obj.max_len || g.validate().is_err() {
         return f64::INFINITY;
     }
     let wave = run(&g.lower(), spec);
-    let corr = hamming_tolerant(golden, &wave, mask, obj.k);
+    let corr = match obj.metric {
+        Metric::LevelTolerant => hamming_tolerant(golden, &wave, mask, obj.k),
+        Metric::Edge => edge_cost(golden, &wave, mask, obj.k),
+    };
     obj.w * corr + obj.size_weight * g.lowered_len() as f64
 }
 
@@ -914,7 +944,7 @@ pub fn synthesize_gene(
     // hit the chain cap. Front-loading basin diversity here is what later
     // stages need to avoid committing to one stage-1 champion.
     let s0 = schedule[0];
-    let obj0 = Obj { w: params.w, size_weight: s0.size_weight, max_len, k: s0.k };
+    let obj0 = Obj { w: params.w, size_weight: s0.size_weight, max_len, k: s0.k, metric: params.metric };
     let diversity_target = 2 * elite_n;
     let max_chains = params.restarts * 8;
     let mut scored: Vec<(Gene, f64)> = Vec::new();
@@ -935,7 +965,7 @@ pub fn synthesize_gene(
     // Later stages — sharpen with a larger batch seeded from the elite pool.
     let late_batch = params.restarts * 2;
     for (idx, stage) in schedule.iter().enumerate().skip(1) {
-        let obj = Obj { w: params.w, size_weight: stage.size_weight, max_len, k: stage.k };
+        let obj = Obj { w: params.w, size_weight: stage.size_weight, max_len, k: stage.k, metric: params.metric };
         let batch = run_chains(
             config, &population, golden, mask, spec, params, &obj, late_batch,
             seed ^ ((idx as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)),
@@ -952,7 +982,7 @@ pub fn synthesize_gene(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Insn, Op, OutDst, SetDst, SideCfg};
+    use crate::ir::{Insn, MovDst, MovOp, MovSrc, Op, OutDst, SetDst, SideCfg};
     use crate::program::*;
     use crate::run::run;
 
@@ -1008,6 +1038,266 @@ mod tests {
 
     fn full_mask(golden: &[u32]) -> Vec<u32> {
         vec![u32::MAX; golden.len()]
+    }
+
+    // ---- DME (Differential Manchester / biphase-mark) benchmark ----
+    //
+    // The harder-than-UART target (tickets 001 / the v2-IR motivation). Line
+    // level is tracked in Y and driven to the pin; a transition is `mov y,~y`
+    // (flip the level) + `mov pins,y` (drive it). Biphase-mark: a transition at
+    // every bit boundary (the clock), plus an extra mid-bit transition iff the
+    // data bit is 1 — the latter a *data-conditional* `Cond`, the structure UART
+    // lacked and v1 couldn't express.
+
+    fn dme_cfg() -> Config {
+        Config {
+            side: SideCfg::NONE,
+            clkdiv_int: 1,
+            // 5-bit 4B/5B line codes, shifted LSB-first (matches the real impl).
+            shift: ShiftCfg { pull_threshold: 5, out_dir: ShiftDir::Right, ..ShiftCfg::default() },
+            pins: PinMap { out_base: TX, out_count: 1, set_base: TX, set_count: 1, ..PinMap::default() },
+            ..Config::default()
+        }
+    }
+
+    fn mov_y_inv() -> Node {
+        Node::Prim(Insn::plain(Op::Mov { dst: MovDst::Y, op: MovOp::Invert, src: MovSrc::Y }))
+    }
+    fn drive(d: u8) -> Node {
+        Node::Prim(Insn { op: Op::Mov { dst: MovDst::Pins, op: MovOp::None, src: MovSrc::Y }, delay: d, sideset: None })
+    }
+    fn out_x() -> Node {
+        Node::Prim(Insn::plain(Op::Out { dst: OutDst::X, count: 1 }))
+    }
+
+    /// Reference biphase-mark DME encoder, half-bit = `h` cycles. Tracks level
+    /// in Y. Per bit: boundary transition + first-half hold, fetch the data bit,
+    /// a conditional mid-bit transition (`if x-- {toggle}`, `skip_delay=1` to
+    /// balance the 0/1 paths to equal duration), then the second-half hold.
+    fn dme_ref(h: u8) -> Gene {
+        let cell = vec![
+            out_x(),       // data bit -> X (consumed by the Cond)
+            mov_y_inv(),   // boundary transition (clock edge)
+            drive(h - 1),  // drive + hold first half (h cycles)
+            Node::Cond {
+                cond: CondKind::XPostDec, // taken iff bit == 1
+                then: vec![mov_y_inv(), drive(0)], // mid-bit transition
+                els: vec![],
+                dispatch_delay: 0,
+                skip_delay: 1, // balance: 0-path (dispatch+skip) == 1-path (dispatch+toggle+drive)
+            },
+            drive(h - 1), // second-half hold (re-drives current level, both paths)
+        ];
+        Gene {
+            config: dme_cfg(),
+            nodes: vec![
+                pull(),
+                Node::Loop { cond: LoopCond::UntilOsrEmpty, counter_init: None, body: cell, jmp_delay: 0 },
+            ],
+        }
+    }
+
+    const DME_H: u8 = 4;
+    /// Locked capture window: covers the 4-code corpus (active to cycle 272) with
+    /// a small tail, so "correctness" isn't inflated by a long constant stall.
+    const DME_CYCLES: u64 = 278;
+
+    /// The locked DME benchmark: (spec, golden, full mask). Golden is the
+    /// reference's own output (self-consistent oracle), captured under the locked
+    /// window — exactly the reference-oracle approach UART uses.
+    fn dme_golden() -> (RunSpec, Vec<u32>, Vec<u32>) {
+        let sp = dme_spec(DME_CYCLES);
+        let golden = run(&dme_ref(DME_H).lower(), &sp);
+        let mask = full_mask(&golden);
+        (sp, golden, mask)
+    }
+
+    /// A multi-code corpus (diverse 4B/5B data codes, varied bit patterns and
+    /// popcounts) so a thin oracle can't be gamed — the recurring overfitting
+    /// hazard. Processed back-to-back: the loop wraps to `pull` between codes.
+    fn dme_corpus() -> Vec<u32> {
+        vec![0x1E, 0x0A, 0x15, 0x09] // codes 0,4,3,1; lsb bits 01111/01010/10101/10010
+    }
+
+    fn dme_spec(cycles: u64) -> RunSpec {
+        RunSpec {
+            block: 0,
+            sm: 0,
+            inputs: dme_corpus(),
+            output_pins: vec![TX],
+            capture_pins: vec![TX],
+            cycles,
+        }
+    }
+
+    /// PROBE: find the active length (last transition) of the reference on the
+    /// corpus, so the locked capture window covers the data with minimal stall
+    /// tail. Run: `cargo test --release -- --ignored dme_probe --nocapture`
+    #[test]
+    #[ignore = "probe; run with --release ... --nocapture"]
+    fn dme_probe() {
+        let g = dme_ref(DME_H);
+        let wave = run(&g.lower(), &dme_spec(400));
+        let last_edge = wave.windows(2).rposition(|w| (w[0] ^ w[1]) & 1 != 0).map(|i| i + 1).unwrap_or(0);
+        let edges = wave.windows(2).filter(|w| (w[0] ^ w[1]) & 1 != 0).count();
+        let total_pop: u32 = dme_corpus().iter().map(|c| (c & 0x1F).count_ones()).sum();
+        eprintln!("corpus={:02X?}  lowered_len={}", dme_corpus(), g.lower().size());
+        eprintln!("last transition at cycle {last_edge}; total edges={edges} (5*4 boundaries + {total_pop} mids = {})", 20 + total_pop);
+        eprintln!("suggest DME_CYCLES = {}", last_edge + DME_H as usize + 2);
+    }
+
+    /// LOCK GUARD (runs in the normal suite): the reference is legal and scores
+    /// 0 against its own locked golden, and the golden carries the expected
+    /// data-conditional structure — one mid transition per 1-bit. This pins the
+    /// benchmark so later changes can't silently move it.
+    #[test]
+    fn dme_reference_scores_zero() {
+        let (sp, golden, mask) = dme_golden();
+        let g = dme_ref(DME_H);
+        assert!(g.validate().is_ok(), "{:?}", g.validate());
+        assert_eq!(g.lower().size(), 10, "reference is 10 slots");
+        assert_eq!(
+            score_masked(&g.lower(), &golden, &mask, &sp).correctness,
+            0,
+            "reference must match its own golden"
+        );
+        // Structural: 5 boundaries/code (minus the 1 pre-window startup edge) plus
+        // one mid transition per 1-bit across the corpus — the v2-IR property.
+        let edges = golden.windows(2).filter(|w| (w[0] ^ w[1]) & 1 != 0).count();
+        let pop: u32 = dme_corpus().iter().map(|c| (c & 0x1F).count_ones()).sum();
+        let boundaries = 5 * dme_corpus().len() as u32 - 1;
+        assert_eq!(edges as u32, boundaries + pop, "boundary + popcount-mid structure");
+    }
+
+    /// HEADROOM (ticket 001 gate): does the baseline gene search — now with the
+    /// `insert_cond` move — actually solve DME, or does it have headroom? If the
+    /// baseline reliably hits 0 it's too easy (like UART) and can't discriminate
+    /// PT; if it plateaus, DME is a real testbed. This is the gate before any
+    /// migration A/B is meaningful.
+    ///
+    /// Run: `cargo test --release -- --ignored dme_headroom --nocapture`
+    #[test]
+    #[ignore = "DME headroom; run with --release ... --nocapture"]
+    fn dme_headroom() {
+        let (sp, golden, mask) = dme_golden();
+        let params = Params { iters: 6000, restarts: 8, ..Params::default() };
+        let seeds: Vec<u64> = (0..8u64).map(|i| 0x0D3E ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        let (solved, corrs) = solve_rate(dme_cfg(), &golden, &mask, &sp, &params, 16, &seeds);
+        eprintln!("\nDME baseline (n={}, max_len=16): solved {solved}/{}", seeds.len(), seeds.len());
+        eprintln!("  correctness spread: {corrs:?}");
+        eprintln!("  (golden has {} active cycles; reference is 10 slots)", DME_CYCLES);
+    }
+
+    /// HEADROOM++ : throw real compute at DME — a portfolio of schedules
+    /// (including a wider starting blur, since the DME frame is ~3x UART) ×
+    /// seeds, higher iters/restarts, larger length cap. Reports the best
+    /// correctness reached and the structure of the best gene, to see whether
+    /// the thin search ever approaches a solution with effort, and whether it's
+    /// reaching for the toggle/conditional cell at all.
+    ///
+    /// Run: `cargo test --release -- --ignored dme_compute --nocapture`
+    #[test]
+    #[ignore = "DME big-compute frontier; run with --release ... --nocapture"]
+    fn dme_compute() {
+        let (sp, golden, mask) = dme_golden();
+        let params = Params { iters: 18000, restarts: 16, ..Params::default() };
+        let portfolio = [
+            sched(&[(8, 0.25), (4, 0.25), (2, 0.5), (1, 0.5), (0, 1.0)]),
+            sched(&[(16, 0.25), (8, 0.25), (4, 0.5), (2, 0.5), (1, 0.25), (0, 1.0)]), // wider start for the long frame
+        ];
+        let seeds: Vec<u64> = (0..8u64).map(|i| 0x0D3E ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        let mut best: (u32, u8, Option<Gene>) = (u32::MAX, 0, None);
+        let mut solved = 0;
+        for (si, s) in portfolio.iter().enumerate() {
+            for &seed in &seeds {
+                let (g, sc) = synthesize_gene(dme_cfg(), &golden, &mask, &sp, &params, s, 20, 4, seed);
+                if sc.correctness == 0 {
+                    solved += 1;
+                }
+                if (sc.correctness, sc.size) < (best.0, best.1) {
+                    best = (sc.correctness, sc.size, Some(g));
+                }
+                eprintln!("  sched{si} seed{seed:#x}: correctness={} size={}", sc.correctness, sc.size);
+            }
+        }
+        eprintln!("\nDME big-compute: solved {solved}/{} | best correctness={} size={}", 2 * seeds.len(), best.0, best.1);
+        if let Some(g) = best.2 {
+            eprintln!("  best gene: {}", show_gene(&g));
+        }
+    }
+
+    /// OBJECTIVE A/B: does the transition-event metric dissolve the deceptive
+    /// `out Pins` basin? Same search, same compute — only `Params.metric`
+    /// differs. Both arms report the *strict level-Hamming* correctness of the
+    /// best gene found (the unchanged certifier), so this measures whether
+    /// edge-guided search actually reaches a level-correct DME waveform.
+    ///
+    /// Run: `cargo test --release -- --ignored dme_metric_ab --nocapture`
+    #[test]
+    #[ignore = "objective A/B; run with --release ... --nocapture"]
+    fn dme_metric_ab() {
+        let (sp, golden, mask) = dme_golden();
+        let lvl = Params { iters: 8000, restarts: 8, ..Params::default() };
+        let edge = Params { metric: Metric::Edge, ..lvl };
+        let seeds: Vec<u64> = (0..8u64).map(|i| 0x0D3E ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+
+        // Best gene per arm, judged by the arm's OWN metric, plus a cross-readout
+        // of the other metric, so we see what each is actually steering toward.
+        let run_arm = |name: &str, p: &Params| {
+            let mut best: Option<(f64, Gene)> = None; // by this arm's metric (window 0)
+            for &seed in &seeds {
+                let (g, _) = synthesize_gene(dme_cfg(), &golden, &mask, &sp, p, &DEFAULT_SCHEDULE, 16, 4, seed);
+                let w = run(&g.lower(), &sp);
+                let self_cost = match p.metric {
+                    Metric::Edge => edge_cost(&golden, &w, &mask, 0),
+                    Metric::LevelTolerant => hamming_tolerant(&golden, &w, &mask, 0),
+                };
+                if best.as_ref().map_or(true, |(bc, _)| self_cost < *bc) {
+                    best = Some((self_cost, g));
+                }
+            }
+            let (bc, g) = best.unwrap();
+            let w = run(&g.lower(), &sp);
+            let lvl = hamming(&golden, &w);
+            let edg = edge_cost(&golden, &w, &mask, 0);
+            eprintln!("\n  {name}: best self-metric={bc:.1} | strict level-Hamming={lvl} | strict edge-cost={edg:.1}");
+            eprintln!("    {}", show_gene(&g));
+        };
+        eprintln!("\nDME objective A/B (n={}); golden has ~30 edges, 278 cycles:", seeds.len());
+        run_arm("level-tolerant", &lvl);
+        run_arm("edge", &edge);
+    }
+
+    /// DIAGNOSTIC: run the DME reference on a few line codes and print the pin
+    /// waveform + per-bit transition counts, to eyeball correctness and tune
+    /// timing. Run: `cargo test --release -- --ignored dme_inspect --nocapture`
+    #[test]
+    #[ignore = "diagnostic; run with --release ... --nocapture"]
+    fn dme_inspect() {
+        let h = 4u8;
+        let g = dme_ref(h);
+        eprintln!("dme_ref(h={h}): {}", show_gene(&g));
+        eprintln!("validate: {:?}", g.validate());
+        // One code at a time so the transition structure is legible.
+        for &(name, code) in &[("0=11110", 0x1Eu32), ("F=11101", 0x1D), ("1=01001", 0x09), ("Idle=11111", 0x1F), ("Q=00000", 0x00)] {
+            let sp = RunSpec {
+                block: 0,
+                sm: 0,
+                inputs: vec![code],
+                output_pins: vec![TX],
+                capture_pins: vec![TX],
+                cycles: 100,
+            };
+            let wave = run(&g.lower(), &sp);
+            let levels: String = wave.iter().map(|s| if s & 1 != 0 { '#' } else { '_' }).collect();
+            let edges = wave.windows(2).filter(|w| (w[0] ^ w[1]) & 1 != 0).count();
+            // low 5 bits LSB-first are the line bits actually shifted out
+            let bits: String = (0..5).map(|i| if (code >> i) & 1 != 0 { '1' } else { '0' }).collect();
+            let pop = (code & 0x1F).count_ones();
+            let want = 5 + pop; // 5 boundary edges + one mid edge per 1-bit
+            let ok = if edges as u32 == want { "OK" } else { "??" };
+            eprintln!("  {name:>10} bits(lsb→)={bits} edges={edges} want={want} {ok}  {levels}");
+        }
     }
 
     /// Sanity: reference genes lower to legal programs that score 0 vs their own
@@ -1267,6 +1557,7 @@ mod tests {
 
     /// Run `seeds` syntheses and return (solved_count, sorted correctness).
     fn solve_rate(
+        config: Config,
         golden: &[u32],
         mask: &[u32],
         spec: &RunSpec,
@@ -1277,7 +1568,7 @@ mod tests {
         let mut corrs: Vec<u32> = seeds
             .iter()
             .map(|&seed| {
-                synthesize_gene(uart_cfg(), golden, mask, spec, params, &DEFAULT_SCHEDULE, max_len, 4, seed)
+                synthesize_gene(config, golden, mask, spec, params, &DEFAULT_SCHEDULE, max_len, 4, seed)
                     .1
                     .correctness
             })
@@ -1309,8 +1600,8 @@ mod tests {
             let ugolden = run(&uart_gene(k).lower(), &usp);
             let umask = full_mask(&ugolden);
 
-            let (sb, cb) = solve_rate(&ugolden, &umask, &usp, &base, 10, &seeds);
-            let (sm, cm) = solve_rate(&ugolden, &umask, &usp, &migr, 10, &seeds);
+            let (sb, cb) = solve_rate(uart_cfg(), &ugolden, &umask, &usp, &base, 10, &seeds);
+            let (sm, cm) = solve_rate(uart_cfg(), &ugolden, &umask, &usp, &migr, 10, &seeds);
             eprintln!("\nUART k={k} (n={})", seeds.len());
             eprintln!("  baseline   : solved {sb}/{} | {cb:?}", seeds.len());
             eprintln!("  migration  : solved {sm}/{} | {cm:?}", seeds.len());

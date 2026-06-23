@@ -93,6 +93,97 @@ pub fn hamming_tolerant(golden: &[u32], candidate: &[u32], mask: &[u32], k: usiz
     total
 }
 
+/// Which search-gradient metric to optimize. The strict certifier is always
+/// level-Hamming (`hamming`); this only chooses the *smooth* metric the search
+/// climbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metric {
+    /// Per-cycle level/OE Hamming with a `k`-cycle tolerance band
+    /// ([`hamming_tolerant`]). Rewards holding the right *level* — which on a
+    /// transition code (DME) is deceptive: a slowly-varying signal matches ~half
+    /// the cycles for free, trapping the search in a no-transition basin.
+    LevelTolerant,
+    /// Transition-event distance ([`edge_cost`]). Scores the *edges*, so a
+    /// signal with the wrong transition structure scores badly with no free
+    /// partial credit — the gradient points toward producing real transitions.
+    Edge,
+}
+
+/// Transition events of one bit-channel: `(cycle, new_value)` for every cycle
+/// the bit differs from the previous (implicit pre-start level 0). Because the
+/// pre-start level is fixed, the event list is a *complete* encoding of the
+/// channel — two channels with identical event lists are bit-identical, so
+/// `edge_cost == 0` (window 0) implies an exact waveform match.
+fn channel_edges(wave: &[u32], bit: u32, n: usize) -> Vec<(usize, u32)> {
+    let mut out = Vec::new();
+    let mut prev = 0u32;
+    for i in 0..n {
+        let v = (wave.get(i).copied().unwrap_or(0) >> bit) & 1;
+        if v != prev {
+            out.push((i, v));
+            prev = v;
+        }
+    }
+    out
+}
+
+/// Banded edit distance between two edge sequences. A matched pair (same
+/// direction, within `window` cycles) costs `Δ/(window+1)`; a deleted golden
+/// edge (missing) or inserted candidate edge (spurious) costs 1. Wrong-direction
+/// or out-of-window pairs are not matchable and resolve to delete+insert.
+fn align_edges(eg: &[(usize, u32)], ec: &[(usize, u32)], window: usize) -> f64 {
+    let (n, m) = (eg.len(), ec.len());
+    let denom = window as f64 + 1.0;
+    // dp[i][j] = min cost to align eg[..i] with ec[..j].
+    let mut dp = vec![vec![0.0f64; m + 1]; n + 1];
+    for i in 0..=n {
+        dp[i][0] = i as f64;
+    }
+    for j in 0..=m {
+        dp[0][j] = j as f64;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let (gc, gv) = eg[i - 1];
+            let (cc, cv) = ec[j - 1];
+            let d = (gc as isize - cc as isize).unsigned_abs();
+            let match_cost = if gv == cv && d <= window { d as f64 / denom } else { f64::INFINITY };
+            dp[i][j] = (dp[i - 1][j - 1] + match_cost)
+                .min(dp[i - 1][j] + 1.0)
+                .min(dp[i][j - 1] + 1.0);
+        }
+    }
+    dp[n][m]
+}
+
+/// **Transition-event metric.** Sum, over every bit-channel the `mask` cares
+/// about (a bit set anywhere), of the [`align_edges`] distance between golden
+/// and candidate edge sequences. Replaces per-cycle level matching with
+/// per-edge matching: the unit of error is a wrong/missing/mistimed *transition*,
+/// so a no-transition or wrong-transition-structure candidate cannot collect the
+/// free partial credit that level-Hamming hands out. `window` is the timing
+/// slack (annealed like `k`); `window = 0` certifies exact edge structure.
+pub fn edge_cost(golden: &[u32], candidate: &[u32], mask: &[u32], window: usize) -> f64 {
+    let n = golden.len().max(candidate.len());
+    let mut care = 0u32;
+    for i in 0..n {
+        care |= mask.get(i).copied().unwrap_or(0);
+    }
+    let mut total = 0.0;
+    let mut bits = care;
+    while bits != 0 {
+        let b = bits.trailing_zeros();
+        bits &= bits - 1;
+        let eg = channel_edges(golden, b, n);
+        let ec = channel_edges(candidate, b, n);
+        if eg.is_empty() && ec.is_empty() {
+            continue;
+        }
+        total += align_edges(&eg, &ec, window);
+    }
+    total
+}
+
 /// The decomposed score of a candidate. The MH loop combines these into a
 /// scalar (correctness gated ahead of size); kept separate here so the
 /// weighting policy lives with the search, not the metric.
@@ -189,6 +280,47 @@ mod tests {
             capture_pins: vec![DATA, CLK], // bit0 = data, bit1 = clock
             cycles: 24,
         }
+    }
+
+    #[test]
+    fn edge_cost_zero_for_identical() {
+        let g = [0u32, 1, 1, 0, 0, 1];
+        let m = [u32::MAX; 6];
+        assert_eq!(edge_cost(&g, &g, &m, 0), 0.0);
+        assert_eq!(edge_cost(&g, &g, &m, 4), 0.0);
+    }
+
+    #[test]
+    fn edge_cost_partial_credit_for_shifted_edge() {
+        // Golden rises at cycle 2; candidate rises at cycle 3 (one late).
+        let g = [0u32, 0, 1, 1, 1];
+        let c = [0u32, 0, 0, 1, 1];
+        let m = [1u32; 5];
+        let strict = edge_cost(&g, &c, &m, 0);
+        let tol = edge_cost(&g, &c, &m, 4);
+        assert_eq!(strict, 2.0, "no window: the rising edge is missing(1)+spurious(1)");
+        assert!(tol < strict && tol > 0.0, "a one-cycle slip costs <1 with a window (got {tol})");
+        assert!((tol - 0.2).abs() < 1e-9, "1 cycle / (4+1) = 0.2 (got {tol})");
+    }
+
+    #[test]
+    fn edge_cost_punishes_the_deceptive_no_transition_basin() {
+        // Golden: a toggling signal (5 edges). Candidate A: holds the right level
+        // half the time (the level-Hamming trap) but never transitions. Candidate
+        // B: actually transitions, slightly mistimed. Edge metric must prefer B.
+        let g = [0u32, 1, 0, 1, 0, 1, 0, 1];
+        let flat = [1u32; 8]; // matches golden on 4/8 cycles by level, but 0 edges
+        let toggly = [0u32, 1, 0, 1, 0, 1, 1, 1]; // same edges as g except the tail
+        let m = [1u32; 8];
+        let win = 2;
+        // The flat signal has zero edges vs golden's 7 → ~7 missing; the toggly
+        // one shares almost all edges → near zero. The edge metric strongly
+        // prefers real transitions. (The level metric's deceptive partial credit
+        // only emerges at DME scale; demonstrated by the search A/B, not here.)
+        assert!(
+            edge_cost(&g, &toggly, &m, win) + 3.0 < edge_cost(&g, &flat, &m, win),
+            "edge metric must strongly reward real transitions over a flat signal"
+        );
     }
 
     #[test]
