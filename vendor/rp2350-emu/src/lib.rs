@@ -736,6 +736,70 @@ impl Emulator {
         self.update_gpio();
     }
 
+    /// **Capture-loop PIO tick** (LOCAL FORK — not upstream). Like
+    /// [`Self::step_pio_only`] but omits the *pre*-step GPIO refresh: inside a
+    /// capture loop that never changes external inputs between cycles, the
+    /// pre-refresh is provably identical to the previous cycle's post-merge, so
+    /// it is hoisted out. Callers MUST call [`Self::refresh_gpio`] once before
+    /// the first `tick_pio` to compose the initial GPIO state. Halves the
+    /// per-cycle `update_gpio` count (ticket 004).
+    ///
+    /// Steps every PIO block released from reset (all four SMs of each), so
+    /// multi-SM and multi-block programs advance correctly: the input snapshot
+    /// is taken once, all SMs step against it, then outputs are merged once —
+    /// the same one-cycle inter-SM latency as hardware / the full step.
+    pub fn tick_pio(&mut self) {
+        self.clock.advance(1);
+        let gpio_pins = (self.bus.gpio_in.load(Ordering::Relaxed) as u64)
+            | ((self.bus.gpio_in_hi.load(Ordering::Relaxed) as u64) << 32);
+        let resets = self.bus.resets_state;
+        for (i, pio) in self.bus.pio.iter_mut().enumerate() {
+            let bit = crate::bus::RESET_PIO0 + i as u8;
+            if (resets & (1u32 << bit)) == 0 {
+                pio.step_n_with_pins(1, gpio_pins);
+            }
+        }
+        self.update_gpio_released();
+    }
+
+    /// Compose SIO + PIO + external GPIO into `bus.gpio_in` (public wrapper over
+    /// the internal merge). Call once before a [`Self::tick_pio`] loop.
+    pub fn refresh_gpio(&mut self) {
+        self.update_gpio_released();
+    }
+
+    /// [`Self::update_gpio`] restricted to PIO blocks released from reset (LOCAL
+    /// FORK). A block in reset is inert (`pad_out == pad_oe == 0`) and overlays
+    /// identity onto the merge, so skipping it is byte-identical while avoiding
+    /// its `local_to_physical_pins` work — for the superopt, 1 of 3 blocks is
+    /// released, so this is the bulk of `update_gpio`'s cost. Multi-block
+    /// programs release more blocks and all released ones are merged.
+    fn update_gpio_released(&mut self) {
+        let resets = self.bus.resets_state;
+        let mut out_lo = self.bus.sio.gpio_out & self.bus.sio.gpio_oe;
+        let mut out_hi = 0u32;
+        for (i, pio) in self.bus.pio.iter().enumerate() {
+            let bit = crate::bus::RESET_PIO0 + i as u8;
+            if (resets & (1u32 << bit)) != 0 {
+                continue;
+            }
+            let (pio_out_lo, pio_out_hi) = pio.local_to_physical_pins(pio.pad_out);
+            let (pio_oe_lo, pio_oe_hi) = pio.local_to_physical_pins(pio.pad_oe);
+            out_lo = (out_lo & !pio_oe_lo) | (pio_out_lo & pio_oe_lo);
+            out_hi = (out_hi & !pio_oe_hi) | (pio_out_hi & pio_oe_hi);
+        }
+        let ext_mask = self.bus.gpio_external_mask;
+        let ext_val = self.bus.gpio_external_in.load(Ordering::Relaxed);
+        self.bus
+            .gpio_in
+            .store((out_lo & !ext_mask) | (ext_val & ext_mask), Ordering::Relaxed);
+        let ext_mask_hi = self.bus.gpio_external_mask_hi;
+        let ext_val_hi = self.bus.gpio_external_in_hi.load(Ordering::Relaxed);
+        self.bus
+            .gpio_in_hi
+            .store((out_hi & !ext_mask_hi) | (ext_val_hi & ext_mask_hi), Ordering::Relaxed);
+    }
+
     /// Serial-mode single-quantum step. Shared by [`Self::step`] and
     /// [`Self::run_quantum`] on the Serial path.
     fn step_serial(&mut self) -> u64 {
