@@ -12,7 +12,7 @@
 //! correct. Phase 2 reintroduces size on the phase-1 champion and greedily
 //! shrinks while `W·correctness` holds correctness fixed.
 
-use crate::cost::{edge_cost, hamming, hamming_tolerant, score_masked, Metric, Score};
+use crate::cost::{edge_cost, hamming_tolerant, score_masked, Metric, Score};
 use crate::gene::{CondKind, Gene, LoopCond, Node};
 use crate::ir::{Insn, Op, OutDst, SetDst, SideCfg};
 use crate::program::Config;
@@ -1258,7 +1258,7 @@ mod tests {
             }
             let (bc, g) = best.unwrap();
             let w = run(&g.lower(), &sp);
-            let lvl = hamming(&golden, &w);
+            let lvl = crate::cost::hamming(&golden, &w);
             let edg = edge_cost(&golden, &w, &mask, 0);
             eprintln!("\n  {name}: best self-metric={bc:.1} | strict level-Hamming={lvl} | strict edge-cost={edg:.1}");
             eprintln!("    {}", show_gene(&g));
@@ -1266,6 +1266,49 @@ mod tests {
         eprintln!("\nDME objective A/B (n={}); golden has ~30 edges, 278 cycles:", seeds.len());
         run_arm("level-tolerant", &lvl);
         run_arm("edge", &edge);
+    }
+
+    /// POINT 2: the flat-slot edge-objective search on DME — the creativity
+    /// substrate (arbitrary jumps, no priors/macros) running on the edge metric.
+    /// Compares against the gene-search results: does removing the structural
+    /// constraints (and keeping the fixed objective) find more DME structure?
+    ///
+    /// Run: `cargo test --release -- --ignored dme_flat --nocapture`
+    #[test]
+    #[ignore = "flat+edge DME; run with --release ... --nocapture"]
+    fn dme_flat() {
+        use crate::program::Program;
+        let (sp, golden, mask) = dme_golden();
+        let template = Program::empty(dme_cfg());
+        let space = crate::search::Space {
+            slots: 18,
+            side: SideCfg::NONE,
+            search_wrap: true,
+            genes: crate::search::Genes::default(), // config fixed (pins/shift from template)
+        };
+        let params = Params { iters: 8000, restarts: 16, ..Params::default() };
+        let windows = [8usize, 4, 2, 1, 0];
+        let seeds: Vec<u64> = (0..6u64).map(|i| 0xF1A7 ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+
+        let mut best: Option<(u32, f64, Program)> = None;
+        for &seed in &seeds {
+            let (p, s) = crate::search::synthesize_flat(&template, &space, &golden, &mask, &sp, &params, &windows, seed);
+            let w = run(&p, &sp);
+            let ec = edge_cost(&golden, &w, &mask, 0);
+            eprintln!("  seed{seed:#018x}: strict level-Hamming={} edge-cost={ec:.1} size={}", s.correctness, s.size);
+            if best.as_ref().map_or(true, |(bc, _, _)| s.correctness < *bc) {
+                best = Some((s.correctness, ec, p));
+            }
+        }
+        let (bc, be, bp) = best.unwrap();
+        let mut parts = Vec::new();
+        for i in 0..32usize {
+            if let Some(insn) = &bp.slots[i] {
+                parts.push(format!("{i}:{}", brief_insn(insn)));
+            }
+        }
+        eprintln!("\nflat+edge DME best: level-Hamming={bc} edge-cost={be:.1} (gene+edge was edge-cost 34)");
+        eprintln!("  [{}]  wrap {}..{}", parts.join("  "), bp.wrap_bottom, bp.wrap_top);
     }
 
     /// DIAGNOSTIC: run the DME reference on a few line codes and print the pin

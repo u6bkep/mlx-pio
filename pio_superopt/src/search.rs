@@ -9,11 +9,11 @@
 //! The first validation fixes the SM config and searches only the
 //! instruction slots + wrap, within a small slot window.
 
-use crate::cost::{score_masked, Metric};
+use crate::cost::{edge_cost, score_masked, Metric};
 use crate::ir::*;
 use crate::program::{Config, Program, ShiftDir};
 use crate::rng::Rng;
-use crate::run::RunSpec;
+use crate::run::{run, RunSpec};
 
 /// What the search may vary: the first `slots` instruction slots, the wrap
 /// bounds, and the config `genes`. Everything not searched is taken from
@@ -673,6 +673,81 @@ pub fn anneal(
     seed: u64,
 ) -> (Program, crate::cost::Score) {
     anneal_masked(template, space, golden, &full_mask(golden), spec, params, seed)
+}
+
+/// Edge-objective cost over the raw program: `w·edge_cost(window) + size`,
+/// `∞` if illegal. The flat analogue of `cost_gene` with [`Metric::Edge`].
+fn edge_flat_cost(p: &Program, golden: &[u32], mask: &[u32], spec: &RunSpec, w: f64, window: usize) -> f64 {
+    if p.validate().is_err() {
+        return f64::INFINITY;
+    }
+    let wave = run(p, spec);
+    w * edge_cost(golden, &wave, mask, window) + p.size() as f64
+}
+
+/// **Flat-slot edge-objective search** — point 2 of the mlx86 plan: the
+/// creativity substrate. Metropolis over the raw [`Program`] with arbitrary
+/// jumps and instruction reuse and **no structural priors or macros**
+/// (`mutate(.., macros=false, ..)`), climbing the transition-event metric
+/// ([`edge_cost`]) with the matching `window` annealed across stages (graduated
+/// optimization: each stage warm-starts from the running champion and re-heats
+/// temperature). Certified at the end with strict level-Hamming.
+///
+/// Unlike the gene search this imposes no atomic-loop / structured-control-flow
+/// constraints — control flow is whatever raw `JMP`s the search discovers, so
+/// the representation can express the kind of creative reuse the gene IR forbids.
+pub fn synthesize_flat(
+    template: &Program,
+    space: &Space,
+    golden: &[u32],
+    mask: &[u32],
+    spec: &RunSpec,
+    params: &Params,
+    windows: &[usize],
+    seed: u64,
+) -> (Program, crate::cost::Score) {
+    let mut rng = Rng::new(seed);
+    let mut champ: Option<Program> = None; // running warm-start champion (by stage cost)
+    let mut global_best: Option<(Program, u32)> = None; // strict level-Hamming best (certifier)
+
+    for &window in windows {
+        let mut stage_best: Option<(Program, f64)> = None;
+        for _ in 0..params.restarts {
+            let mut cur = match &champ {
+                Some(c) => c.clone(),
+                None => random_program(template, space, &mut rng),
+            };
+            let mut cur_cost = edge_flat_cost(&cur, golden, mask, spec, params.w, window);
+            let mut local_best = (cur.clone(), cur_cost);
+            for i in 0..params.iters {
+                let frac = i as f64 / params.iters as f64;
+                let t = params.t0 * (params.t_end / params.t0).powf(frac);
+                let cand = mutate(&cur, space, false, &mut rng); // macros OFF — no priors
+                let cand_cost = edge_flat_cost(&cand, golden, mask, spec, params.w, window);
+                let d = cand_cost - cur_cost;
+                if d <= 0.0 || rng.unit() < (-d / t).exp() {
+                    cur = cand;
+                    cur_cost = cand_cost;
+                }
+                if cur_cost < local_best.1 {
+                    local_best = (cur.clone(), cur_cost);
+                }
+            }
+            // strict (level) certification of this chain's best
+            let sc = score_masked(&local_best.0, golden, mask, spec);
+            if sc.valid && global_best.as_ref().map_or(true, |(_, bc)| sc.correctness < *bc) {
+                global_best = Some((local_best.0.clone(), sc.correctness));
+            }
+            if stage_best.as_ref().map_or(true, |(_, bc)| local_best.1 < *bc) {
+                stage_best = Some(local_best);
+            }
+        }
+        champ = stage_best.map(|(p, _)| p);
+    }
+
+    let p = global_best.map(|(p, _)| p).or(champ).expect("at least one window/restart");
+    let s = score_masked(&p, golden, mask, spec);
+    (p, s)
 }
 
 /// Anneal against a partial-credit `mask` (see [`hamming_masked`]). A curriculum
