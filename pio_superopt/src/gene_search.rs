@@ -1551,20 +1551,30 @@ mod tests {
     #[ignore = "meta-tune the breeding engine (~2min); run with --release ... --nocapture"]
     fn dme_meta_tune() {
         use crate::program::Program;
-        use crate::search::{meta_anneal, synthesize_flat_breed, BreedHp};
+        use crate::search::{meta_anneal, synthesize_flat_breed, BreedHp, MigrateCfg};
         let (sp, golden, mask) = dme_golden();
         let template = Program::empty(dme_cfg());
         let space = crate::search::Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
 
-        // Mini-trial: 32 islands (all cores), fixed seeds; objective = mean strict
-        // edge-cost (rewards reliability). inner_iters raised from 40k now that
-        // evals are ~3.4x cheaper (ticket 004) — a larger fraction of the 800k
-        // deployment budget shrinks the transfer trap AND averages down the
-        // breeding engine's thread-timing noise within each trial.
+        // INDEPENDENT (deterministic) mode: force poll_rate=0 so the engine is
+        // reproducible (flat_breed_independent_is_deterministic), making the
+        // meta-objective NOISE-FREE. This is the fix for the wandering means
+        // (default full-scale was 21.0 one run, 25.3 the next under cooperation);
+        // the A/B (dme_breed_ab) showed cooperation doesn't help on DME anyway.
+        let det_params = |hp: &BreedHp, iters: u32| -> Params {
+            let mut p = hp.to_params(iters);
+            p.migrate = Some(MigrateCfg { post_rate: 20, poll_rate: 0, intensity: 1.0 });
+            p
+        };
+
+        // Mini-trial: 32 islands (all cores), 150k iters (a large fraction of the
+        // 800k deployment, post-004). Multiple seeds are now restarts — samples of
+        // different starting basins, not noise control (the engine is deterministic).
+        // Objective = mean strict edge-cost.
         let inner_iters = 150_000u32;
         let inner_seeds = [0xA1u64, 0xB2u64, 0xC3u64];
         let eval = |hp: &BreedHp| -> f64 {
-            let params = hp.to_params(inner_iters);
+            let params = det_params(hp, inner_iters);
             let windows = hp.ladder(32);
             let mut tot = 0.0;
             for &s in &inner_seeds {
@@ -1582,17 +1592,16 @@ mod tests {
         eprintln!("  default HP: {:?}", BreedHp::default());
         eprintln!("  tuned   HP: {best_hp:?}");
 
-        // Apples-to-apples at deployment scale: default vs tuned, each averaged
-        // over several seeds (synthesize_flat_breed is non-deterministic, so a
-        // single run can't tell us whether tuning transfers). This is the real
-        // transfer-trap test the original (tuned-only) validation couldn't make.
+        // Apples-to-apples at deployment scale: default vs tuned, each over
+        // several restart seeds. Deterministic now, so these numbers are exactly
+        // reproducible run-to-run — the transfer-trap test is finally trustworthy.
         let full_iters = 800_000u32;
         let full_seeds = [0x5EEDu64, 0x1234u64, 0xABCDu64];
         let full_scale = |hp: &BreedHp| -> Vec<f64> {
             full_seeds
                 .iter()
                 .map(|&s| {
-                    let (c, _) = synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &hp.to_params(full_iters), &hp.ladder(32), s);
+                    let (c, _) = synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &det_params(hp, full_iters), &hp.ladder(32), s);
                     edge_cost(&golden, &run(&c, &sp), &mask, 0)
                 })
                 .collect()

@@ -46,14 +46,35 @@ inner 150k mini-cost:  default 22.7   tuned 19.7
 densify_w 0.5→0.33) is lower AND tighter than the default at deployment. The
 ladder shape was the whole transfer trap; removing it fixed it.
 
-### Remaining caveat / next
-- **Noise persists across runs.** Same default HP + same seeds gave full-scale
-  mean 21.0 one run and 25.3 the next — `synthesize_flat_breed` is
-  non-deterministic (board ↔ thread timing). The *within-run* default-vs-tuned
-  gap is clean (non-overlapping), but a deterministic engine is still the next
-  enabler for confident, repeatable meta-tuning.
-- **Then** consider tuning at deployment scale once a JIT-class eval makes 800k
-  inner trials cheap (follow-on to 004).
+### Deterministic meta-tune (2026-06-23) — noise-chasing eliminated
+
+The noise was killed without a rewrite: the cooperative-vs-independent A/B
+(ticket 001) showed independent mode (`poll_rate = 0`, no board reads) is both
+better on DME *and* deterministic. The meta-tune now forces `poll_rate = 0`, so
+the objective is noise-free and exactly reproducible. The meta-genome is now
+just the four continuous knobs (w, t0, t_end, densify_w); post/poll dropped too
+(irrelevant in independent mode).
+
+```
+inner 150k mini-cost:  default 24.7   tuned 22.7
+tuned HP: only t_end moved (1.0 -> 0.54); w/t0/densify_w unchanged
+@ full 800k (3 seeds): default mean 23.0 [24,23,22]
+                       tuned   mean 21.3 [20,22,22]   => HELPS, reproducible
+```
+
+Tellingly, the clean objective moved **one** knob (t_end); the noisy runs'
+sprawl (w=122, t0=33, densify_w=0.33) was largely noise-chasing.
+
+### Open: is 150k inner still non-representative? (the schedule axis)
+
+w and densify_w are budget-independent (cost weights) and transfer trivially.
+t0/t_end are the annealing schedule: the curve is parameterized by *fraction* of
+budget, but an 800k run spends 5.3x more iters at each temperature, so the
+optimal t_end can shift with budget. The whole tuned gain sits in t_end — the
+one budget-coupled knob — so the residual transfer question is now 1-D.
+**Definitive test:** sweep t_end at 150k vs 800k; if the optimum shifts, short
+inner trials are still non-representative (for the schedule). Cheap + direct
+now that the objective is deterministic.
 
 ## Built + finding (2026-06-22)
 

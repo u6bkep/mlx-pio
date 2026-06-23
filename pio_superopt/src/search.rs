@@ -1163,21 +1163,23 @@ fn meta_mult(rng: &mut Rng) -> f64 {
 impl BreedHp {
     /// Perturb one field multiplicatively, then clamp to a sane range.
     ///
-    /// `max_window` (the ladder shape) is deliberately NOT in the meta-genome:
-    /// the post-004 re-run (ticket 002) identified it as the transfer-trap lever
-    /// — the tuner picks a narrow ladder that sprints short inner trials but
-    /// starves full-scale exploration. It stays fixed at the seed HP's value (a
-    /// wide ladder from `BreedHp::default`); only the continuous + rate knobs
-    /// are tuned.
+    /// The meta-genome is just the four continuous knobs (w, t0, t_end,
+    /// densify_w). Two fields are deliberately excluded:
+    /// - `max_window` (ladder shape) — the transfer-trap lever: the tuner picks
+    ///   a narrow ladder that sprints short inner trials but starves full-scale
+    ///   exploration (ticket 002). Fixed at the seed HP's wide default.
+    /// - `post_rate` / `poll_rate` — the cross-breeding rates, irrelevant in the
+    ///   independent (`poll_rate = 0`) mode the meta-tune now runs in, since the
+    ///   A/B showed cooperation doesn't help on DME and independent mode is
+    ///   deterministic (ticket 001). Re-add them to tune cooperative HPs at
+    ///   higher complexity.
     fn perturb(&self, rng: &mut Rng) -> BreedHp {
         let mut h = *self;
-        match rng.below(6) {
+        match rng.below(4) {
             0 => h.w = (h.w * meta_mult(rng)).clamp(8.0, 4096.0),
             1 => h.t0 = (h.t0 * meta_mult(rng)).clamp(2.0, 8192.0),
             2 => h.t_end = (h.t_end * meta_mult(rng)).clamp(0.01, 64.0),
-            3 => h.densify_w = (h.densify_w * meta_mult(rng)).clamp(0.05, 1.0),
-            4 => h.post_rate = ((h.post_rate as f64 * meta_mult(rng)).round() as u32).clamp(1, 500),
-            _ => h.poll_rate = ((h.poll_rate as f64 * meta_mult(rng)).round() as u32).clamp(2, 1000),
+            _ => h.densify_w = (h.densify_w * meta_mult(rng)).clamp(0.05, 1.0),
         }
         if h.t_end >= h.t0 {
             h.t_end = h.t0 * 0.5;
