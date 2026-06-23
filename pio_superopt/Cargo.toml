@@ -20,6 +20,20 @@ criterion = "0.5"
 name = "eval"
 harness = false
 
+# The eval hot path crosses four crate boundaries (pio_superopt -> pio_harness
+# -> rp2350-emu -> picoem-common) through thin pub fns (tick_pio ->
+# step_n_with_pins -> step_with_pins -> execute_cycle). Without LTO those calls
+# aren't inlined — measured ~15% of eval was cross-crate call overhead (ticket
+# 004). LTO lets the compiler inline and optimize across them. Applied to the
+# search-run (release), bench, and profiling-example builds.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+[profile.bench]
+lto = "fat"
+codegen-units = 1
+
 # Same patch the harness uses, so the transitive (rp2350-emu -> picoem-common)
 # and direct dev-dependency both resolve to the vendored, fixed copy.
 [patch.crates-io]
