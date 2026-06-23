@@ -1471,7 +1471,7 @@ mod tests {
         assert_eq!(windows.len(), 32);
 
         let iters = 400_000u32;
-        let seeds: Vec<u64> = (0..6u64).map(|i| 0xA1B2 ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        let seeds: Vec<u64> = (0..16u64).map(|i| 0xA1B2 ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
 
         // Equal compute; only poll_rate differs. (Cooperative does ~1/poll_rate
         // extra crossover evals/iter — ~2% more work, a slight handicap to
@@ -1495,7 +1495,14 @@ mod tests {
             }
             let mean = ecs.iter().sum::<f64>() / ecs.len() as f64;
             let best = ecs.iter().cloned().fold(f64::INFINITY, f64::min);
-            eprintln!("  {name}: best {best:.1}  mean {mean:.1}  spread {ecs:?}");
+            // Breakthrough rate: the crux of the cooperation hypothesis is that
+            // recombination crosses barriers more often, lifting the tail.
+            let breakthroughs = ecs.iter().filter(|&&e| e <= 18.0).count();
+            let mut sorted = ecs.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = sorted[sorted.len() / 2];
+            eprintln!("  {name}: best {best:.1}  median {median:.1}  mean {mean:.1}  breakthroughs(<=18) {breakthroughs}/{}", ecs.len());
+            eprintln!("    spread {ecs:?}");
             (best, mean)
         };
 

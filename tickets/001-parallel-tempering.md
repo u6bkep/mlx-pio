@@ -7,29 +7,41 @@ source: reference/mlx86 (SolverParallelTempering)
 
 # 001 — Parallel tempering with live solution exchange
 
-## Cross-breeding A/B (2026-06-23) — earns its keep in the tail
+## Cross-breeding A/B (2026-06-23) — does NOT help on DME (n=6 was noise)
 
-First clean isolation of recombination's value: cooperative (crossover on) vs
-the SAME 32 islands run independently (crossover off, `poll_rate = 0`, take
-best), equal compute, identical ladder/iters/seeds (`dme_breed_ab`):
+Clean isolation of recombination's value: cooperative (crossover on) vs the SAME
+32 islands run independently (crossover off, `poll_rate = 0`, take best), equal
+compute, identical ladder/iters/seeds (`dme_breed_ab`).
+
+An initial **n=6** run looked positive (cooperative best 17 vs 20), but **n=16
+reversed it**:
 
 ```
-cooperative: best 17.0  mean 21.3  spread [24,17,23,18,24,22]
-independent: best 20.0  mean 22.2  spread [22,24,20,22,22,23]   (n=6)
+cooperative: best 22  median 23  mean 23.3  breakthroughs(<=18) 0/16  [22-26]
+independent: best 20  median 22  mean 21.8  breakthroughs(<=18) 0/16  [20-24]
+=> independent is better on best, median, AND mean
 ```
 
-Cooperation wins the **best case** (17 vs 20) but **ties on mean** (−0.8, within
-overlapping spreads) and is **higher variance**. Reading: recombination
-occasionally crosses a conjunctive barrier independent chains can't — rare at
-DME complexity, so it shows in the tail, not the mean. Since deployment takes
-the best champion, the tail is the relevant metric, and the hypothesis is that
-the edge grows with complexity (toward 10BASE-T1S; mlx86 needed cooperation for
-hard problems). Caveats: n=6 is noisy (best is one min each); cooperative ran a
-~2% compute handicap yet still won the best case by 15%.
+The n=6 "best 17" was **noise**: seeds 0-5 are identical across the two runs, yet
+seed 1 gave 17 in the first and 23 in the second — *same seed, same params,
+different result*, because `synthesize_flat_breed` is non-deterministic
+(board <-> thread timing). The noise was large enough to flip the conclusion.
 
-**Implication:** the board is not dead weight — keep it. So a deterministic
-engine (ticket 002) must be the barrier-synchronous-exchange rewrite, not a
-delete-the-board shortcut.
+**On DME, cross-breeding does not earn its keep** — independent restarts are
+consistently ~1.5 lower. Likely cause: slot-range `crossover` is destructive
+(breaks structure / JMP targets), and at DME complexity that disruption
+outweighs the rare beneficial recombination.
+
+Caveats / open: this does **not** refute the hypothesis that cooperation pays at
+*higher* complexity (toward 10BASE-T1S; mlx86 needed it) — DME may be below that
+threshold. And the old "cross-breeding cracked the DME wall" claim was never
+isolated from densify+scale; this A/B suggests densify+scale did the work.
+
+**Implications:**
+1. Determinism (ticket 002) is now a *critical* blocker, not a nicety — it just
+   flipped an A/B conclusion. No few-seed result is trustworthy without it.
+2. The board is not justified at current complexity. Re-run this A/B on the
+   harder target before assuming cooperation helps there.
 
 ## Verdict (2026-06-22)
 
