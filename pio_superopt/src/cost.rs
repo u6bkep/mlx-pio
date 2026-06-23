@@ -139,26 +139,25 @@ fn channel_edges(wave: &[u32], bit: u32, n: usize) -> Vec<(usize, u32)> {
 fn align_edges(eg: &[(usize, u32)], ec: &[(usize, u32)], window: usize, spurious_w: f64) -> f64 {
     let (n, m) = (eg.len(), ec.len());
     let denom = window as f64 + 1.0;
-    // dp[i][j] = min cost to align eg[..i] with ec[..j].
-    let mut dp = vec![vec![0.0f64; m + 1]; n + 1];
-    for i in 0..=n {
-        dp[i][0] = i as f64; // i golden edges deleted (missing), cost 1 each
-    }
-    for j in 0..=m {
-        dp[0][j] = j as f64 * spurious_w; // j candidate edges inserted (spurious)
-    }
+    // Edit distance needs only the previous DP row, so roll two rows of width
+    // m+1 instead of allocating the full (n+1)×(m+1) grid (one alloc per row).
+    // `prev[j]` / `cur[j]` = min cost to align eg[..i-1] / eg[..i] with ec[..j].
+    let mut prev: Vec<f64> = (0..=m).map(|j| j as f64 * spurious_w).collect(); // 0 golden vs j spurious
+    let mut cur = vec![0.0f64; m + 1];
     for i in 1..=n {
+        cur[0] = i as f64; // i golden edges deleted (missing), cost 1 each
+        let (gc, gv) = eg[i - 1];
         for j in 1..=m {
-            let (gc, gv) = eg[i - 1];
             let (cc, cv) = ec[j - 1];
             let d = (gc as isize - cc as isize).unsigned_abs();
             let match_cost = if gv == cv && d <= window { d as f64 / denom } else { f64::INFINITY };
-            dp[i][j] = (dp[i - 1][j - 1] + match_cost)
-                .min(dp[i - 1][j] + 1.0) // delete golden edge i (missing)
-                .min(dp[i][j - 1] + spurious_w); // insert candidate edge j (spurious)
+            cur[j] = (prev[j - 1] + match_cost)
+                .min(prev[j] + 1.0) // delete golden edge i (missing)
+                .min(cur[j - 1] + spurious_w); // insert candidate edge j (spurious)
         }
+        std::mem::swap(&mut prev, &mut cur);
     }
-    dp[n][m]
+    prev[m] // after the final swap the last row lives in `prev` (n=0: j*spurious_w)
 }
 
 /// **Transition-event metric.** Sum, over every bit-channel the `mask` cares
@@ -179,10 +178,20 @@ pub fn edge_cost(golden: &[u32], candidate: &[u32], mask: &[u32], window: usize)
 /// spurious counts must be 0), so certification is unaffected.
 pub fn edge_cost_w(golden: &[u32], candidate: &[u32], mask: &[u32], window: usize, spurious_w: f64) -> f64 {
     let n = golden.len().max(candidate.len());
+    // `care` = bits the mask asks about; `present` = bits ever set in either
+    // waveform. A bit absent from both waves has empty edge lists in golden and
+    // candidate, so it contributes 0 — intersecting drops those channels' scans
+    // without changing the result (a full all-ones mask on a 1-pin capture
+    // otherwise scans all 32 channels, 30 of them empty). This only narrows
+    // `care`, so any genuine mask exclusion is preserved.
     let mut care = 0u32;
+    let mut present = 0u32;
     for i in 0..n {
         care |= mask.get(i).copied().unwrap_or(0);
+        present |= golden.get(i).copied().unwrap_or(0);
+        present |= candidate.get(i).copied().unwrap_or(0);
     }
+    care &= present;
     let mut total = 0.0;
     let mut bits = care;
     while bits != 0 {

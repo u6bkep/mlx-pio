@@ -63,6 +63,21 @@ fn bench_eval(c: &mut Criterion) {
         })
     });
     g.finish();
+
+    // Evidence: does the full (all-32-bits) mask cost ~32x the channel scan vs a
+    // mask naming only the bits that actually carry data? `care` = OR of the mask.
+    let mask_full = mask.clone(); // u32::MAX everywhere -> care = all 32 bits
+    let mask_bit0: Vec<u32> = vec![1; golden.len()]; // only the TX level channel
+    let mask_present: Vec<u32> = vec![1 | (1 << 16); golden.len()]; // TX level + OE
+    let mut g = c.benchmark_group("edge_cost_mask");
+    for (name, m) in [("full32", &mask_full), ("present2", &mask_present), ("bit0", &mask_bit0)] {
+        g.bench_function(name, |b| {
+            b.iter(|| {
+                edge_cost_w(black_box(&golden), black_box(&cand_wave), black_box(m), COST_WINDOW, SPURIOUS_W)
+            })
+        });
+    }
+    g.finish();
 }
 
 fn bench_run_parts(c: &mut Criterion) {
