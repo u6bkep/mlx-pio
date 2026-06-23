@@ -123,6 +123,20 @@ fn relocate(insn: u16, offset: u8) -> u16 {
     }
 }
 
+/// Byte sizes of the core emulator structs, for cache analysis (ticket 004):
+/// `(Emulator, Bus, PioBlock, StateMachine)`. The PIO-only step touches one
+/// `PioBlock` (+ a few GPIO words) embedded in the much larger `Emulator`/`Bus`,
+/// so the gap between these numbers is the cache pressure we drag per cycle.
+pub fn type_sizes() -> (usize, usize, usize, usize) {
+    use std::mem::size_of;
+    (
+        size_of::<Emulator>(),
+        size_of::<rp2350_emu::bus::Bus>(),
+        size_of::<rp2350_emu::pio::PioBlock>(),
+        size_of::<rp2350_emu::pio::sm::StateMachine>(),
+    )
+}
+
 /// A handle to one state machine on one PIO block, sharing an emulator.
 pub struct Pio {
     emu: Rc<RefCell<Emulator>>,
