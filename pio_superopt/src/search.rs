@@ -244,7 +244,10 @@ fn occupied(p: &Program, slots: u8) -> Vec<usize> {
 }
 
 /// A fresh random program: each window slot ~half-filled, valid wrap.
-fn random_program(template: &Program, space: &Space, rng: &mut Rng) -> Program {
+///
+/// `pub` so the eval-hot-path benches (ticket 004) can build a representative
+/// starting candidate; not otherwise part of the public API.
+pub fn random_program(template: &Program, space: &Space, rng: &mut Rng) -> Program {
     let mut p = template.clone();
     for i in 0..space.slots as usize {
         p.slots[i] = if rng.boolean() { Some(random_insn(rng, space)) } else { None };
@@ -325,7 +328,10 @@ fn mutate_immediate(insn: &mut Insn, slots: u8, rng: &mut Rng) {
 /// One mutation move. Always yields legal IR (range-aware by construction).
 /// With `macros`, a fraction of moves insert a building-block idiom (see
 /// [`insert_counted_loop`]) instead of a single-field point edit.
-fn mutate(p: &Program, space: &Space, macros: bool, rng: &mut Rng) -> Program {
+///
+/// `pub` so the eval-hot-path benches (ticket 004) can measure the real
+/// per-iteration move; not otherwise part of the public API.
+pub fn mutate(p: &Program, space: &Space, macros: bool, rng: &mut Rng) -> Program {
     let mut m = p.clone();
     let slots = space.slots;
     // Building-block move: ~1 in 8 when enabled and the window has room.
@@ -974,7 +980,12 @@ pub fn synthesize_flat_pt(
 }
 
 /// Edge cost with the densify bias (`spurious_w < 1`), for the breeding engine.
-fn edge_breed_cost(p: &Program, golden: &[u32], mask: &[u32], spec: &RunSpec, w: f64, window: usize, spurious_w: f64) -> f64 {
+/// The per-candidate objective: `validate` + `run` + `edge_cost` + `size`.
+///
+/// `pub` so the eval-hot-path benches (ticket 004) can measure the real
+/// per-candidate cost (incl. the `validate` short-circuit); not otherwise part
+/// of the public API.
+pub fn edge_breed_cost(p: &Program, golden: &[u32], mask: &[u32], spec: &RunSpec, w: f64, window: usize, spurious_w: f64) -> f64 {
     if p.validate().is_err() {
         return f64::INFINITY;
     }

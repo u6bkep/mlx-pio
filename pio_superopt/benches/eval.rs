@@ -26,7 +26,11 @@ use std::time::{Duration, Instant};
 
 use pio_harness::Pio;
 use pio_superopt::cost::edge_cost_w;
-use pio_superopt::fixtures::{dme_golden, dme_plateau_gene, dme_ref, DME_H};
+use pio_superopt::fixtures::{dme_cfg, dme_golden, dme_plateau_gene, dme_ref, DME_H};
+use pio_superopt::ir::SideCfg;
+use pio_superopt::program::Program;
+use pio_superopt::rng::Rng;
+use pio_superopt::search::{edge_breed_cost, mutate, random_program, Genes, Params, Space};
 use pio_superopt::{configure, run};
 
 /// The window/spurious-weight the breeding engine actually evaluates at
@@ -129,5 +133,74 @@ fn bench_run_parts(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_eval, bench_run_parts);
+/// The real search inner loop, to confirm the micro-benches above add up to the
+/// per-iteration cost the search actually pays — and to catch the `validate()`
+/// the ticket flagged (it runs per candidate, inside `edge_breed_cost`, and is
+/// not covered by `run`/`edge_cost`).
+fn bench_breed(c: &mut Criterion) {
+    let (spec, golden, mask) = dme_golden();
+    // The exact DME breed configuration (gene_search::tests::dme_breed).
+    let template = Program::empty(dme_cfg());
+    let space = Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: Genes::default() };
+    let params = Params::default(); // w = 64.0, densify_w = 0.5
+    let window = COST_WINDOW; // representative mid-ladder window
+
+    // A representative valid starting candidate (regenerate until legal).
+    let mut rng = Rng::new(0xB433);
+    let cur = loop {
+        let p = random_program(&template, &space, &mut rng);
+        if p.validate().is_ok() {
+            break p;
+        }
+    };
+
+    // Diagnostic: how edge-dense is this candidate's waveform? (edge_cost scales
+    // with edge count, so a sparse random candidate is the cheap end of the
+    // range; an evolved/plateau candidate the dense end.)
+    {
+        let w = run(&cur, &spec);
+        let ec = edge_cost_w(&golden, &w, &mask, window, params.densify_w);
+        let edges = w.windows(2).filter(|x| (x[0] ^ x[1]) & 1 != 0).count();
+        eprintln!("[breed/cost candidate] wave edges(bit0)={edges}  edge_cost={ec:.2}");
+    }
+
+    let mut g = c.benchmark_group("breed");
+
+    g.bench_function("validate", |b| {
+        b.iter(|| black_box(&cur).validate().is_ok())
+    });
+
+    g.bench_function("mutate", |b| {
+        b.iter(|| mutate(black_box(&cur), black_box(&space), false, &mut rng))
+    });
+
+    // The full per-candidate objective: validate + run + edge_cost + size.
+    g.bench_function("cost", |b| {
+        b.iter(|| {
+            edge_breed_cost(
+                black_box(&cur),
+                black_box(&golden),
+                black_box(&mask),
+                black_box(&spec),
+                params.w,
+                window,
+                params.densify_w,
+            )
+        })
+    });
+
+    // One full local-move iteration of flat_breed_chain: mutate a fresh
+    // candidate, then score it. (The crossover/poll path adds a second
+    // edge_breed_cost every poll_rate≈50 iters — ~2% amortized, omitted.)
+    g.bench_function("step", |b| {
+        b.iter(|| {
+            let cand = mutate(black_box(&cur), black_box(&space), false, &mut rng);
+            edge_breed_cost(&cand, black_box(&golden), black_box(&mask), black_box(&spec), params.w, window, params.densify_w)
+        })
+    });
+
+    g.finish();
+}
+
+criterion_group!(benches, bench_eval, bench_run_parts, bench_breed);
 criterion_main!(benches);
