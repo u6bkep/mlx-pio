@@ -58,6 +58,24 @@ fn run_on(pio: &mut Pio, program: &Program, spec: &RunSpec) -> Vec<u32> {
     pio.trace_pads(&spec.capture_pins, spec.cycles)
 }
 
+/// Like [`run`], but captures via the full-fidelity emulator step (CPU cores +
+/// all peripherals) instead of the PIO-only fast path. Equal to [`run`] for any
+/// program whose output doesn't depend on the cores — the reference the fast
+/// path is validated against (`fast_step_matches_full`). Not used in the search
+/// hot loop.
+pub fn run_full(program: &Program, spec: &RunSpec) -> Vec<u32> {
+    RUNNER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if !matches!(&*slot, Some((b, s, _)) if *b == spec.block && *s == spec.sm) {
+            *slot = Some((spec.block, spec.sm, Pio::new(spec.block, spec.sm)));
+        }
+        let pio = &mut slot.as_mut().unwrap().2;
+        pio.reset();
+        configure(pio, program, spec);
+        pio.trace_pads_full(&spec.capture_pins, spec.cycles)
+    })
+}
+
 /// Assemble, load, and configure an already-reset `Pio` for `program`/`spec`,
 /// up to (and including) enabling the SM and pushing the inputs — everything a
 /// single evaluation does *except* the cycle-stepping capture. Split out so the

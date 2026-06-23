@@ -1126,6 +1126,37 @@ mod tests {
         assert_eq!(edges as u32, boundaries + pop, "boundary + popcount-mid structure");
     }
 
+    /// FORK CORRECTNESS GATE (ticket 004): the PIO-only fast step (`run`, via
+    /// `step_pio_only`) must produce byte-identical waveforms to the full-
+    /// fidelity emulator step (`run_full`). Covers the real DME reference, the
+    /// plateau candidate, and a large spread of random programs (the search's
+    /// actual diet). Runs in the normal suite so the fork can never silently
+    /// diverge from upstream emulation.
+    #[test]
+    fn fast_step_matches_full() {
+        use crate::run::run_full;
+        let (sp, _g, _m) = dme_golden();
+
+        let p = dme_ref(DME_H).lower();
+        assert_eq!(run(&p, &sp), run_full(&p, &sp), "DME reference");
+
+        let pl = crate::fixtures::dme_plateau_gene().lower();
+        assert_eq!(run(&pl, &sp), run_full(&pl, &sp), "plateau candidate");
+
+        let space = crate::search::Space {
+            slots: 20,
+            side: SideCfg::NONE,
+            search_wrap: true,
+            genes: crate::search::Genes::default(),
+        };
+        let template = Program::empty(dme_cfg());
+        let mut rng = Rng::new(0x5EED_F00D);
+        for i in 0..300 {
+            let rp = crate::search::random_program(&template, &space, &mut rng);
+            assert_eq!(run(&rp, &sp), run_full(&rp, &sp), "random program {i}");
+        }
+    }
+
     /// HEADROOM (ticket 001 gate): does the baseline gene search — now with the
     /// `insert_cond` move — actually solve DME, or does it have headroom? If the
     /// baseline reliably hits 0 it's too easy (like UART) and can't discriminate

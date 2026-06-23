@@ -449,6 +449,36 @@ impl Pio {
     /// keeps its pins driven. Up to 16 pins.
     pub fn trace_pads(&mut self, pins: &[u8], cycles: u64) -> Vec<u32> {
         assert!(pins.len() <= 16, "trace_pads supports up to 16 pins");
+        // Fast path: borrow the emulator once and step only the PIO each cycle
+        // (`step_pio_only` skips the CPU cores and non-PIO peripherals — ticket
+        // 004). Byte-identical to `trace_pads_full` whenever the captured output
+        // doesn't depend on the cores; `pio_superopt`'s `fast_step_matches_full`
+        // test asserts that on real and random programs.
+        let block = self.block;
+        let mut e = self.emu.borrow_mut();
+        let mut out = Vec::with_capacity(cycles as usize);
+        for _ in 0..cycles {
+            e.step_pio_only();
+            let mut w = 0u32;
+            for (j, &p) in pins.iter().enumerate() {
+                if e.gpio_read(p) {
+                    w |= 1 << j;
+                }
+                if (e.bus.pio[block].pad_oe >> p) & 1 != 0 {
+                    w |= 1 << (16 + j);
+                }
+            }
+            out.push(w);
+        }
+        out
+    }
+
+    /// Full-fidelity `trace_pads`: steps the entire emulator (CPU cores + all
+    /// peripherals) each cycle. The reference the fast [`Self::trace_pads`] is
+    /// validated against, and the path to use if a capture ever depends on the
+    /// cores driving the PIO (firmware-in-the-loop scenarios).
+    pub fn trace_pads_full(&mut self, pins: &[u8], cycles: u64) -> Vec<u32> {
+        assert!(pins.len() <= 16, "trace_pads supports up to 16 pins");
         let mut out = Vec::with_capacity(cycles as usize);
         for _ in 0..cycles {
             self.step();

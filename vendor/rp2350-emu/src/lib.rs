@@ -690,6 +690,52 @@ impl Emulator {
         Ok(self.step_serial())
     }
 
+    /// **PIO-only single-cycle step** (LOCAL FORK — not upstream rp2350-emu).
+    ///
+    /// Advances exactly the PIO-relevant slice of one [`Self::step_serial`]
+    /// quantum (`step_quantum == 1`) and *nothing else*: it skips the two CPU
+    /// cores, the SysTick/MTIME/TIMER peripherals, IRQ routing, and the decode-
+    /// cache machinery. The PIO superoptimizer runs a single state machine with
+    /// no firmware loaded, so the cores are idle and the non-PIO peripherals
+    /// never influence the captured waveform — ~95% of a full `step()` is wasted
+    /// work for that use case (ticket 004).
+    ///
+    /// Byte-identical to `step()` for any run where the captured PIO output does
+    /// not depend on the CPU cores or non-PIO peripherals. This is the exact
+    /// PIO sub-sequence of `step_serial` + `tick_peripherals`: pre-compose GPIO,
+    /// step each released PIO block one cycle, then re-merge GPIO so reads see
+    /// the new pad state. `pio_harness`'s `trace_pads` equivalence test asserts
+    /// it matches the full step on representative programs.
+    ///
+    /// Panics (debug) if called on a Threaded emulator; the fast path is a
+    /// Serial-only convenience.
+    pub fn step_pio_only(&mut self) {
+        debug_assert!(
+            self.execution_model != ExecutionModel::Threaded,
+            "step_pio_only is Serial-only"
+        );
+        // Pre: fold any external GPIO stimulus into bus.gpio_in, exactly as
+        // step_serial does before the cores dispatch (a no-op when nothing
+        // external changed since the last cycle's post-merge).
+        self.update_gpio();
+        self.clock.advance(1);
+        // Tick only the PIO blocks released from reset (RESET_PIO0..2). This is
+        // the PIO portion of `tick_peripherals(1)`; route_pio_irqs and
+        // bus.tick_peripherals (TIMER/TICKS/MTIME) are deliberately skipped.
+        let gpio_pins = (self.bus.gpio_in.load(Ordering::Relaxed) as u64)
+            | ((self.bus.gpio_in_hi.load(Ordering::Relaxed) as u64) << 32);
+        let resets = self.bus.resets_state;
+        for (i, pio) in self.bus.pio.iter_mut().enumerate() {
+            let bit = crate::bus::RESET_PIO0 + i as u8;
+            if (resets & (1u32 << bit)) == 0 {
+                pio.step_n_with_pins(1, gpio_pins);
+            }
+        }
+        // Post: merge PIO (and SIO) outputs back into bus.gpio_in so the next
+        // cycle's PIO input and the harness's pin reads observe the new levels.
+        self.update_gpio();
+    }
+
     /// Serial-mode single-quantum step. Shared by [`Self::step`] and
     /// [`Self::run_quantum`] on the Serial path.
     fn step_serial(&mut self) -> u64 {

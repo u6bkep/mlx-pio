@@ -32,4 +32,4 @@ pub use decode::{decode_insn, DecodeError};
 pub use encode::encode_insn;
 pub use ir::{Insn, Op, SideCfg};
 pub use program::{import_program, Config, PinMap, Program, ShiftCfg, ShiftDir};
-pub use run::{configure, run, RunSpec};
+pub use run::{configure, run, run_full, RunSpec};
