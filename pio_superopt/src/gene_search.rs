@@ -1618,6 +1618,64 @@ mod tests {
         );
     }
 
+    /// t_end BUDGET-COUPLING SWEEP (ticket 002): the deterministic meta-tune moved
+    /// only `t_end`, the one budget-coupled knob (the cooling schedule). This
+    /// settles whether short inner trials are still non-representative: sweep
+    /// `t_end` at the inner (150k) vs deployment (800k) budget and compare the
+    /// optimum. Same optimum ⇒ 150k is representative; a lower optimum at 800k ⇒
+    /// short runs still mislead (tune t_end near deployment length). Independent/
+    /// deterministic, so each point is a clean, reproducible number.
+    ///
+    /// Run: `cargo test --release -- --ignored dme_tend_sweep --nocapture`
+    #[test]
+    #[ignore = "t_end budget-coupling sweep (~4min); run with --release ... --nocapture"]
+    fn dme_tend_sweep() {
+        use crate::program::Program;
+        use crate::search::{synthesize_flat_breed, BreedHp, MigrateCfg, Space};
+        let (sp, golden, mask) = dme_golden();
+        let template = Program::empty(dme_cfg());
+        let space = Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        let windows = BreedHp::default().ladder(32); // wide ladder, 32 islands
+        let seeds: Vec<u64> = (0..5u64).map(|i| 0x7E2D ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        let t_ends = [1.0f64, 0.7, 0.5, 0.35, 0.2, 0.1, 0.05];
+
+        let mean_cost = |t_end: f64, iters: u32| -> f64 {
+            let hp = BreedHp { t_end, ..BreedHp::default() };
+            let mut p = hp.to_params(iters);
+            p.migrate = Some(MigrateCfg { post_rate: 20, poll_rate: 0, intensity: 1.0 }); // independent/deterministic
+            let tot: f64 = seeds
+                .iter()
+                .map(|&s| {
+                    let (c, _) = synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &p, &windows, s);
+                    edge_cost(&golden, &run(&c, &sp), &mask, 0)
+                })
+                .sum();
+            tot / seeds.len() as f64
+        };
+
+        eprintln!("\nt_end budget-coupling sweep (32 islands, independent/deterministic, n={} seeds):", seeds.len());
+        let mut optima = Vec::new();
+        for &iters in &[150_000u32, 800_000u32] {
+            let mut best = (f64::INFINITY, 0.0f64);
+            eprint!("  iters={iters:>7}: ");
+            for &te in &t_ends {
+                let c = mean_cost(te, iters);
+                eprint!("{te:.2}->{c:.1}  ");
+                if c < best.0 {
+                    best = (c, te);
+                }
+            }
+            eprintln!("\n    => best t_end={:.2} (mean cost {:.1})", best.1, best.0);
+            optima.push(best.1);
+        }
+        eprintln!(
+            "\n  inner-optimal t_end={:.2}  deployment-optimal t_end={:.2}  => 150k is {}",
+            optima[0],
+            optima[1],
+            if (optima[0] - optima[1]).abs() < 1e-6 { "REPRESENTATIVE" } else { "NOT representative (schedule is budget-coupled)" }
+        );
+    }
+
     /// CRANK: the breeding engine at scale — 32 islands (one per core), a
     /// cold-weighted window ladder, ~1.2M iters/island. Does scale + the wider
     /// ladder turn the "mids get born sometimes" breakthrough into reliable,

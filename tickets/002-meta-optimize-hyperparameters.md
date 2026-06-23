@@ -65,16 +65,31 @@ tuned HP: only t_end moved (1.0 -> 0.54); w/t0/densify_w unchanged
 Tellingly, the clean objective moved **one** knob (t_end); the noisy runs'
 sprawl (w=122, t0=33, densify_w=0.33) was largely noise-chasing.
 
-### Open: is 150k inner still non-representative? (the schedule axis)
+### Resolved: short inner trials ARE representative (t_end sweep, 2026-06-23)
 
-w and densify_w are budget-independent (cost weights) and transfer trivially.
-t0/t_end are the annealing schedule: the curve is parameterized by *fraction* of
-budget, but an 800k run spends 5.3x more iters at each temperature, so the
-optimal t_end can shift with budget. The whole tuned gain sits in t_end — the
-one budget-coupled knob — so the residual transfer question is now 1-D.
-**Definitive test:** sweep t_end at 150k vs 800k; if the optimum shifts, short
-inner trials are still non-representative (for the schedule). Cheap + direct
-now that the objective is deterministic.
+Swept t_end at both budgets (`dme_tend_sweep`, independent/deterministic, n=5):
+
+```
+t_end:  1.00  0.70  0.50  0.35  0.20  0.10  0.05
+150k:   24.4  23.6  22.6  23.4  23.6  23.8  21.8   -> best 0.05
+800k:   22.2  22.6  22.6  23.6  22.4  22.2  21.8   -> best 0.05
+```
+
+**Both budgets bottom out at the same t_end (0.05) — the optimum does NOT shift
+with budget.** So 150k inner trials are representative; the transfer trap was
+entirely the max_window/ladder lever (now removed). Caveats: the optimum is at
+the swept edge (cool as hard as possible — true min may be lower, but both agree
+at the edge so the conclusion holds), and at 800k the curve is nearly flat
+(22.2->21.8) — t_end barely matters at deployment length.
+
+### New weak link: the meta-anneal under-optimizes
+
+The deterministic meta-tune picked t_end=0.54, but the sweep shows 0.05 is
+better (21.8 vs 22.6). The meta-anneal (24 SA iters, multiplicative steps)
+stalled at a local improvement on an essentially 1-D problem. The bottleneck has
+moved from inner-budget representativeness to the **meta-search itself** — for a
+small HP space a grid/sweep beats SA; SA needs more iters / restarts. This, not
+budget, is what to improve next for the meta-tuning track.
 
 ## Built + finding (2026-06-22)
 
