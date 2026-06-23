@@ -13,6 +13,13 @@ pio_harness = { path = "../pio_harness" }
 # (decode(encode(ir)) == ir).
 picoem-common = "0.2"
 
+# Statistical benchmarking for the eval hot path (ticket 004).
+criterion = "0.5"
+
+[[bench]]
+name = "eval"
+harness = false
+
 # Same patch the harness uses, so the transitive (rp2350-emu -> picoem-common)
 # and direct dev-dependency both resolve to the vendored, fixed copy.
 [patch.crates-io]

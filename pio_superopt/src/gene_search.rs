@@ -982,7 +982,8 @@ pub fn synthesize_gene(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Insn, MovDst, MovOp, MovSrc, Op, OutDst, SetDst, SideCfg};
+    use crate::fixtures::{dme_cfg, dme_corpus, dme_golden, dme_ref, dme_spec, DME_CYCLES, DME_H};
+    use crate::ir::{Insn, Op, OutDst, SetDst, SideCfg};
     use crate::program::*;
     use crate::run::run;
 
@@ -1042,75 +1043,10 @@ mod tests {
 
     // ---- DME (Differential Manchester / biphase-mark) benchmark ----
     //
-    // The harder-than-UART target (tickets 001 / the v2-IR motivation). Line
-    // level is tracked in Y and driven to the pin; a transition is `mov y,~y`
-    // (flip the level) + `mov pins,y` (drive it). Biphase-mark: a transition at
-    // every bit boundary (the clock), plus an extra mid-bit transition iff the
-    // data bit is 1 — the latter a *data-conditional* `Cond`, the structure UART
-    // lacked and v1 couldn't express.
-
-    fn dme_cfg() -> Config {
-        Config {
-            side: SideCfg::NONE,
-            clkdiv_int: 1,
-            // 5-bit 4B/5B line codes, shifted LSB-first (matches the real impl).
-            shift: ShiftCfg { pull_threshold: 5, out_dir: ShiftDir::Right, ..ShiftCfg::default() },
-            pins: PinMap { out_base: TX, out_count: 1, set_base: TX, set_count: 1, ..PinMap::default() },
-            ..Config::default()
-        }
-    }
-
-    fn mov_y_inv() -> Node {
-        Node::Prim(Insn::plain(Op::Mov { dst: MovDst::Y, op: MovOp::Invert, src: MovSrc::Y }))
-    }
-    fn drive(d: u8) -> Node {
-        Node::Prim(Insn { op: Op::Mov { dst: MovDst::Pins, op: MovOp::None, src: MovSrc::Y }, delay: d, sideset: None })
-    }
-    fn out_x() -> Node {
-        Node::Prim(Insn::plain(Op::Out { dst: OutDst::X, count: 1 }))
-    }
-
-    /// Reference biphase-mark DME encoder, half-bit = `h` cycles. Tracks level
-    /// in Y. Per bit: boundary transition + first-half hold, fetch the data bit,
-    /// a conditional mid-bit transition (`if x-- {toggle}`, `skip_delay=1` to
-    /// balance the 0/1 paths to equal duration), then the second-half hold.
-    fn dme_ref(h: u8) -> Gene {
-        let cell = vec![
-            out_x(),       // data bit -> X (consumed by the Cond)
-            mov_y_inv(),   // boundary transition (clock edge)
-            drive(h - 1),  // drive + hold first half (h cycles)
-            Node::Cond {
-                cond: CondKind::XPostDec, // taken iff bit == 1
-                then: vec![mov_y_inv(), drive(0)], // mid-bit transition
-                els: vec![],
-                dispatch_delay: 0,
-                skip_delay: 1, // balance: 0-path (dispatch+skip) == 1-path (dispatch+toggle+drive)
-            },
-            drive(h - 1), // second-half hold (re-drives current level, both paths)
-        ];
-        Gene {
-            config: dme_cfg(),
-            nodes: vec![
-                pull(),
-                Node::Loop { cond: LoopCond::UntilOsrEmpty, counter_init: None, body: cell, jmp_delay: 0 },
-            ],
-        }
-    }
-
-    const DME_H: u8 = 4;
-    /// Locked capture window: covers the 4-code corpus (active to cycle 272) with
-    /// a small tail, so "correctness" isn't inflated by a long constant stall.
-    const DME_CYCLES: u64 = 278;
-
-    /// The locked DME benchmark: (spec, golden, full mask). Golden is the
-    /// reference's own output (self-consistent oracle), captured under the locked
-    /// window — exactly the reference-oracle approach UART uses.
-    fn dme_golden() -> (RunSpec, Vec<u32>, Vec<u32>) {
-        let sp = dme_spec(DME_CYCLES);
-        let golden = run(&dme_ref(DME_H).lower(), &sp);
-        let mask = full_mask(&golden);
-        (sp, golden, mask)
-    }
+    // The harder-than-UART target (tickets 001 / the v2-IR motivation). The
+    // canonical fixtures (reference encoder, corpus, spec, locked golden) live in
+    // `crate::fixtures` so the benches measure the same workload; imported above
+    // via `use super::*`. `dme_reference_scores_zero` pins them.
 
     /// Bit-0 transition edges of a waveform: `(cycle, rising?)`.
     fn dme_edges01(wave: &[u32]) -> Vec<(usize, bool)> {
@@ -1149,24 +1085,6 @@ mod tests {
             ce.len(),
             edge_cost(golden, cwave, mask, 0)
         );
-    }
-
-    /// A multi-code corpus (diverse 4B/5B data codes, varied bit patterns and
-    /// popcounts) so a thin oracle can't be gamed — the recurring overfitting
-    /// hazard. Processed back-to-back: the loop wraps to `pull` between codes.
-    fn dme_corpus() -> Vec<u32> {
-        vec![0x1E, 0x0A, 0x15, 0x09] // codes 0,4,3,1; lsb bits 01111/01010/10101/10010
-    }
-
-    fn dme_spec(cycles: u64) -> RunSpec {
-        RunSpec {
-            block: 0,
-            sm: 0,
-            inputs: dme_corpus(),
-            output_pins: vec![TX],
-            capture_pins: vec![TX],
-            cycles,
-        }
     }
 
     /// PROBE: find the active length (last transition) of the reference on the

@@ -18,6 +18,7 @@
 pub mod cost;
 pub mod decode;
 pub mod encode;
+pub mod fixtures;
 pub mod gene;
 pub mod gene_search;
 pub mod ir;
@@ -31,4 +32,4 @@ pub use decode::{decode_insn, DecodeError};
 pub use encode::encode_insn;
 pub use ir::{Insn, Op, SideCfg};
 pub use program::{import_program, Config, PinMap, Program, ShiftCfg, ShiftDir};
-pub use run::{run, RunSpec};
+pub use run::{configure, run, RunSpec};

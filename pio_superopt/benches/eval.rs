@@ -1,0 +1,118 @@
+//! Eval hot-path benchmarks (ticket 004).
+//!
+//! The search evaluates tens of millions of candidates; each one is a full
+//! emulator run plus a cost computation. These benches attribute the per-eval
+//! time so we know where to spend optimization effort:
+//!
+//!   * `eval/run`        — the whole `run()`: assemble + load + configure +
+//!                         enable + step/capture. The headline per-candidate cost.
+//!   * `eval/edge_cost`  — the cost metric (per-channel DP edge alignment) on a
+//!                         realistic golden-vs-imperfect waveform pair.
+//!   * `eval/candidate`  — run + edge_cost: one complete candidate evaluation.
+//!
+//! And `run()` decomposed, to split the emulator core from per-eval setup:
+//!
+//!   * `run_parts/assemble`  — `Program::assemble()` (IR -> 32 machine words).
+//!   * `run_parts/reset`     — `Pio::reset()` (the reuse path; vs ~200µs rebuild).
+//!   * `run_parts/configure` — load + pinctrl/shift/clkdiv/... + enable + push.
+//!   * `run_parts/trace`     — `trace_pads()` alone: the cycle-stepping core.
+//!
+//! All workloads are the locked DME target from `pio_superopt::fixtures`, so the
+//! benches measure exactly what the search runs.
+
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
+use std::time::{Duration, Instant};
+
+use pio_harness::Pio;
+use pio_superopt::cost::edge_cost_w;
+use pio_superopt::fixtures::{dme_golden, dme_plateau_gene, dme_ref, DME_H};
+use pio_superopt::{configure, run};
+
+/// The window/spurious-weight the breeding engine actually evaluates at
+/// (`densify_w` default = 0.5; a representative mid-ladder window).
+const COST_WINDOW: usize = 4;
+const SPURIOUS_W: f64 = 0.5;
+
+fn bench_eval(c: &mut Criterion) {
+    let (spec, golden, mask) = dme_golden();
+    let program = dme_ref(DME_H).lower();
+    // A realistic imperfect candidate: the boundary-only "plateau" basin —
+    // edge-dense and misaligned vs golden, the worst case the DP aligner sees.
+    let cand_wave = run(&dme_plateau_gene().lower(), &spec);
+
+    let mut g = c.benchmark_group("eval");
+    g.bench_function("run", |b| {
+        b.iter(|| run(black_box(&program), black_box(&spec)))
+    });
+    g.bench_function("edge_cost", |b| {
+        b.iter(|| {
+            edge_cost_w(
+                black_box(&golden),
+                black_box(&cand_wave),
+                black_box(&mask),
+                COST_WINDOW,
+                SPURIOUS_W,
+            )
+        })
+    });
+    g.bench_function("candidate", |b| {
+        b.iter(|| {
+            let w = run(black_box(&program), black_box(&spec));
+            edge_cost_w(black_box(&golden), &w, black_box(&mask), COST_WINDOW, SPURIOUS_W)
+        })
+    });
+    g.finish();
+}
+
+fn bench_run_parts(c: &mut Criterion) {
+    let (spec, _golden, _mask) = dme_golden();
+    let program = dme_ref(DME_H).lower();
+
+    let mut g = c.benchmark_group("run_parts");
+
+    g.bench_function("assemble", |b| {
+        b.iter(|| black_box(&program).assemble())
+    });
+
+    // reset / configure: reuse one Pio (mirrors the thread-local in `run()`).
+    g.bench_function("reset", |b| {
+        let mut pio = Pio::new(spec.block, spec.sm);
+        b.iter(|| {
+            pio.reset();
+            black_box(&pio);
+        })
+    });
+    g.bench_function("configure", |b| {
+        let mut pio = Pio::new(spec.block, spec.sm);
+        b.iter(|| {
+            pio.reset();
+            configure(&mut pio, black_box(&program), black_box(&spec));
+            black_box(&pio);
+        })
+    });
+
+    // trace alone: each timed call needs a freshly reset+configured SM (stepping
+    // is destructive), so reset+configure *untimed* and time only trace_pads.
+    // One reused Pio keeps the cache hot, matching `run()`'s thread-local reuse
+    // (a fresh Pio per call measures cold-cache and over-reports by ~50%).
+    g.bench_function("trace", |b| {
+        let mut pio = Pio::new(spec.block, spec.sm);
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                pio.reset();
+                configure(&mut pio, &program, &spec);
+                let t = Instant::now();
+                black_box(pio.trace_pads(black_box(&spec.capture_pins), spec.cycles));
+                total += t.elapsed();
+            }
+            total
+        })
+    });
+
+    g.finish();
+}
+
+criterion_group!(benches, bench_eval, bench_run_parts);
+criterion_main!(benches);

@@ -54,6 +54,16 @@ pub fn run(program: &Program, spec: &RunSpec) -> Vec<u32> {
 
 /// Configure and run an already-reset `Pio`, returning the waveform.
 fn run_on(pio: &mut Pio, program: &Program, spec: &RunSpec) -> Vec<u32> {
+    configure(pio, program, spec);
+    pio.trace_pads(&spec.capture_pins, spec.cycles)
+}
+
+/// Assemble, load, and configure an already-reset `Pio` for `program`/`spec`,
+/// up to (and including) enabling the SM and pushing the inputs — everything a
+/// single evaluation does *except* the cycle-stepping capture. Split out so the
+/// per-eval setup cost can be benchmarked apart from the emulator core
+/// (`trace_pads`); `run_on` is its only in-tree caller.
+pub fn configure(pio: &mut Pio, program: &Program, spec: &RunSpec) {
     let code = program.assemble();
     // Slot index == instruction address: load at offset 0, no relocation.
     pio.load_at(0, &code, program.wrap_bottom, program.wrap_top);
@@ -89,6 +99,4 @@ fn run_on(pio: &mut Pio, program: &Program, spec: &RunSpec) -> Vec<u32> {
     for &w in &spec.inputs {
         pio.tx_push(w);
     }
-
-    pio.trace_pads(&spec.capture_pins, spec.cycles)
 }
