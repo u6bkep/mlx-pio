@@ -8,7 +8,7 @@ Status values: `open` · `in-progress` · `blocked` · `done` · `wontfix`
 | # | Title | Status | Priority |
 |---|---|---|---|
 | 001 | Parallel tempering with live solution exchange | done (superseded) | — |
-| 002 | Meta-optimize search hyperparameters | blocked (needs 004) | high |
+| 002 | Meta-optimize search hyperparameters | open (trap persists) | high |
 | 003 | Hash-based tabu list | open | low |
 | 004 | Eval hot-path performance | in-progress (3.4x) | high |
 

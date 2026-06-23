@@ -1457,10 +1457,13 @@ mod tests {
         let template = Program::empty(dme_cfg());
         let space = crate::search::Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
 
-        // Mini-trial: 32 islands (all cores), short budget, fixed seeds for a
-        // fair comparison; objective = mean strict edge-cost (rewards reliability).
-        let inner_iters = 40_000u32;
-        let inner_seeds = [0xA1u64, 0xB2u64];
+        // Mini-trial: 32 islands (all cores), fixed seeds; objective = mean strict
+        // edge-cost (rewards reliability). inner_iters raised from 40k now that
+        // evals are ~3.4x cheaper (ticket 004) — a larger fraction of the 800k
+        // deployment budget shrinks the transfer trap AND averages down the
+        // breeding engine's thread-timing noise within each trial.
+        let inner_iters = 150_000u32;
+        let inner_seeds = [0xA1u64, 0xB2u64, 0xC3u64];
         let eval = |hp: &BreedHp| -> f64 {
             let params = hp.to_params(inner_iters);
             let windows = hp.ladder(32);
@@ -1477,11 +1480,34 @@ mod tests {
         eprintln!("\nmeta-tune (inner: 32 islands × {inner_iters} iters × {} seeds, mean edge-cost):", inner_seeds.len());
         eprintln!("  default HP mini-cost: {default_cost:.1}");
         eprintln!("  tuned   HP mini-cost: {best_cost:.1}");
-        eprintln!("  tuned HP: {best_hp:?}");
+        eprintln!("  default HP: {:?}", BreedHp::default());
+        eprintln!("  tuned   HP: {best_hp:?}");
 
-        // Validate the tuned HP at full scale.
-        let (champ, _) = synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &best_hp.to_params(800_000), &best_hp.ladder(32), 0x5EED);
-        eprintln!("  tuned HP @ full scale (32 islands × 800k): edge-cost {:.1}", edge_cost(&golden, &run(&champ, &sp), &mask, 0));
+        // Apples-to-apples at deployment scale: default vs tuned, each averaged
+        // over several seeds (synthesize_flat_breed is non-deterministic, so a
+        // single run can't tell us whether tuning transfers). This is the real
+        // transfer-trap test the original (tuned-only) validation couldn't make.
+        let full_iters = 800_000u32;
+        let full_seeds = [0x5EEDu64, 0x1234u64, 0xABCDu64];
+        let full_scale = |hp: &BreedHp| -> Vec<f64> {
+            full_seeds
+                .iter()
+                .map(|&s| {
+                    let (c, _) = synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &hp.to_params(full_iters), &hp.ladder(32), s);
+                    edge_cost(&golden, &run(&c, &sp), &mask, 0)
+                })
+                .collect()
+        };
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let d = full_scale(&BreedHp::default());
+        let t = full_scale(&best_hp);
+        eprintln!("\n@ full scale (32 islands × {full_iters}, n={} seeds):", full_seeds.len());
+        eprintln!("  default HP: mean {:.1}  spread {:?}", mean(&d), d);
+        eprintln!("  tuned   HP: mean {:.1}  spread {:?}", mean(&t), t);
+        eprintln!(
+            "  => tuning {} at deployment scale",
+            if mean(&t) < mean(&d) { "HELPS" } else { "does NOT transfer" }
+        );
     }
 
     /// CRANK: the breeding engine at scale — 32 islands (one per core), a
