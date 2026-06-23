@@ -1,11 +1,51 @@
 ---
-status: open
+status: in-progress (2.9x banked; further levers optional)
 priority: high
 created: 2026-06-22
 source: the shared bottleneck for scale (SCRATCH) + meta-tuning (002)
 ---
 
 # 004 — Eval hot-path performance
+
+## Done (2026-06-23) — 2.9x on the real per-candidate eval
+
+Profile-first with a Criterion suite (`pio_superopt/benches/eval.rs`): full
+eval, its decomposition, cost-by-mask-width, and the real breed-step. Findings
+overturned the guesses below — per-eval setup (validate/assemble/reset) is ~2%,
+not a target; `validate()` is 29ns and never short-circuits the local move.
+
+Two wins, both verified byte-identical:
+
+1. **edge_cost 3.9x** (12.3 -> 3.2us). A full all-ones mask made it scan all 32
+   bit-channels when only 1 pin carries data (~10us wasted); intersect `care`
+   with bits present in golden|candidate. Plus rolled the align_edges DP onto
+   two reused rows (was one heap alloc per row). Commit c4041fe.
+2. **Emulator core 3.1x** (16.5 -> 5.26us, ~59 -> ~19 ns/cycle). `emu.step()`
+   ran both Cortex-M33 cores + all peripherals every PIO cycle; we run one SM,
+   no firmware. Vendored rp2350-emu (commit 326e74f) and added
+   `step_pio_only()` (commit c9bc555) — the PIO slice of step only. Gated by
+   `fast_step_matches_full` (DME ref + plateau + 300 random programs, in the
+   normal suite).
+
+Net: candidate eval 30.7 -> 10.5us; **real breed-step 16.8 -> 6.45us (2.6x)**.
+
+## Remaining levers (optional, diminishing)
+
+- The fast step still calls `update_gpio` twice/cycle and iterates all 3 PIO
+  blocks (2 in reset). Dropping the *pre*-step `update_gpio` (safe only when no
+  input pin changes mid-run — true for TX-only DME) and skipping reset blocks
+  would shave the ~19ns/cycle further, at the cost of the clean "byte-identical
+  to full step in all cases" guarantee.
+- `edge_cost`'s remaining ~4 small allocs/eval (channel_edges Vecs + DP rows)
+  could move to a thread-local scratch buffer. Sub-1us; edge_cost is now ~15%
+  of eval at most.
+- The PIO step itself (`PioBlock::step_n_with_pins`, vendored picoem-common) is
+  now the bulk of the per-cycle cost — profile if more is needed.
+
+## Re-run 002 (meta-tune) at the now-affordable budget
+
+With evals ~2.9x cheaper, the meta-tuner's inner trials can run far closer to
+deployment scale — the fix for the transfer trap. 002's machinery is ready.
 
 ## Why
 
