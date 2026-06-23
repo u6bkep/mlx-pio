@@ -189,6 +189,53 @@ keep on either UART or flat-DME; if PT is to pay off it likely needs knob tuning
 or the cross-*seed* variant (deferred "plan 2"), not more within-stage migration.
 Neither solves yet (edge ~23, need 0). **Next: crank scale (point 3).**
 
+### Plateau → diagnosis → the cross-breeding pivot
+
+Flat+edge+PT+scale (the full mlx86 recipe) **plateaus at edge-cost ~22** —
+7× iters barely moved it (24→22). **Diagnosis** (`dme_diagnose`, classify golden
+edges as *boundary*/clock vs *mid*/data-conditional via an all-zeros reference):
+the champion matches some boundaries but **0/11 mids, every seed** — the
+data-conditional transition is **never born**. Two findings:
+- The mid cell is **expressible** in the flat search (`out x`/`jmp x--` exist)
+  but **gradient-free** — no partial credit until the whole timed cell is right,
+  so local search never enters it. Scale can't manufacture a gradient.
+- The edge metric has its **own trap**: missing = spurious = 1, so the safe move
+  is *emit few edges, avoid spurious* (a champion hid at 7 edges / 0 spurious).
+
+**The new path (committed) — staging overstayed its welcome.** Three changes,
+all confirmed to matter:
+1. **Densify** (`edge_cost_w`, spurious weight < 1): attempting an edge costs
+   less than leaving one unmatched → the search densifies instead of hiding.
+2. **Continuous cross-breeding islands** (`synthesize_flat_breed`): persistent
+   parallel islands on a **fixed window ladder** (no staged re-election), each a
+   long anneal, sharing a board and **recombining** (slot-range `crossover`) not
+   copying — so a "has clock" and a "has mid fragment" island can yield a child
+   with both, crossing the conjunctive gap.
+3. **Scale** (your repeated intuition): 32 islands = 32 cores (was 12 — we were
+   leaving 20 idle).
+
+**BREAKTHROUGH:** the data-conditional mids — never born before — **are born**:
+4-5/11, edge-cost trajectory **staged-plateau 22 → small-breed 23 → breed@scale
+17** (5/11 mids, 12/20 boundaries, 1 spurious; a creative `mov Pins,~Pins` /
+`~Osr` / `Isr` tangle, *not* the human reference). Still not solved (17, need 0)
+and **high-variance** (1/3 seeds breaks through).
+
+### Migration verdict + meta-tuning + the performance wall
+- **Within-stage island migration (copy) is a wash** — UART, flat-DME, and at
+  scale. Superseded by **cross-breeding (recombination > copy)**. Ticket 001's
+  copy-migration is retired; the useful descendant is the breeding board.
+- **Meta-tuning (ticket 002, committed):** `BreedHp` + `meta_anneal` (SA over
+  hyperparams, multiplicative perturbation, fixed-seed mini-trial — mlx86 style).
+  Works *mechanically* (inner mini-cost 24.5→21.5) but the tuned HPs **don't
+  transfer**: a 40k-iter inner trial overfits short-budget knobs (narrow ladder,
+  aggressive breeding) → **worse at 800k (29 vs 17)**. mlx86 dodged this by
+  tuning and deploying at the same scale; ours differ ~25×.
+- **⇒ Both open levers bottleneck on eval speed.** More scale (the working
+  lever) is core-bound; trustworthy meta-tuning needs deployment-scale inner
+  trials. `run()` is ~28µs (278 cyc × ~100ns) × tens of millions of calls.
+  **NEXT: profile/optimize the eval hot path** (reset cost, capture only scored
+  cycles/pins, skip redundant re-validate) — it multiplies everything.
+
 ## Other directions (held)
 - **Population + crossover (GP)**: combine a "has spine" with a "has framing"
   individual. The per-stage elitism above is a step toward this.

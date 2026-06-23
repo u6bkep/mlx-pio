@@ -1,11 +1,26 @@
 ---
-status: open
-priority: medium
+status: blocked (needs 004 — faster evals)
+priority: high
 created: 2026-06-22
 source: reference/mlx86 (*_hyperparameters.cpp)
 ---
 
 # 002 — Meta-optimize search hyperparameters
+
+## Built + finding (2026-06-22)
+
+Implemented for the breeding engine: `BreedHp` (meta-genome: w, t0, t_end,
+densify_w, post/poll rate, ladder max_window) + `meta_anneal` (SA over HPs,
+multiplicative perturbation + clamps, fixed-seed mini-trial objective). `dme_meta_tune`.
+
+**Works mechanically but the tuned HPs don't transfer.** A 40k-iter inner trial
+drove mini-cost 24.5→21.5, but the winning knobs (narrow ladder `max_window=3`,
+aggressive breeding `poll=18`) overfit short-budget *sprinting* and score **29 at
+full 800k scale vs the default's 17** on the same seed. Classic meta-opt transfer
+trap: mlx86 tuned and deployed at the same scale; our inner/deploy differ ~25×.
+**Blocked on 004** — trustworthy meta-tuning needs inner trials near deployment
+budget, which needs a faster eval. The machinery is correct and ready to re-run
+once evals are cheap enough.
 
 ## Problem this targets
 

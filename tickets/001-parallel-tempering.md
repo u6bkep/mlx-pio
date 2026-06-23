@@ -1,11 +1,22 @@
 ---
-status: in-progress
+status: done (superseded by cross-breeding)
 priority: high
 created: 2026-06-22
 source: reference/mlx86 (SolverParallelTempering)
 ---
 
 # 001 — Parallel tempering with live solution exchange
+
+## Verdict (2026-06-22)
+
+**Within-stage island migration (copy a better peer) is a wash** — measured
+neutral-to-negative on UART, flat-DME, and flat-DME-at-scale. The mechanism was
+ported twice (gene `Migration`, flat `FlatMigration`) and never beat independent
+chains at equal compute. **Superseded** by **cross-breeding**: the same island
+board, but the exchange step *recombines* (slot-range `crossover`) instead of
+copying — and that, with the densify objective + scale, cracked the DME mid-cell
+wall (see SCRATCH "the cross-breeding pivot"). Copy-migration is retired; the
+board lives on in `synthesize_flat_breed`. Kept here for the rationale trail.
 
 ## Problem this targets
 
