@@ -13,15 +13,16 @@
 //! shrinks while `W·correctness` holds correctness fixed.
 
 use crate::cost::{hamming_tolerant, score_masked, Score};
-use crate::gene::{Gene, LoopCond, Node};
+use crate::gene::{CondKind, Gene, LoopCond, Node};
 use crate::ir::{Insn, Op, OutDst, SetDst, SideCfg};
 use crate::program::Config;
 use crate::rng::Rng;
 use crate::run::{run, RunSpec};
 use crate::search::{
-    random_delay, random_sideset, Params, IN_SRCS, MOV_DSTS, MOV_OPS, MOV_SRCS, OUT_DSTS, SET_DSTS,
-    WAIT_SRCS,
+    random_delay, random_sideset, MigrateCfg, Params, IN_SRCS, MOV_DSTS, MOV_OPS, MOV_SRCS,
+    OUT_DSTS, SET_DSTS, WAIT_SRCS,
 };
+use std::sync::Mutex;
 
 // ---- random primitives (never a JMP — control flow is structural) ----
 
@@ -71,6 +72,21 @@ fn random_loop_cond(rng: &mut Rng) -> LoopCond {
         1 => LoopCond::CountY,
         _ => LoopCond::UntilOsrEmpty,
     }
+}
+
+/// All structured-conditional tests (the polish sweep set).
+const COND_KINDS: [CondKind; 7] = [
+    CondKind::NotX,
+    CondKind::XPostDec,
+    CondKind::NotY,
+    CondKind::YPostDec,
+    CondKind::XneY,
+    CondKind::Pin,
+    CondKind::NotOsrEmpty,
+];
+
+fn random_cond_kind(rng: &mut Rng) -> CondKind {
+    *rng.pick(&COND_KINDS)
 }
 
 /// A counted serialization loop: `set reg,N` / `out pins,1 [d]` / `jmp reg--`.
@@ -139,6 +155,19 @@ fn mutate_node(node: &mut Node, rng: &mut Rng, side: &SideCfg) {
             }
             keep_counter_consistent(node);
         }
+        Node::Cond { cond, then, els, dispatch_delay, skip_delay } => match rng.below(5) {
+            0 => *cond = random_cond_kind(rng),
+            1 => *dispatch_delay = random_delay(rng, side),
+            2 => *skip_delay = random_delay(rng, side),
+            3 => mutate_body(then, rng, side), // never empties `then` (mutate_body keeps len>=1)
+            _ => {
+                if els.is_empty() {
+                    els.push(Node::Prim(random_prim_insn(rng, side)));
+                } else {
+                    mutate_body(els, rng, side);
+                }
+            }
+        },
     }
 }
 
@@ -524,6 +553,29 @@ fn polish_gene(start: &Gene, golden: &[u32], mask: &[u32], spec: &RunSpec, obj: 
                         }
                     }
                 }
+                Node::Cond { .. } => {
+                    // Tune the dispatch/skip delays (timing balance) and the test.
+                    // Branch-internal polish is deferred to a later increment.
+                    for d in 0..=maxd {
+                        let mut g = cur.clone();
+                        if let Node::Cond { dispatch_delay, .. } = &mut g.nodes[i] {
+                            *dispatch_delay = d;
+                        }
+                        consider(g, &mut best);
+                        let mut g = cur.clone();
+                        if let Node::Cond { skip_delay, .. } = &mut g.nodes[i] {
+                            *skip_delay = d;
+                        }
+                        consider(g, &mut best);
+                    }
+                    for ck in COND_KINDS {
+                        let mut g = cur.clone();
+                        if let Node::Cond { cond, .. } = &mut g.nodes[i] {
+                            *cond = ck;
+                        }
+                        consider(g, &mut best);
+                    }
+                }
             }
         }
 
@@ -598,9 +650,52 @@ fn polish_gene(start: &Gene, golden: &[u32], mask: &[u32], spec: &RunSpec, obj: 
     }
 }
 
+/// Shared blackboard for async island migration between the concurrent chains
+/// of a stage (ticket 001). One slot per chain holds that chain's most-recently
+/// posted *current* gene and its cost (`None` until the chain first posts).
+struct Migration {
+    slots: Vec<Mutex<Option<(Gene, f64)>>>,
+    cfg: MigrateCfg,
+}
+
+impl Migration {
+    fn new(n: u32, cfg: MigrateCfg) -> Self {
+        Migration { slots: (0..n).map(|_| Mutex::new(None)).collect(), cfg }
+    }
+
+    /// Publish this chain's current state to its own slot.
+    fn post(&self, idx: usize, g: &Gene, cost: f64) {
+        *self.slots[idx].lock().unwrap() = Some((g.clone(), cost));
+    }
+
+    /// Snapshot a random peer's posted state (`None` if no peer or peer hasn't
+    /// posted yet). Static all-to-all topology: any chain may be sampled.
+    fn sample_peer(&self, idx: usize, rng: &mut Rng) -> Option<(Gene, f64)> {
+        let n = self.slots.len();
+        if n < 2 {
+            return None;
+        }
+        let mut j = rng.below(n as u32) as usize;
+        if j == idx {
+            j = (j + 1) % n;
+        }
+        self.slots[j].lock().unwrap().clone()
+    }
+}
+
 /// One annealing chain: a single Metropolis run with geometric cooling from
-/// `start` (or a fresh random gene). Returns the chain's best gene. Stateless
-/// across chains, so chains parallelize freely.
+/// `start` (or a fresh random gene). Returns the chain's best gene.
+///
+/// With `migrate = None` the chain is stateless and independent (the
+/// reproducible baseline). With `Some((board, idx))` it participates in async
+/// island migration: it posts its current gene to `board[idx]` every
+/// `post_rate` iters and, every `poll_rate` iters, may **adopt** a better
+/// peer's current gene. The adoption rule (mlx86-derived) accepts a strictly
+/// better peer with probability `1 - exp(-intensity·gap / t)` — so adoption
+/// intensifies both with the size of the improvement and as the chain cools.
+/// Late in the run this collapses the chains onto the best-found basin
+/// (late-stage consensus); `local_best` is never overwritten, so a chain's own
+/// best discovery can't be lost to a migration.
 fn anneal_chain(
     config: Config,
     start: Option<Gene>,
@@ -610,6 +705,7 @@ fn anneal_chain(
     params: &Params,
     obj: &Obj,
     seed: u64,
+    migrate: Option<(&Migration, usize)>,
 ) -> Gene {
     let mut rng = Rng::new(seed);
     let mut cur = start.unwrap_or_else(|| random_gene(config, &mut rng));
@@ -624,6 +720,23 @@ fn anneal_chain(
         if d <= 0.0 || rng.unit() < (-d / t).exp() {
             cur = cand;
             cur_cost = cand_cost;
+        }
+        if let Some((board, idx)) = migrate {
+            let cfg = board.cfg;
+            if i % cfg.post_rate == 0 {
+                board.post(idx, &cur, cur_cost);
+            }
+            if i % cfg.poll_rate == 0 {
+                if let Some((peer_g, peer_c)) = board.sample_peer(idx, &mut rng) {
+                    if peer_c < cur_cost {
+                        let gap = (cur_cost - peer_c) * cfg.intensity;
+                        if rng.unit() < 1.0 - (-gap / t).exp() {
+                            cur = peer_g;
+                            cur_cost = peer_c;
+                        }
+                    }
+                }
+            }
         }
         if cur_cost < local_best.1 {
             local_best = (cur.clone(), cur_cost);
@@ -723,13 +836,19 @@ fn run_chains(
     n: u32,
     seed: u64,
 ) -> Vec<(Gene, f64)> {
+    // Shared migration blackboard for this batch of chains (ticket 001), or
+    // `None` for the independent baseline. Lives across the whole scope so each
+    // scoped thread can borrow it.
+    let board = params.migrate.map(|cfg| Migration::new(n, cfg));
+    let board_ref = board.as_ref();
     std::thread::scope(|s| {
         let handles: Vec<_> = (0..n)
             .map(|r| {
                 let start = if pool.is_empty() { None } else { Some(pool[r as usize % pool.len()].clone()) };
                 let cs = seed ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let migrate = board_ref.map(|b| (b, r as usize));
                 s.spawn(move || {
-                    let g = anneal_chain(config, start, golden, mask, spec, params, obj, cs);
+                    let g = anneal_chain(config, start, golden, mask, spec, params, obj, cs, migrate);
                     let g = polish_gene(&g, golden, mask, spec, obj);
                     let c = cost_gene(&g, golden, mask, spec, obj);
                     (g, c)
@@ -1145,6 +1264,58 @@ mod tests {
             reliability(&format!("UART k={k}"), &ugolden, &umask, &usp, &params, 10, &seeds);
         }
     }
+
+    /// Run `seeds` syntheses and return (solved_count, sorted correctness).
+    fn solve_rate(
+        golden: &[u32],
+        mask: &[u32],
+        spec: &RunSpec,
+        params: &Params,
+        max_len: usize,
+        seeds: &[u64],
+    ) -> (usize, Vec<u32>) {
+        let mut corrs: Vec<u32> = seeds
+            .iter()
+            .map(|&seed| {
+                synthesize_gene(uart_cfg(), golden, mask, spec, params, &DEFAULT_SCHEDULE, max_len, 4, seed)
+                    .1
+                    .correctness
+            })
+            .collect();
+        let solved = corrs.iter().filter(|&&c| c == 0).count();
+        corrs.sort_unstable();
+        (solved, corrs)
+    }
+
+    /// TICKET 001 A/B: independent chains (baseline) vs. async island migration,
+    /// at *equal compute* (same iters/restarts/seeds — migration only changes
+    /// whether the concurrent chains of a stage share a blackboard). Reports
+    /// solve-rate for each arm on the two UART targets (the hard cases).
+    ///
+    /// Migration is non-deterministic (adoption depends on thread timing), so
+    /// numbers will vary run to run; look at the aggregate solve-rate, not a
+    /// single seed.
+    ///
+    /// Run: `cargo test --release -- --ignored migration_ab --nocapture`
+    #[test]
+    #[ignore = "ticket 001 A/B; run with --release ... --nocapture"]
+    fn migration_ab() {
+        let base = Params { iters: 5000, restarts: 8, ..Params::default() };
+        let migr = Params { migrate: Some(MigrateCfg::default()), ..base };
+        let seeds: Vec<u64> = (0..12u64).map(|i| 0xA1B2 ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+
+        for k in [4u8, 8] {
+            let usp = spec(18 + 8 * k as u64);
+            let ugolden = run(&uart_gene(k).lower(), &usp);
+            let umask = full_mask(&ugolden);
+
+            let (sb, cb) = solve_rate(&ugolden, &umask, &usp, &base, 10, &seeds);
+            let (sm, cm) = solve_rate(&ugolden, &umask, &usp, &migr, 10, &seeds);
+            eprintln!("\nUART k={k} (n={})", seeds.len());
+            eprintln!("  baseline   : solved {sb}/{} | {cb:?}", seeds.len());
+            eprintln!("  migration  : solved {sm}/{} | {cm:?}", seeds.len());
+        }
+    }
 }
 
 /// Compact rendering of one instruction (op + delay + side-set).
@@ -1183,6 +1354,19 @@ pub fn show_gene(g: &Gene) -> String {
                     render(body, &mut inner);
                     let jd = if *jmp_delay > 0 { format!("[{jmp_delay}]") } else { String::new() };
                     out.push(format!("loop({cond:?}{init}){{ {} }}jmp{jd}", inner.join("  ")));
+                }
+                Node::Cond { cond, then, els, dispatch_delay, skip_delay } => {
+                    let mut t = Vec::new();
+                    render(then, &mut t);
+                    let dd = if *dispatch_delay > 0 { format!("[{dispatch_delay}]") } else { String::new() };
+                    let sd = if *skip_delay > 0 { format!("[{skip_delay}]") } else { String::new() };
+                    if els.is_empty() {
+                        out.push(format!("if({cond:?}){dd}{{ {} }}{sd}", t.join("  ")));
+                    } else {
+                        let mut e = Vec::new();
+                        render(els, &mut e);
+                        out.push(format!("if({cond:?}){dd}{{ {} }}else{{ {} }}{sd}", t.join("  "), e.join("  ")));
+                    }
                 }
             }
         }

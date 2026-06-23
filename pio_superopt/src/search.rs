@@ -118,6 +118,35 @@ pub struct Params {
     /// counted-loop spine — that point moves can't reach. Off by default so
     /// the baseline experiments stay reproducible.
     pub macro_moves: bool,
+    /// Async island migration between the concurrent gene-annealing chains of a
+    /// stage (ticket 001). `None` ⇒ chains run fully independently (the
+    /// reproducible baseline). `Some` ⇒ chains share a blackboard and adopt
+    /// better peers mid-run; adoption intensifies as the chain cools, so late
+    /// chains converge onto the best basin (late-stage consensus). Makes a run
+    /// non-deterministic (adoption depends on inter-thread timing).
+    pub migrate: Option<MigrateCfg>,
+}
+
+/// Async migration knobs for the gene-search chains (ticket 001). Modeled on
+/// mlx86's `SolverParallelTempering` island migration: each chain periodically
+/// *posts* its current gene to a shared slot and periodically *polls* a random
+/// peer, adopting the peer's gene with probability rising as the cost gap grows
+/// and as temperature falls.
+#[derive(Debug, Clone, Copy)]
+pub struct MigrateCfg {
+    /// Post the current gene to the shared blackboard every `post_rate` iters.
+    pub post_rate: u32,
+    /// Attempt to adopt a peer every `poll_rate` iters.
+    pub poll_rate: u32,
+    /// Multiplier on the cost gap in the adoption rule (mlx86's
+    /// `score_diff_neighbor_multiplier`). >1 adopts more eagerly.
+    pub intensity: f64,
+}
+
+impl Default for MigrateCfg {
+    fn default() -> Self {
+        MigrateCfg { post_rate: 20, poll_rate: 50, intensity: 1.0 }
+    }
 }
 
 impl Default for Params {
@@ -133,6 +162,7 @@ impl Default for Params {
             w: 64.0,
             seed_from_template: false,
             macro_moves: false,
+            migrate: None,
         }
     }
 }

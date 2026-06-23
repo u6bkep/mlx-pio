@@ -5,3 +5,6 @@
 # Editor / OS cruft
 *.swp
 .DS_Store
+
+#out of tree non dependancy reference material
+reference/
