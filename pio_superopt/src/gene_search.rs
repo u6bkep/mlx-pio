@@ -1517,6 +1517,30 @@ mod tests {
         );
     }
 
+    /// Independent mode (`poll_rate = 0`, no board reads) makes each island a
+    /// pure seeded anneal, so the whole engine is DETERMINISTIC — same seed ⇒
+    /// byte-identical champion. (Cooperative mode is not: the board ↔ thread
+    /// timing makes it noisy enough to flip A/B conclusions — see `dme_breed_ab`.)
+    /// This determinism is what makes independent mode usable for trustworthy,
+    /// repeatable meta-tuning (ticket 002). Runs in the normal suite to guard it.
+    #[test]
+    fn flat_breed_independent_is_deterministic() {
+        use crate::search::{synthesize_flat_breed, MigrateCfg, Space};
+        let (sp, golden, mask) = dme_golden();
+        let template = Program::empty(dme_cfg());
+        let space = Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        let windows = [4usize, 3, 2, 1, 0, 0];
+        let indep = Params {
+            iters: 4000,
+            migrate: Some(MigrateCfg { post_rate: 20, poll_rate: 0, intensity: 1.0 }),
+            ..Params::default()
+        };
+        let a = synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &indep, &windows, 0x1234);
+        let b = synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &indep, &windows, 0x1234);
+        assert_eq!(run(&a.0, &sp), run(&b.0, &sp), "independent mode (poll_rate=0) must be deterministic");
+        assert_eq!(a.1.correctness, b.1.correctness, "deterministic score");
+    }
+
     /// META-TUNE (ticket 002): let the optimizer tune the breeding engine's own
     /// hyperparameters (densify weight, temps, breeding rate, ladder spread, w)
     /// via a fixed-seed mini-trial objective — instead of hand-tuning. Then
