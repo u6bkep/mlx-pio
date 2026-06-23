@@ -7,6 +7,30 @@ source: reference/mlx86 (SolverParallelTempering)
 
 # 001 — Parallel tempering with live solution exchange
 
+## Cross-breeding A/B (2026-06-23) — earns its keep in the tail
+
+First clean isolation of recombination's value: cooperative (crossover on) vs
+the SAME 32 islands run independently (crossover off, `poll_rate = 0`, take
+best), equal compute, identical ladder/iters/seeds (`dme_breed_ab`):
+
+```
+cooperative: best 17.0  mean 21.3  spread [24,17,23,18,24,22]
+independent: best 20.0  mean 22.2  spread [22,24,20,22,22,23]   (n=6)
+```
+
+Cooperation wins the **best case** (17 vs 20) but **ties on mean** (−0.8, within
+overlapping spreads) and is **higher variance**. Reading: recombination
+occasionally crosses a conjunctive barrier independent chains can't — rare at
+DME complexity, so it shows in the tail, not the mean. Since deployment takes
+the best champion, the tail is the relevant metric, and the hypothesis is that
+the edge grows with complexity (toward 10BASE-T1S; mlx86 needed cooperation for
+hard problems). Caveats: n=6 is noisy (best is one min each); cooperative ran a
+~2% compute handicap yet still won the best case by 15%.
+
+**Implication:** the board is not dead weight — keep it. So a deterministic
+engine (ticket 002) must be the barrier-synchronous-exchange rewrite, not a
+delete-the-board shortcut.
+
 ## Verdict (2026-06-22)
 
 **Within-stage island migration (copy a better peer) is a wash** — measured

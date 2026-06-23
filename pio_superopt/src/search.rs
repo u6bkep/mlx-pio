@@ -1049,11 +1049,15 @@ fn flat_breed_chain(
             cur = cand;
             cur_cost = cc;
         }
-        // cross-breeding: publish, then recombine with a peer
+        // cross-breeding: publish, then recombine with a peer. `poll_rate == 0`
+        // disables recombination entirely (islands run independent) — the
+        // no-cooperation arm of the cooperative-vs-independent A/B (dme_breed_ab).
+        // Posting still runs so board overhead matches; only the crossover step
+        // is toggled.
         if i % cfg.post_rate == 0 {
             board.post(idx, &cur, cur_cost);
         }
-        if i % cfg.poll_rate == 0 {
+        if cfg.poll_rate != 0 && i % cfg.poll_rate == 0 {
             if let Some((peer, _)) = board.sample_peer(idx, &mut rng) {
                 let child = crossover(&cur, &peer, space.slots, &mut rng);
                 let ch = edge_breed_cost(&child, golden, mask, spec, params.w, window, params.densify_w);

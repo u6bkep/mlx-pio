@@ -1442,6 +1442,74 @@ mod tests {
         eprintln!("  [{}]", parts.join("  "));
     }
 
+    /// A/B (ticket 001/002): do the cooperating cross-breeding islands earn their
+    /// keep vs the same 32 chains run INDEPENDENTLY (crossover off, take the
+    /// best)? Equal compute — identical islands, window ladder, iters, and seeds;
+    /// only recombination is toggled (`poll_rate = 0` disables it; posting still
+    /// runs in both so board overhead matches). If independent ties cooperative,
+    /// the board/crossover machinery is dead weight (and the engine becomes
+    /// trivially deterministic). DME is the hardest target we have; cooperation
+    /// may only pay off above some complexity threshold (mlx86 needed it).
+    ///
+    /// Run: `cargo test --release -- --ignored dme_breed_ab --nocapture`
+    #[test]
+    #[ignore = "cooperative-vs-independent A/B (~1-2min); run with --release ... --nocapture"]
+    fn dme_breed_ab() {
+        use crate::program::Program;
+        use crate::search::{synthesize_flat_breed, MigrateCfg, Space};
+        let (sp, golden, mask) = dme_golden();
+        let template = Program::empty(dme_cfg());
+        let space = Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+
+        // 32 islands (one per core), cold-weighted window ladder (as dme_breed_scale).
+        let mut windows = Vec::new();
+        for &(win, count) in &[(8usize, 4), (6, 4), (4, 4), (3, 4), (2, 4), (1, 6), (0, 6)] {
+            for _ in 0..count {
+                windows.push(win);
+            }
+        }
+        assert_eq!(windows.len(), 32);
+
+        let iters = 400_000u32;
+        let seeds: Vec<u64> = (0..6u64).map(|i| 0xA1B2 ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+
+        // Equal compute; only poll_rate differs. (Cooperative does ~1/poll_rate
+        // extra crossover evals/iter — ~2% more work, a slight handicap to
+        // independent, so a cooperative win must clear that bar.)
+        let coop = Params {
+            iters,
+            migrate: Some(MigrateCfg { post_rate: 20, poll_rate: 50, intensity: 1.0 }),
+            ..Params::default()
+        };
+        let indep = Params {
+            iters,
+            migrate: Some(MigrateCfg { post_rate: 20, poll_rate: 0, intensity: 1.0 }),
+            ..Params::default()
+        };
+
+        let run_arm = |name: &str, p: &Params| {
+            let mut ecs = Vec::new();
+            for &s in &seeds {
+                let (champ, _) = synthesize_flat_breed(&template, &space, &golden, &mask, &sp, p, &windows, s);
+                ecs.push(edge_cost(&golden, &run(&champ, &sp), &mask, 0));
+            }
+            let mean = ecs.iter().sum::<f64>() / ecs.len() as f64;
+            let best = ecs.iter().cloned().fold(f64::INFINITY, f64::min);
+            eprintln!("  {name}: best {best:.1}  mean {mean:.1}  spread {ecs:?}");
+            (best, mean)
+        };
+
+        eprintln!("\nDME cooperative-vs-independent (32 islands × {iters} iters, n={} seeds):", seeds.len());
+        let (cb, cm) = run_arm("cooperative", &coop);
+        let (ib, im) = run_arm("independent", &indep);
+        eprintln!(
+            "  => cooperative {} (best {:+.1}, mean {:+.1} vs independent)",
+            if cm < im { "HELPS" } else if cm > im { "does NOT help" } else { "ties" },
+            cb - ib,
+            cm - im
+        );
+    }
+
     /// META-TUNE (ticket 002): let the optimizer tune the breeding engine's own
     /// hyperparameters (densify weight, temps, breeding rate, ladder spread, w)
     /// via a fixed-seed mini-trial objective — instead of hand-tuning. Then
