@@ -1,5 +1,5 @@
 ---
-status: in-progress (2.9x banked; further levers optional)
+status: in-progress (3.4x real breed-step; near the single-SM ceiling)
 priority: high
 created: 2026-06-22
 source: the shared bottleneck for scale (SCRATCH) + meta-tuning (002)
@@ -7,7 +7,35 @@ source: the shared bottleneck for scale (SCRATCH) + meta-tuning (002)
 
 # 004 — Eval hot-path performance
 
-## Done (2026-06-23) — 2.9x on the real per-candidate eval
+## Deep dive round 2 (2026-06-23) — compute-bound, not cache-bound
+
+Hypothesis going in was cache/L1. `perf` refuted it: single-thread IPC 4.2 with
+~0.0% L1d misses; even at 32 threads L1d misses stay 0.2%. `Emulator` is 11.5
+KiB and fits L1. The bottleneck is pure instruction count (~142K/eval), and at
+32 threads IPC drops 4.2->2.6 from SMT execution-unit contention (16 physical
+cores, ~5.2 IPC/core saturated) — so 32 islands give ~20x aggregate, not 32x;
+physical core count is the real ceiling.
+
+Wins came from cutting instructions, all guarded by `fast_step_matches_full`:
+- **Leaner capture** (commit 4d70f7e): `tick_pio` drops the redundant per-cycle
+  pre-`update_gpio` (hoisted to one `refresh_gpio`); `update_gpio_released`
+  merges only released blocks; one merged-GPIO read/cycle instead of per-pin.
+- **Fat LTO + codegen-units=1** (commit 761c53f): the hot path crosses 4 crate
+  boundaries through thin pub fns that weren't inlined (~15% was call
+  overhead). LTO inlines `tick_pio -> step_n_with_pins -> step_with_pins ->
+  execute_cycle`. Incremental release rebuild ~4s; debug/test loop unaffected.
+
+Cumulative vs the original baseline:
+- emulator core (`run`): 16.79 -> 4.17us (4.0x)
+- **real breed-step: 16.80 -> 4.88us (3.4x)**
+- candidate eval (run+edge_cost): 30.66 -> 8.90us (3.4x)
+
+Post-LTO the profile is genuine PIO emulation (execute_cycle / 4-SM clock loop /
+pin merge). Going further would require single-SM specialization (skip the
+4-SM loop) — declined, multi-SM/complementary-programs is a wanted feature — or
+a JIT-scale rewrite. This is a good stopping point near the single-SM ceiling.
+
+## Round 1 (2026-06-23) — 2.9x on the real per-candidate eval
 
 Profile-first with a Criterion suite (`pio_superopt/benches/eval.rs`): full
 eval, its decomposition, cost-by-mask-width, and the real breed-step. Findings
