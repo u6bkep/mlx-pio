@@ -235,6 +235,61 @@ and **high-variance** (1/3 seeds breaks through).
   trials. `run()` is ~28µs (278 cyc × ~100ns) × tens of millions of calls.
   **NEXT: profile/optimize the eval hot path** (reset cost, capture only scored
   cycles/pins, skip redundant re-validate) — it multiplies everything.
+  *(DONE 2026-06-23 — see "Performance + determinism + meta-tuning resolved"
+  below. The premise was half-wrong: setup/validate were ~2%; the wins were
+  edge_cost + the emulator fork + LTO. And meta-tuning turned out NOT to need
+  deployment-scale inner trials.)*
+
+## Performance + determinism + meta-tuning resolved (2026-06-23)
+
+Picked up the "NEXT" above (profile the eval hot path) and it cascaded into
+resolving the whole meta-tuning question. All committed.
+
+### Eval perf — 3.4x on the real breed-step (ticket 004)
+Profile-first with a Criterion suite (`benches/eval.rs`) + the `fixtures` module.
+- **edge_cost 3.9x**: a full all-ones mask scanned all 32 bit-channels (30 empty)
+  — intersect `care` with bits present in golden|candidate; rolled the DP onto
+  two rows. 12.3→3.2µs.
+- **Emulator 3x**: `emu.step()` ran both Cortex-M33 cores + all peripherals every
+  PIO cycle. Vendored `rp2350-emu` and added `step_pio_only`/`tick_pio` (PIO
+  slice only; skip cores/timers/IRQ, hoist the redundant GPIO refresh, skip reset
+  blocks). Gated by `fast_step_matches_full` (DME ref + plateau + 300 random,
+  byte-identical to the full step). 16.5→4.2µs.
+- **Fat LTO**: the hot path crossed 4 crate boundaries through un-inlined pub fns
+  (~15% call overhead). 5.2→4.2µs.
+- **Cache hypothesis REFUTED**: perf shows IPC 4.2, L1d miss ~0% (Emulator is
+  11.5 KiB, fits L1) — compute-bound, not cache-bound. At 32 threads IPC drops
+  4.2→2.6 (SMT exec-unit contention), so 32 islands ≈ 20x aggregate, not 32x.
+- Near the single-SM ceiling; more needs single-SM specialization (declined —
+  multi-SM is wanted) or a JIT. The 4-SM-loop skip was measured neutral.
+
+### Determinism — free, via the cooperation A/B (tickets 001/002)
+- **Cross-breeding does NOT help on DME** (`dme_breed_ab`, n=16): independent
+  restarts beat cooperative on best/median/mean. The n=6 look-positive was
+  *noise* — same seed gave 17 then 23 (board↔thread timing). Slot crossover is
+  destructive; disruption > benefit at DME complexity. (May still pay at higher
+  complexity — not refuted, just below threshold here.)
+- **Independent mode (`poll_rate=0`) is deterministic** (no board reads → pure
+  seeded anneal; locked by `flat_breed_independent_is_deterministic`). So
+  trustworthy meta-tuning needed no barrier-sync rewrite — just run independent.
+
+### Meta-tuning — resolved (ticket 002)
+- **Transfer trap was the `max_window`/ladder lever**: dropped it from the
+  meta-genome → tuning transfers (deterministic: default 23.0 vs tuned 21.3 @800k).
+- **`t_end` sweep**: optimum is budget-invariant (0.05 at both 150k and 800k) ⇒
+  **short inner trials ARE representative**. The perf work let us *prove* this.
+- **New weak link**: the meta-anneal under-optimizes (found t_end=0.54; sweep says
+  0.05). 24 SA iters stall on a ~1-D landscape — a grid beats SA for small HP
+  spaces. And at 800k the t_end curve is nearly flat: HP tuning's ROI on DME is
+  thin; its real value is at higher complexity.
+
+### NEXT (candidates — see wrap-up discussion)
+DME is still unsolved (best edge-cost ~17–22, plateaued). Perf + determinism are
+in hand. The open frontier is **why DME plateaus** — the search isn't reaching
+edge-cost 0 regardless of scale/HPs. Likely a *structural/representational* gap
+(the mids), not a tuning or speed gap. Candidates: richer move set / decomposition
+for the data-conditional cell; or accept DME as a stepping stone and move toward
+the real target (10BASE-T1S) where cooperation + meta-tuning should finally pay.
 
 ## Other directions (held)
 - **Population + crossover (GP)**: combine a "has spine" with a "has framing"
