@@ -31,15 +31,29 @@ Two findings:
    is partly chasing noise; `synthesize_flat_breed` is non-deterministic
    (cross-breeding board ↔ thread timing), so single-seed scores are unreliable.
 
-### Redesign options (before another run)
-- **Drop `max_window`/ladder shape from the meta-genome** — tune only the
-  continuous knobs (w, t0, t_end, densify_w, poll_rate) and fix a good wide
-  ladder. Removes the main overfit lever.
-- **Make the engine deterministic** (seed the board exchange deterministically,
-  or a deterministic island schedule) so the objective stops being noisy — the
-  single biggest blocker to trustworthy meta-tuning.
-- **Tune at deployment scale** once determinism + a JIT-class eval make 800k
-  inner trials cheap enough (a follow-on to 004).
+### Fix that worked: drop `max_window` from the meta-genome (2026-06-23)
+
+`perturb` no longer mutates `max_window` — it stays at the seed HP's wide
+default (8); only w/t0/t_end/densify_w/post_rate/poll_rate are tuned. Re-ran:
+
+```
+inner 150k mini-cost:  default 22.7   tuned 19.7
+@ full 800k (3 seeds): default mean 25.3 [24,26,26]
+                       tuned   mean 20.7 [20,21,21]   => tuning HELPS (non-overlapping)
+```
+
+**The continuous knobs transfer.** The tuned set (w 64→122, t0 128→33,
+densify_w 0.5→0.33) is lower AND tighter than the default at deployment. The
+ladder shape was the whole transfer trap; removing it fixed it.
+
+### Remaining caveat / next
+- **Noise persists across runs.** Same default HP + same seeds gave full-scale
+  mean 21.0 one run and 25.3 the next — `synthesize_flat_breed` is
+  non-deterministic (board ↔ thread timing). The *within-run* default-vs-tuned
+  gap is clean (non-overlapping), but a deterministic engine is still the next
+  enabler for confident, repeatable meta-tuning.
+- **Then** consider tuning at deployment scale once a JIT-class eval makes 800k
+  inner trials cheap (follow-on to 004).
 
 ## Built + finding (2026-06-22)
 

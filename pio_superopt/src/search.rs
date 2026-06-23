@@ -1158,16 +1158,22 @@ fn meta_mult(rng: &mut Rng) -> f64 {
 
 impl BreedHp {
     /// Perturb one field multiplicatively, then clamp to a sane range.
+    ///
+    /// `max_window` (the ladder shape) is deliberately NOT in the meta-genome:
+    /// the post-004 re-run (ticket 002) identified it as the transfer-trap lever
+    /// — the tuner picks a narrow ladder that sprints short inner trials but
+    /// starves full-scale exploration. It stays fixed at the seed HP's value (a
+    /// wide ladder from `BreedHp::default`); only the continuous + rate knobs
+    /// are tuned.
     fn perturb(&self, rng: &mut Rng) -> BreedHp {
         let mut h = *self;
-        match rng.below(7) {
+        match rng.below(6) {
             0 => h.w = (h.w * meta_mult(rng)).clamp(8.0, 4096.0),
             1 => h.t0 = (h.t0 * meta_mult(rng)).clamp(2.0, 8192.0),
             2 => h.t_end = (h.t_end * meta_mult(rng)).clamp(0.01, 64.0),
             3 => h.densify_w = (h.densify_w * meta_mult(rng)).clamp(0.05, 1.0),
             4 => h.post_rate = ((h.post_rate as f64 * meta_mult(rng)).round() as u32).clamp(1, 500),
-            5 => h.poll_rate = ((h.poll_rate as f64 * meta_mult(rng)).round() as u32).clamp(2, 1000),
-            _ => h.max_window = ((h.max_window as f64 * meta_mult(rng)).round() as usize).clamp(1, 16),
+            _ => h.poll_rate = ((h.poll_rate as f64 * meta_mult(rng)).round() as u32).clamp(2, 1000),
         }
         if h.t_end >= h.t0 {
             h.t_end = h.t0 * 0.5;
