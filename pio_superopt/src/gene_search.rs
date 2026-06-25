@@ -2004,6 +2004,65 @@ mod tests {
         eprintln!("  [{}]", parts.join("  "));
     }
 
+    /// CURRICULUM BRIDGEABILITY (clock-first, strongest form): warm-start an
+    /// edge-cost anneal from the plateau gene — a PERFECT clock that already
+    /// reads one data bit per cell (`out X,1`) but never conditionally toggles.
+    /// Given that scaffold, adding the data-conditional mid is now output-VISIBLE
+    /// (X is already loaded; the conditional toggle changes the data=1 cells). So
+    /// this isolates the question: can stochastic search add the conditional mid
+    /// when the read+loop scaffold is handed to it? If yes, clock-first curriculum
+    /// is viable (stage 1 only needs to build a data-reading clock). If no, even
+    /// the scaffold doesn't bridge. Run: `cargo test --release -- --ignored dme_curriculum_warmstart --nocapture`
+    ///
+    /// FINDING: inconclusive — the available "clock" (plateau gene) is NOT
+    /// timing-aligned. Removing the mid shrank the cell, so its clock drifts out
+    /// of phase with the reference (its own scaffold scores only 6/20 boundaries,
+    /// cost 45). Warm-starting from it therefore tested "recover from a misaligned
+    /// clock", which stalled at the ~20-24 plateau (best 5/11 mids). A
+    /// timing-correct clock scaffold would have to be hand-built — exactly the
+    /// hand-skeleton we're avoiding. Argues for the length-progressive testbed
+    /// (grow the problem from length 1) over hand-scaffolded clock-first.
+    #[test]
+    #[ignore = "curriculum bridgeability (~1min); run with --release ... --nocapture"]
+    fn dme_curriculum_warmstart() {
+        let (sp, golden, mask) = dme_golden();
+        let zsp = RunSpec { inputs: vec![0, 0, 0, 0], ..sp.clone() };
+        let boundaries = dme_edges01(&run(&dme_ref(DME_H).lower(), &zsp));
+        let space = crate::search::Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        let params = Params::default();
+
+        let start = crate::fixtures::dme_plateau_gene().lower();
+        let sw = run(&start, &sp);
+        eprint!("clock scaffold (plateau gene):");
+        dme_diagnose_wave(&golden, &sw, &mask, &boundaries);
+
+        let seeds: Vec<u64> = (0..4u64).map(|i| 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        let iters = 3_000_000u32;
+        for &seed in &seeds {
+            let mut rng = Rng::new(seed);
+            let mut cur = start.clone();
+            let mut cur_cost = crate::search::edge_breed_cost(&cur, &golden, &mask, &sp, params.w, 0, params.densify_w);
+            let mut best = (cur.clone(), cur_cost);
+            for i in 0..iters {
+                let t = params.t0 * (params.t_end / params.t0).powf(i as f64 / iters as f64);
+                let cand = crate::search::mutate(&cur, &space, false, &mut rng);
+                let cc = crate::search::edge_breed_cost(&cand, &golden, &mask, &sp, params.w, 0, params.densify_w);
+                if cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / t).exp() {
+                    cur = cand;
+                    cur_cost = cc;
+                }
+                if cur_cost < best.1 {
+                    best = (cur.clone(), cur_cost);
+                }
+            }
+            let cw = run(&best.0, &sp);
+            let ec = edge_cost(&golden, &cw, &mask, 0);
+            let (vt, vh) = crate::fixtures::dme_validate(&best.0);
+            eprintln!("  seed{seed:#018x}: edge-cost {ec:.1} [gate train={vt} held-out={vh}]");
+            dme_diagnose_wave(&golden, &cw, &mask, &boundaries);
+        }
+    }
+
     /// PLATEAU DIAGNOSIS: take a flat-engine champion and decompose its edge
     /// errors against golden. Golden edges are classified **boundary** (the
     /// data-independent clock — present in an all-zeros-corpus reference) vs
