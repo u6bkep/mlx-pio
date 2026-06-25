@@ -1750,6 +1750,65 @@ mod tests {
         eprintln!("  [{}]", parts.join("  "));
     }
 
+    /// CRANK 10x (the depth-scale experiment): identical to `dme_breed_scale`
+    /// EXCEPT the per-island budget is 10x (12M iters). The only variable is
+    /// climb depth — the geometric schedule auto-slows over the same temperature
+    /// range, so this is "longer runs, slower cooling" holding everything else
+    /// fixed. Question: is there a phase change at 10x depth — does the deep
+    /// engine reliably assemble the mid-cell conjunction (cost -> 0), or does DME
+    /// plateau regardless of scale? Run: `cargo test --release -- --ignored dme_breed_scale_10x --nocapture`
+    ///
+    /// FINDING (3 seeds, ~8min): NO phase change. Best edge-cost 20 (21/21/20),
+    /// no better than 1x (18), mids still capped at 6/11, and the champion is the
+    /// same *level-driven* structure (drive pin from OSR data + scattered
+    /// self-toggles, NO per-cell `out X,1` + conditional toggle). Depth does not
+    /// break the barrier: the data-conditional mid is a zero-partial-credit
+    /// conjunction, out-competed by the immediate-reward `out Pins`<-data
+    /// attractor. Scale is the wrong lever — this is a deceptive-landscape /
+    /// credit-assignment problem, not a compute problem.
+    #[test]
+    #[ignore = "breeding engine at 10x scale (~8min); run with --release ... --nocapture"]
+    fn dme_breed_scale_10x() {
+        use crate::program::Program;
+        let (sp, golden, mask) = dme_golden();
+        let zsp = RunSpec { inputs: vec![0, 0, 0, 0], ..sp.clone() };
+        let boundaries = dme_edges01(&run(&dme_ref(DME_H).lower(), &zsp));
+
+        let template = Program::empty(dme_cfg());
+        let space = crate::search::Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        let params = Params { iters: 12_000_000, ..Params::default() };
+        let mut windows = Vec::new();
+        for &(win, count) in &[(8usize, 4), (6, 4), (4, 4), (3, 4), (2, 4), (1, 6), (0, 6)] {
+            for _ in 0..count {
+                windows.push(win);
+            }
+        }
+        assert_eq!(windows.len(), 32);
+        let seeds: Vec<u64> = (0..3u64).map(|i| 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+
+        let mut best: Option<(f64, Program)> = None;
+        for &seed in &seeds {
+            let (champ, _) = crate::search::synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &params, &windows, seed);
+            let cw = run(&champ, &sp);
+            let ec = edge_cost(&golden, &cw, &mask, 0);
+            let (vtrain, vheld) = crate::fixtures::dme_validate(&champ);
+            eprintln!("  seed{seed:#018x}:  [gate train={vtrain} held-out={vheld}]");
+            dme_diagnose_wave(&golden, &cw, &mask, &boundaries);
+            if best.as_ref().map_or(true, |(bc, _)| ec < *bc) {
+                best = Some((ec, champ));
+            }
+        }
+        let (be, bp) = best.unwrap();
+        let mut parts = Vec::new();
+        for i in 0..32usize {
+            if let Some(insn) = &bp.slots[i] {
+                parts.push(format!("{i}:{}", brief_insn(insn)));
+            }
+        }
+        eprintln!("\nbreed@10x best edge-cost={be:.1} (breed@scale ~18) wrap {}..{}", bp.wrap_bottom, bp.wrap_top);
+        eprintln!("  [{}]", parts.join("  "));
+    }
+
     /// BREADTH vs DEPTH (the rainbow experiment): same DME target and total
     /// wall-clock ballpark as `dme_breed_scale`, but allocated breadth-first —
     /// a huge random pool, keep the best basins, shallow-anneal + polish each.
