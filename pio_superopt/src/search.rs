@@ -1240,6 +1240,196 @@ pub fn synthesize_rainbow(
     (bp, sc)
 }
 
+/// **Output-only behavior descriptor** for novelty search: the transition-density
+/// profile of the captured waveform — `n_bins` buckets over the capture window,
+/// each holding the count of bit-0 transitions that fall in it. It characterizes
+/// *what signal the program emits* (where and how often it switches), with **no**
+/// reference to the program's internal mechanism or the target's structure. So
+/// novelty rewards "emit a signal nothing else has emitted", never "look like a
+/// particular (e.g. human) solution" — the diversity axis is output, not idiom.
+fn behavior_profile(wave: &[u32], n_bins: usize) -> Vec<f32> {
+    let mut b = vec![0f32; n_bins];
+    if wave.len() < 2 {
+        return b;
+    }
+    let span = wave.len();
+    let mut prev = wave[0] & 1;
+    for (i, &s) in wave.iter().enumerate().skip(1) {
+        let v = s & 1;
+        if v != prev {
+            let bin = (i * n_bins / span).min(n_bins - 1);
+            b[bin] += 1.0;
+            prev = v;
+        }
+    }
+    b
+}
+
+fn l1(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum()
+}
+
+/// Novelty = mean L1 distance from `b` to its `k` nearest neighbors among `refs`
+/// (the archive + current behaviors). Higher = more behaviorally novel. A
+/// zero-distance self-match (when `b` is itself in `refs`) only adds a uniform
+/// 0 across all candidates, so it doesn't perturb the ranking.
+fn knn_novelty(b: &[f32], refs: &[Vec<f32>], k: usize) -> f32 {
+    if refs.is_empty() {
+        return 0.0;
+    }
+    let mut dists: Vec<f32> = refs.iter().map(|r| l1(b, r)).collect();
+    let take = k.min(dists.len());
+    if take == 0 {
+        return 0.0;
+    }
+    // Partition the `take` smallest into the front in O(n) — no full sort.
+    if take < dists.len() {
+        dists.select_nth_unstable_by(take - 1, |a, c| a.partial_cmp(c).unwrap());
+    }
+    dists[..take].iter().sum::<f32>() / take as f32
+}
+
+/// **Novelty search** (Lehman & Stanley) — the deceptive-landscape engine. Scale,
+/// breadth, and data-diversity all fail on DME because an immediate-reward
+/// attractor (drive the pin from data) out-competes a zero-gradient conjunction
+/// (the data-conditional toggle); no resource lever crosses that. Novelty search
+/// refuses to follow the deceptive fitness gradient: each generation it keeps
+/// half the population by *fitness* (elitism — stays grounded and converges) and
+/// half by *behavioral novelty* (drives into unseen regions of OUTPUT space), so
+/// the population can't collapse into the one attractor. Crucially the novelty
+/// axis is the emitted signal ([`behavior_profile`]), NOT any program idiom — it
+/// rewards a genuinely different waveform, human-like or not, equally.
+///
+/// `fitness` is strict (window-0) densified edge cost on `golden`; the global
+/// best-by-fitness ever seen is returned (gate it with `dme_validate`).
+pub fn synthesize_novelty(
+    template: &Program,
+    space: &Space,
+    golden: &[u32],
+    mask: &[u32],
+    spec: &RunSpec,
+    params: &Params,
+    pop_size: usize,
+    gens: usize,
+    n_bins: usize,
+    k: usize,
+    archive_cap: usize,
+    seed: u64,
+) -> (Program, crate::cost::Score) {
+    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).max(1);
+    let pop_size = pop_size.max(2);
+
+    // Evaluate a batch of programs in parallel into (fitness, behavior).
+    let eval_batch = |progs: Vec<Program>| -> Vec<(Program, f64, Vec<f32>)> {
+        let progs_ref = &progs;
+        let chunk = progs.len().div_ceil(n_threads).max(1);
+        let mut out: Vec<(usize, f64, Vec<f32>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..n_threads)
+                .map(|tid| {
+                    s.spawn(move || {
+                        let lo = (tid * chunk).min(progs_ref.len());
+                        let hi = ((tid + 1) * chunk).min(progs_ref.len());
+                        (lo..hi)
+                            .map(|i| {
+                                let p = &progs_ref[i];
+                                if p.validate().is_err() {
+                                    return (i, f64::INFINITY, vec![0f32; n_bins]);
+                                }
+                                let wave = run(p, spec);
+                                let fit = params.w * edge_cost_w(golden, &wave, mask, 0, params.densify_w) + p.size() as f64;
+                                (i, fit, behavior_profile(&wave, n_bins))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+        out.sort_by_key(|(i, _, _)| *i);
+        out.into_iter().zip(progs).map(|((_, f, b), p)| (p, f, b)).collect()
+    };
+
+    let mut rng = Rng::new(seed);
+    let mut pop: Vec<(Program, f64, Vec<f32>)> =
+        eval_batch((0..pop_size).map(|_| random_program(template, space, &mut rng)).collect());
+    let mut archive: Vec<Vec<f32>> = Vec::new();
+    let mut best: (Program, f64) = pop
+        .iter()
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .map(|(p, f, _)| (p.clone(), *f))
+        .unwrap();
+
+    for _ in 0..gens {
+        // Offspring: mutate random parents (cheap, serial), then eval in parallel.
+        let offspring_progs: Vec<Program> =
+            (0..pop_size).map(|_| mutate(&pop[rng.below(pop.len() as u32) as usize].0, space, false, &mut rng)).collect();
+        let offspring = eval_batch(offspring_progs);
+
+        // Track the global best by fitness.
+        for (p, f, _) in pop.iter().chain(offspring.iter()) {
+            if *f < best.1 {
+                best = (p.clone(), *f);
+            }
+        }
+
+        // Score novelty of the combined pool against archive + pool behaviors,
+        // in parallel (the k-NN scan dominates a generation at large pool sizes).
+        let mut pool: Vec<(Program, f64, Vec<f32>)> = pop.drain(..).chain(offspring).collect();
+        let refs: Vec<Vec<f32>> = archive.iter().cloned().chain(pool.iter().map(|(_, _, b)| b.clone())).collect();
+        let nov: Vec<f32> = {
+            let pool_ref = &pool;
+            let refs_ref = &refs;
+            let chunk = pool_ref.len().div_ceil(n_threads).max(1);
+            let mut out: Vec<(usize, f32)> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..n_threads)
+                    .map(|tid| {
+                        s.spawn(move || {
+                            let lo = (tid * chunk).min(pool_ref.len());
+                            let hi = ((tid + 1) * chunk).min(pool_ref.len());
+                            (lo..hi).map(|i| (i, knn_novelty(&pool_ref[i].2, refs_ref, k))).collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+            });
+            out.sort_by_key(|(i, _)| *i);
+            out.into_iter().map(|(_, n)| n).collect()
+        };
+
+        // Next population: half the slots to the fittest, half to the most novel.
+        let n_elite = pop_size / 2;
+        let mut idx: Vec<usize> = (0..pool.len()).collect();
+        idx.sort_by(|&a, &b| pool[a].1.partial_cmp(&pool[b].1).unwrap());
+        let mut chosen = vec![false; pool.len()];
+        for &i in idx.iter().take(n_elite) {
+            chosen[i] = true;
+        }
+        // Remaining slots by novelty (descending) among the not-yet-chosen.
+        let mut rest: Vec<usize> = (0..pool.len()).filter(|&i| !chosen[i]).collect();
+        rest.sort_by(|&a, &b| nov[b].partial_cmp(&nov[a]).unwrap());
+        for &i in rest.iter().take(pop_size - n_elite) {
+            chosen[i] = true;
+        }
+        // Archive the most novel few each generation, capped (FIFO eviction).
+        let mut by_nov = rest.clone();
+        by_nov.sort_by(|&a, &b| nov[b].partial_cmp(&nov[a]).unwrap());
+        for &i in by_nov.iter().take(2) {
+            archive.push(pool[i].2.clone());
+        }
+        if archive.len() > archive_cap {
+            let drop = archive.len() - archive_cap;
+            archive.drain(0..drop);
+        }
+
+        pop = pool.drain(..).zip(chosen).filter(|(_, c)| *c).map(|(ind, _)| ind).collect();
+    }
+
+    // Final polish of the best-by-fitness champion.
+    let p = polish_masked(&best.0, space, golden, mask, spec, params.w, false);
+    let sc = score_masked(&p, golden, mask, spec);
+    (p, sc)
+}
+
 // ---- meta-optimization: tune the breeding engine's hyperparameters (ticket
 // 002), modeled on mlx86's *_hyperparameters.cpp — the optimizer optimizes its
 // own knobs. Multiplicative (scale-invariant) perturbation + hard clamps; the

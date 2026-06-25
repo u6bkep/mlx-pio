@@ -1947,6 +1947,63 @@ mod tests {
         eprintln!("  [{}]", parts.join("  "));
     }
 
+    /// NOVELTY SEARCH (the deceptive-landscape engine): can rewarding output-signal
+    /// novelty — not the human idiom — escape the level-driving attractor that
+    /// scale/breadth/data-diversity could not? Half the population is kept by
+    /// fitness (converge), half by behavioral novelty (escape). The diversity axis
+    /// is the emitted waveform, so a non-human encoding is rewarded equally. On the
+    /// 4-code corpus for speed + direct comparison to breed@scale (~18, 50% mid);
+    /// the gate flags any overfit win. Run: `cargo test --release -- --ignored dme_novelty --nocapture`
+    ///
+    /// FINDING (3 seeds): novelty search also does NOT escape — best edge-cost 20
+    /// (vs breed@scale 18), champions STILL level-driven (`mov Pins,InvertOsr`,
+    /// `out Pins`<-data). The reason is fundamental and unifies all four failures:
+    /// the data-conditional conjunction (`out X,1` + `jmp X--` + toggle) has
+    /// output-NEUTRAL intermediate states — loading X changes nothing observable
+    /// until the conditional toggle also exists — so NO output-based signal, not
+    /// fitness and not output-behavior novelty, can see or preserve the stepping
+    /// stones on the path to it. Output novelty rewards diverse *signals*, but the
+    /// assembly path is invisible in signal space. Conclusion: an output-invisible
+    /// conjunction cannot be found by any output-only search; solving it requires
+    /// injecting some structural information (curriculum / mechanism-QD / macro).
+    #[test]
+    #[ignore = "novelty search (~3min); run with --release ... --nocapture"]
+    fn dme_novelty() {
+        use crate::program::Program;
+        let (sp, golden, mask) = dme_golden();
+        let zsp = RunSpec { inputs: vec![0, 0, 0, 0], ..sp.clone() };
+        let boundaries = dme_edges01(&run(&dme_ref(DME_H).lower(), &zsp));
+
+        let template = Program::empty(dme_cfg());
+        let space = crate::search::Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        let params = Params::default();
+        // pop 512, 15k gens, 24-bin output profile, k=15, archive cap 1024.
+        let (pop, gens, bins, k, cap) = (512usize, 15_000usize, 24usize, 15usize, 1024usize);
+        let seeds: Vec<u64> = (0..3u64).map(|i| 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+
+        let mut best: Option<(f64, Program)> = None;
+        for &seed in &seeds {
+            let (champ, _) = crate::search::synthesize_novelty(&template, &space, &golden, &mask, &sp, &params, pop, gens, bins, k, cap, seed);
+            let cw = run(&champ, &sp);
+            let ec = edge_cost(&golden, &cw, &mask, 0);
+            let (vtrain, vheld) = crate::fixtures::dme_validate(&champ);
+            eprintln!("  seed{seed:#018x}:  [gate train={vtrain} held-out={vheld}]");
+            dme_diagnose_wave(&golden, &cw, &mask, &boundaries);
+            if best.as_ref().map_or(true, |(bc, _)| ec < *bc) {
+                best = Some((ec, champ));
+            }
+        }
+        let (be, bp) = best.unwrap();
+        let mut parts = Vec::new();
+        for i in 0..32usize {
+            if let Some(insn) = &bp.slots[i] {
+                parts.push(format!("{i}:{}", brief_insn(insn)));
+            }
+        }
+        eprintln!("\nnovelty best edge-cost={be:.1} (breed@scale ~18) wrap {}..{}", bp.wrap_bottom, bp.wrap_top);
+        eprintln!("  [{}]", parts.join("  "));
+    }
+
     /// PLATEAU DIAGNOSIS: take a flat-engine champion and decompose its edge
     /// errors against golden. Golden edges are classified **boundary** (the
     /// data-independent clock — present in an all-zeros-corpus reference) vs
