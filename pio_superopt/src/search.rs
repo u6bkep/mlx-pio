@@ -1240,6 +1240,74 @@ pub fn synthesize_rainbow(
     (bp, sc)
 }
 
+/// Summed densified edge cost of `p` over one curriculum stage: a *set* of data
+/// sequences `(spec, golden, mask)` the candidate must match ALL of. Scoring
+/// across multiple data values is what makes the data-CONDITIONAL toggle
+/// output-visible — it is precisely the difference between the sequences' golden
+/// traces — and forbids hardcoding a single waveform. Size is counted once.
+fn multidata_cost(p: &Program, dataset: &[(RunSpec, Vec<u32>, Vec<u32>)], w: f64, window: usize, spurious_w: f64) -> f64 {
+    if p.validate().is_err() {
+        return f64::INFINITY;
+    }
+    let mut total = 0.0;
+    for (sp, g, m) in dataset {
+        total += edge_cost_w(g, &run(p, sp), m, window, spurious_w);
+    }
+    w * total + p.size() as f64
+}
+
+/// **One curriculum stage**: minimize [`multidata_cost`] over `dataset` with
+/// parallel restarts. Half the restarts warm-start from `warm` (the previous,
+/// shorter stage's champion — carrying its loop structure forward), half start
+/// random (keep exploring). Returns the best `(program, cost)`; a cost below `w`
+/// means zero edge-errors across every sequence (the stage is solved). The
+/// length-progressive driver lives in the DME tests since the data generation is
+/// protocol-specific; this is the reusable inner search.
+pub fn synthesize_curriculum_stage(
+    template: &Program,
+    space: &Space,
+    dataset: &[(RunSpec, Vec<u32>, Vec<u32>)],
+    params: &Params,
+    warm: Option<&Program>,
+    restarts: usize,
+    iters: u32,
+    window: usize,
+    seed: u64,
+) -> (Program, f64) {
+    let dataset_ref = dataset;
+    let results: Vec<(Program, f64)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..restarts.max(1))
+            .map(|r| {
+                let cs = seed ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                s.spawn(move || {
+                    let mut rng = Rng::new(cs);
+                    let mut cur = match warm {
+                        Some(w) if r % 2 == 0 => w.clone(),
+                        _ => random_program(template, space, &mut rng),
+                    };
+                    let mut cur_cost = multidata_cost(&cur, dataset_ref, params.w, window, params.densify_w);
+                    let mut best = (cur.clone(), cur_cost);
+                    for i in 0..iters {
+                        let t = params.t0 * (params.t_end / params.t0).powf(i as f64 / iters.max(1) as f64);
+                        let cand = mutate(&cur, space, false, &mut rng);
+                        let cc = multidata_cost(&cand, dataset_ref, params.w, window, params.densify_w);
+                        if cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / t).exp() {
+                            cur = cand;
+                            cur_cost = cc;
+                        }
+                        if cur_cost < best.1 {
+                            best = (cur.clone(), cur_cost);
+                        }
+                    }
+                    best
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    results.into_iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap()
+}
+
 /// **Output-only behavior descriptor** for novelty search: the transition-density
 /// profile of the captured waveform — `n_bins` buckets over the capture window,
 /// each holding the count of bit-0 transitions that fall in it. It characterizes

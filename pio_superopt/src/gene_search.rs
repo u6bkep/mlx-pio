@@ -2063,6 +2063,85 @@ mod tests {
         }
     }
 
+    /// Pack `n_bits` (bit i = the i-th emitted line bit, LSB-first) into 5-bit
+    /// DME words for the TX FIFO.
+    fn seq_words(bits: u64, n_bits: usize) -> Vec<u32> {
+        let words = (n_bits + 4) / 5;
+        (0..words.max(1)).map(|w| ((bits >> (5 * w)) & 0x1F) as u32).collect()
+    }
+
+    /// LENGTH-PROGRESSIVE CURRICULUM (the testbed redesign): grow the problem one
+    /// cell at a time. At length L the candidate must reproduce the reference over
+    /// the first L cells for a SET of data sequences (exhaustive while small,
+    /// sampled when large) — multi-data scoring forces data-conditionality and
+    /// makes the conditional toggle output-visible, and short L keeps the search
+    /// space tiny. Advance L when a stage is solved (0 edge-errors over all
+    /// sequences), warm-starting from the champion so its loop structure carries
+    /// forward; growing L defeats overfitting. How far up the ladder do we climb,
+    /// and does a clean data-driven loop emerge? Run with `--ignored
+    /// dme_curriculum_length --nocapture`.
+    ///
+    /// FINDING: the testbed works mechanically but the ladder breaks at the first
+    /// rung. L=1 SOLVES — but its champion is pure level-driving (`mov
+    /// Pins,InvertOsr`): at a SINGLE cell, pin-follows-data is a *valid* solution,
+    /// so L=1 rewards the attractor rather than forcing the conditional toggle.
+    /// L=2 then STALLS (differential carry makes level-driving fail), and the
+    /// search can't assemble the read+branch+toggle conjunction — not in 20 slots,
+    /// not even in 10. Multi-data scoring (forces conditionality, kills the
+    /// attractor over >1 cell) and a small slot budget (shrinks the space) are
+    /// both necessary but together still NOT sufficient: stochastic point-mutation
+    /// search does not find this conjunction from scratch at L=2. The recurring
+    /// wall across the whole session is the conjunction assembly itself.
+    #[test]
+    #[ignore = "length-progressive curriculum (~3min); run with --release ... --nocapture"]
+    fn dme_curriculum_length() {
+        use crate::program::Program;
+        let reff = dme_ref(DME_H).lower();
+        // Boundary grid (data-independent clock) for sizing the per-length window.
+        let gsp = RunSpec { inputs: vec![0, 0, 0, 0], cycles: 320, ..dme_spec(0) };
+        let grid: Vec<usize> = dme_edges01(&run(&reff, &gsp)).iter().map(|&(c, _)| c).collect();
+
+        // Small slot budget: the minimal DME loop is ~8-10 slots, and shrinking
+        // the space is what makes the read+branch+toggle conjunction findable
+        // (it's hopeless in 20 slots). "Find a small program" is the
+        // superoptimizer's objective, not a structural bias.
+        let space = crate::search::Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        let template = Program::empty(dme_cfg());
+        let params = Params::default();
+        let (cap, restarts, iters, max_l) = (32u64, 24usize, 800_000u32, 14usize);
+
+        let mut champ: Option<Program> = None;
+        for l in 1..=max_l {
+            let win = (grid[l.min(grid.len() - 1)] + 3) as u64;
+            let exhaustive = (1u64 << l) <= cap;
+            let n = if exhaustive { 1u64 << l } else { cap };
+            let mut drng = Rng::new(0xDA7A_5EED ^ l as u64);
+            let dataset: Vec<(RunSpec, Vec<u32>, Vec<u32>)> = (0..n)
+                .map(|s| {
+                    let bits = if exhaustive { s } else { drng.below(1u32 << l) as u64 };
+                    let sp = RunSpec { inputs: seq_words(bits, l), cycles: win, ..dme_spec(0) };
+                    let g = run(&reff, &sp);
+                    let m = vec![u32::MAX; g.len()];
+                    (sp, g, m)
+                })
+                .collect();
+
+            let (c, cost) = crate::search::synthesize_curriculum_stage(&template, &space, &dataset, &params, champ.as_ref(), restarts, iters, 0, 0x5EED ^ l as u64);
+            let solved = cost < params.w; // < w  ==>  zero edge-errors across all sequences
+            let parts: Vec<_> = (0..20).filter_map(|i| c.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins)))).collect();
+            eprintln!("L={l:2} seqs={n:<5} {} cost={cost:6.1} size={} wrap {}..{}: [{}]", if solved { "SOLVED" } else { "STALL " }, c.size(), c.wrap_bottom, c.wrap_top, parts.join("  "));
+            champ = Some(c.clone());
+            if !solved {
+                break;
+            }
+        }
+        if let Some(c) = champ {
+            let (vt, vh) = crate::fixtures::dme_validate(&c);
+            let parts: Vec<_> = (0..20).filter_map(|i| c.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins)))).collect();
+            eprintln!("\nfinal champ [gate train={vt} held-out={vh}] wrap {}..{}: [{}]", c.wrap_bottom, c.wrap_top, parts.join("  "));
+        }
+    }
+
     /// PLATEAU DIAGNOSIS: take a flat-engine champion and decompose its edge
     /// errors against golden. Golden edges are classified **boundary** (the
     /// data-independent clock — present in an all-zeros-corpus reference) vs
