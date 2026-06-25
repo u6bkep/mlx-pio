@@ -2157,6 +2157,73 @@ mod tests {
         }
     }
 
+    /// MULTI-LENGTH CURRICULUM (the generality fix): score each candidate over a
+    /// MIX of lengths in one objective — exhaustive sequences at 2,3,4,5 cells,
+    /// each windowed to its own length. The SHORT lengths give the gradient that
+    /// makes the read+branch+toggle conjunction findable (proven at L=2); a LOOP
+    /// that solves them automatically solves the longer ones, while a non-general
+    /// (unrolled / length-specific) solution fails the long lengths and is
+    /// penalized. Findability and generality in a single from-scratch search — no
+    /// fragile warm-start chain. Solving it (0 edge-errors across all sequences)
+    /// is a general data-driven DME loop; the gate confirms it on the held-out
+    /// corpus. Run: `cargo test --release -- --ignored dme_curriculum_multilength --nocapture`
+    ///
+    /// FINDING (generality still open): three multi-length variants all fall to
+    /// level-driving. (a) equal-weight from-scratch: long lengths dominate, no
+    /// gradient to the conjunction. (b) equal-weight warm from a cracked L=2: the
+    /// high default temperature lets it JUMP off the conjunction back to
+    /// level-driving. (c) weight-RAMP from scratch (this): ramps too fast — length
+    /// 2 never gets the solo high-temp window it needs (~4M iters from scratch) to
+    /// crack the conjunction before longer lengths flood the gradient. The L=2
+    /// breakthrough is robust, but carrying it to a GENERAL loop needs either a
+    /// much slower ramp that holds length-2 solo, or warm-start + LOW temperature
+    /// (gentle refinement that can't jump basins), or cracking at L=3 from scratch
+    /// (3 cells can't unroll in 10 slots, forcing a loopy conjunction directly —
+    /// untested in isolation).
+    #[test]
+    #[ignore = "multi-length curriculum (~3min); run with --release ... --nocapture"]
+    fn dme_curriculum_multilength() {
+        use crate::program::Program;
+        let reff = dme_ref(DME_H).lower();
+        let gsp = RunSpec { inputs: vec![0, 0, 0, 0], cycles: 320, ..dme_spec(0) };
+        let grid: Vec<usize> = dme_edges01(&run(&reff, &gsp)).iter().map(|&(c, _)| c).collect();
+        let space = crate::search::Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        let template = Program::empty(dme_cfg());
+        let params = Params::default();
+
+        // Pool sequences across lengths into one dataset, tagging each with its
+        // length-GROUP (0 = shortest). Short = gradient, long = generality;
+        // exhaustive (vary the first `len` bits) while 2^len <= cap.
+        let lengths = [2usize, 3, 4, 5];
+        let cap = 32u64;
+        let mut dataset: Vec<(RunSpec, Vec<u32>, Vec<u32>)> = Vec::new();
+        let mut groups: Vec<usize> = Vec::new();
+        for (gi, &len) in lengths.iter().enumerate() {
+            let win = (grid[len.min(grid.len() - 1)] + 3) as u64;
+            let exhaustive = (1u64 << len) <= cap;
+            let n = if exhaustive { 1u64 << len } else { cap };
+            let mut drng = Rng::new(0xDA7A_5EED ^ len as u64);
+            for s in 0..n {
+                let bits = if exhaustive { s } else { drng.below(1u32 << len) as u64 };
+                let sp = RunSpec { inputs: seq_words(bits, len), cycles: win, ..dme_spec(0) };
+                let g = run(&reff, &sp);
+                let m = vec![u32::MAX; g.len()];
+                dataset.push((sp, g, m));
+                groups.push(gi);
+            }
+        }
+        eprintln!("multi-length dataset: {} sequences over lengths {lengths:?} (weight-ramped)", dataset.len());
+
+        // Single from-scratch search with the WEIGHT RAMP: the shortest length
+        // anchors the conjunction early (findable), longer lengths ramp in as the
+        // search cools (forcing a general loop without abandoning the structure).
+        let (champ, cost) = crate::search::synthesize_curriculum_ramp(&template, &space, &dataset, &groups, lengths.len(), &params, 32, 8_000_000, 0x5EED);
+        let parts: Vec<_> = (0..space.slots as usize).filter_map(|i| champ.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins)))).collect();
+        eprintln!("{} cost={cost:.1} size={} wrap {}..{}: [{}]", if cost < params.w { "SOLVED" } else { "STALL " }, champ.size(), champ.wrap_bottom, champ.wrap_top, parts.join("  "));
+        let (vt, vh) = crate::fixtures::dme_validate(&champ);
+        eprintln!("gate: train={vt} held-out={vh}  (0/0 == a general data-driven DME loop)");
+    }
+
     /// PLATEAU DIAGNOSIS: take a flat-engine champion and decompose its edge
     /// errors against golden. Golden edges are classified **boundary** (the
     /// data-independent clock — present in an all-zeros-corpus reference) vs

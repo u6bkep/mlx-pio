@@ -1308,6 +1308,93 @@ pub fn synthesize_curriculum_stage(
     results.into_iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap()
 }
 
+/// Weighted multi-data cost: like [`multidata_cost`] but each entry's
+/// contribution is scaled by its length-group's `weights[group]`. Entries whose
+/// weight is 0 are skipped entirely (so early, long-length-zero iterations only
+/// run the short sequences — a real speedup). Strict window (0).
+fn weighted_multidata_cost(p: &Program, dataset: &[(RunSpec, Vec<u32>, Vec<u32>)], groups: &[usize], weights: &[f64], w: f64, spurious_w: f64) -> f64 {
+    if p.validate().is_err() {
+        return f64::INFINITY;
+    }
+    let mut total = 0.0;
+    for (i, (sp, g, m)) in dataset.iter().enumerate() {
+        let wt = weights[groups[i]];
+        if wt > 0.0 {
+            total += wt * edge_cost_w(g, &run(p, sp), m, 0, spurious_w);
+        }
+    }
+    w * total + p.size() as f64
+}
+
+/// **Multi-length curriculum stage with a WEIGHT RAMP** — the generality fix.
+/// Equal-weight multi-length fails: the long sequences dominate the cost and
+/// destroy the conjunction (the search drifts back to level-driving). Here each
+/// dataset entry belongs to a length-`group` (0 = shortest), and a group's weight
+/// ramps in over the anneal: `weight(g, t) = clamp(t·n_groups − g + 1, 0, 1)`. So
+/// the shortest length anchors the conjunction from the start (findable AND
+/// preserved), and longer lengths gain importance only as the search cools —
+/// forcing generality without abandoning the structure. SA is driven by the
+/// ramped cost (re-anchored at each weight step); the champion returned is the
+/// best by the FULL (all-weights-1) objective. A returned cost below `w` is a
+/// general data-driven loop solving every sequence at every length.
+pub fn synthesize_curriculum_ramp(
+    template: &Program,
+    space: &Space,
+    dataset: &[(RunSpec, Vec<u32>, Vec<u32>)],
+    groups: &[usize],
+    n_groups: usize,
+    params: &Params,
+    restarts: usize,
+    iters: u32,
+    seed: u64,
+) -> (Program, f64) {
+    let dataset_ref = dataset;
+    let groups_ref = groups;
+    let weights_at = move |t: f64| -> Vec<f64> { (0..n_groups).map(|g| (t * n_groups as f64 - g as f64 + 1.0).clamp(0.0, 1.0)).collect() };
+    let results: Vec<(Program, f64)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..restarts.max(1))
+            .map(|r| {
+                let cs = seed ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let weights_at = &weights_at;
+                s.spawn(move || {
+                    let mut rng = Rng::new(cs);
+                    let step = (iters / 256).max(1);
+                    let mut cur = random_program(template, space, &mut rng);
+                    let mut weights = weights_at(0.0);
+                    let mut cur_cost = weighted_multidata_cost(&cur, dataset_ref, groups_ref, &weights, params.w, params.densify_w);
+                    let mut best = (cur.clone(), multidata_cost(&cur, dataset_ref, params.w, 0, params.densify_w));
+                    for i in 0..iters {
+                        if i % step == 0 {
+                            // Re-anchor: weights changed, so re-score cur under them,
+                            // and snapshot the best by the FULL objective.
+                            weights = weights_at(i as f64 / iters as f64);
+                            cur_cost = weighted_multidata_cost(&cur, dataset_ref, groups_ref, &weights, params.w, params.densify_w);
+                            let full = multidata_cost(&cur, dataset_ref, params.w, 0, params.densify_w);
+                            if full < best.1 {
+                                best = (cur.clone(), full);
+                            }
+                        }
+                        let temp = params.t0 * (params.t_end / params.t0).powf(i as f64 / iters.max(1) as f64);
+                        let cand = mutate(&cur, space, false, &mut rng);
+                        let cc = weighted_multidata_cost(&cand, dataset_ref, groups_ref, &weights, params.w, params.densify_w);
+                        if cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / temp).exp() {
+                            cur = cand;
+                            cur_cost = cc;
+                        }
+                    }
+                    let full = multidata_cost(&cur, dataset_ref, params.w, 0, params.densify_w);
+                    if full < best.1 {
+                        best = (cur, full);
+                    }
+                    best
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    results.into_iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap()
+}
+
 /// **Output-only behavior descriptor** for novelty search: the transition-density
 /// profile of the captured waveform — `n_bins` buckets over the capture window,
 /// each holding the count of bit-0 transitions that fall in it. It characterizes
