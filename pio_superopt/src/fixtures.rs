@@ -8,7 +8,7 @@
 
 use crate::gene::{CondKind, Gene, LoopCond, Node};
 use crate::ir::{Insn, MovDst, MovOp, MovSrc, Op, OutDst};
-use crate::program::{Config, PinMap, ShiftCfg, ShiftDir};
+use crate::program::{Config, PinMap, Program, ShiftCfg, ShiftDir};
 use crate::run::{run, RunSpec};
 use crate::ir::SideCfg;
 
@@ -98,6 +98,38 @@ pub fn dme_golden() -> (RunSpec, Vec<u32>, Vec<u32>) {
     let golden = run(&dme_ref(DME_H).lower(), &sp);
     let mask = vec![u32::MAX; golden.len()];
     (sp, golden, mask)
+}
+
+/// HELD-OUT validation corpus: 4 distinct 4B/5B data codes, none of which appear
+/// in [`dme_corpus`], with a different mid-transition pattern. The search trains
+/// on `dme_corpus`; this is the generalization oracle. A program that *overfits*
+/// the training corpus — replays its specific 278-cycle waveform via fixed
+/// delays rather than reading the data — scores 0 on train but nonzero here.
+/// Only a genuinely data-driven DME encoder reproduces the reference on both.
+pub fn dme_validation_corpus() -> Vec<u32> {
+    vec![0x12, 0x16, 0x1B, 0x0F] // codes 8,A,D,7; lsb 01001/01101/11011/11110
+}
+
+/// The held-out validation benchmark: `(spec, golden, full_mask)` — same locked
+/// window and config as [`dme_golden`] but driven by [`dme_validation_corpus`].
+pub fn dme_validation_golden() -> (RunSpec, Vec<u32>, Vec<u32>) {
+    let sp = RunSpec { inputs: dme_validation_corpus(), ..dme_spec(DME_CYCLES) };
+    let golden = run(&dme_ref(DME_H).lower(), &sp);
+    let mask = vec![u32::MAX; golden.len()];
+    (sp, golden, mask)
+}
+
+/// VALIDATION GATE: strict correctness of `champ` on the training corpus and the
+/// held-out validation corpus, as `(train, held_out)`. A champion is a *real*
+/// DME solution only when BOTH are 0 — exact on training proves it fits the
+/// objective, exact on held-out proves it generalizes (isn't an overfit replay).
+/// Use this to qualify every cost-0 champion before trusting it.
+pub fn dme_validate(champ: &Program) -> (u32, u32) {
+    let (tsp, tg, _) = dme_golden();
+    let (vsp, vg, _) = dme_validation_golden();
+    let train = crate::cost::score(champ, &tg, &tsp).correctness;
+    let held_out = crate::cost::score(champ, &vg, &vsp).correctness;
+    (train, held_out)
 }
 
 /// A representative *imperfect* candidate: the reference with the data-conditional

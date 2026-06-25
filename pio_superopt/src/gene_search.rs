@@ -1126,6 +1126,30 @@ mod tests {
         assert_eq!(edges as u32, boundaries + pop, "boundary + popcount-mid structure");
     }
 
+    /// VALIDATION GATE (runs in the normal suite): the held-out validation oracle
+    /// is a genuinely *different* waveform from the training golden (so it can
+    /// catch a train-overfit replay), and the data-driven reference reproduces
+    /// the encoder on BOTH corpora. This pins the generalization guardrail so a
+    /// later cost-0 champion can be qualified as real (data-driven) vs overfit.
+    #[test]
+    fn dme_validation_gate() {
+        use crate::fixtures::{dme_validate, dme_validation_corpus, dme_validation_golden};
+        // The validation corpus is disjoint from training, and the two goldens
+        // are different waveforms — so any program that merely replays the
+        // training waveform necessarily fails here.
+        let train_corpus = dme_corpus();
+        for c in dme_validation_corpus() {
+            assert!(!train_corpus.contains(&c), "validation code {c:#x} leaks into training corpus");
+        }
+        let (_, train_golden, _) = dme_golden();
+        let (_, valid_golden, _) = dme_validation_golden();
+        assert_ne!(train_golden, valid_golden, "held-out oracle must differ from training oracle");
+
+        // The real data-driven reference reproduces the encoder on both corpora.
+        let r = dme_ref(DME_H).lower();
+        assert_eq!(dme_validate(&r), (0, 0), "reference must generalize to held-out data");
+    }
+
     /// FORK CORRECTNESS GATE (ticket 004): the PIO-only fast step (`run`, via
     /// `step_pio_only`) must produce byte-identical waveforms to the full-
     /// fidelity emulator step (`run_full`). Covers the real DME reference, the
@@ -1425,7 +1449,8 @@ mod tests {
             let (champ, _) = crate::search::synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &params, &windows, seed);
             let cw = run(&champ, &sp);
             let ec = edge_cost(&golden, &cw, &mask, 0);
-            eprintln!("  seed{seed:#018x}:");
+            let (vtrain, vheld) = crate::fixtures::dme_validate(&champ);
+            eprintln!("  seed{seed:#018x}:  [gate train={vtrain} held-out={vheld}]");
             dme_diagnose_wave(&golden, &cw, &mask, &boundaries);
             if best.as_ref().map_or(true, |(bc, _)| ec < *bc) {
                 best = Some((ec, champ));
@@ -1707,7 +1732,8 @@ mod tests {
             let (champ, _) = crate::search::synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &params, &windows, seed);
             let cw = run(&champ, &sp);
             let ec = edge_cost(&golden, &cw, &mask, 0);
-            eprintln!("  seed{seed:#018x}:");
+            let (vtrain, vheld) = crate::fixtures::dme_validate(&champ);
+            eprintln!("  seed{seed:#018x}:  [gate train={vtrain} held-out={vheld}]");
             dme_diagnose_wave(&golden, &cw, &mask, &boundaries);
             if best.as_ref().map_or(true, |(bc, _)| ec < *bc) {
                 best = Some((ec, champ));
@@ -1764,7 +1790,8 @@ mod tests {
 
         let ge = edges01(&golden);
         let ce = edges01(&cwave);
-        eprintln!("\ngolden: {} edges ({} boundary-grid)  champion: {} edges  edge-cost={:.1}", ge.len(), boundaries.len(), ce.len(), edge_cost(&golden, &cwave, &mask, 0));
+        let (vtrain, vheld) = crate::fixtures::dme_validate(&champ);
+        eprintln!("\ngolden: {} edges ({} boundary-grid)  champion: {} edges  edge-cost={:.1}  [gate train={vtrain} held-out={vheld}]", ge.len(), boundaries.len(), ce.len(), edge_cost(&golden, &cwave, &mask, 0));
 
         let (mut b_tot, mut b_hit, mut m_tot, mut m_hit) = (0, 0, 0, 0);
         let mut misses = Vec::new();
