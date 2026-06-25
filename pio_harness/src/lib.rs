@@ -470,26 +470,13 @@ impl Pio {
         // once (not a method call per pin). Byte-identical to `trace_pads_full`
         // whenever the captured output doesn't depend on the cores;
         // `pio_superopt`'s `fast_step_matches_full` test asserts that.
+        // Delegate to the emulator's fused PIO-only trace, which keeps the
+        // composed GPIO word in a local across cycles instead of round-tripping
+        // it through `bus.gpio_in` (the per-cycle store + reloads that
+        // dominated the profile). Byte-identical to the old tick_pio +
+        // gpio_read_all loop; `fast_step_matches_full` asserts that.
         let block = self.block;
-        let mut e = self.emu.borrow_mut();
-        e.refresh_gpio(); // hoisted initial compose (was tick 0's pre-refresh)
-        let mut out = Vec::with_capacity(cycles as usize);
-        for _ in 0..cycles {
-            e.tick_pio();
-            let levels = e.gpio_read_all(); // 48-bit merged pin levels, one read
-            let oe = e.bus.pio[block].pad_oe; // this block's output-enables, one read
-            let mut w = 0u32;
-            for (j, &p) in pins.iter().enumerate() {
-                if (levels >> p) & 1 != 0 {
-                    w |= 1 << j;
-                }
-                if (oe >> p) & 1 != 0 {
-                    w |= 1 << (16 + j);
-                }
-            }
-            out.push(w);
-        }
-        out
+        self.emu.borrow_mut().trace_pio_fast(block, pins, cycles)
     }
 
     /// Full-fidelity `trace_pads`: steps the entire emulator (CPU cores + all

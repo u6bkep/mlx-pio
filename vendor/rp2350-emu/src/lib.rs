@@ -775,6 +775,19 @@ impl Emulator {
     /// released, so this is the bulk of `update_gpio`'s cost. Multi-block
     /// programs release more blocks and all released ones are merged.
     fn update_gpio_released(&mut self) {
+        let (lo, hi) = self.compose_released_pins();
+        self.bus.gpio_in.store(lo, Ordering::Relaxed);
+        self.bus.gpio_in_hi.store(hi, Ordering::Relaxed);
+    }
+
+    /// Pure compose of the merged 48-bit GPIO input view (SIO + released PIO
+    /// blocks + external stimulus), returned as `(lo, hi)` **without** writing
+    /// it back to `bus.gpio_in`. Factored out of [`Self::update_gpio_released`]
+    /// so the fused trace path ([`Self::trace_pio_fast`]) can keep the value in
+    /// a register across cycles instead of round-tripping it through the atomic
+    /// `gpio_in` fields — the store + reloads that dominated the profile.
+    #[inline]
+    fn compose_released_pins(&self) -> (u32, u32) {
         let resets = self.bus.resets_state;
         let mut out_lo = self.bus.sio.gpio_out & self.bus.sio.gpio_oe;
         let mut out_hi = 0u32;
@@ -790,14 +803,58 @@ impl Emulator {
         }
         let ext_mask = self.bus.gpio_external_mask;
         let ext_val = self.bus.gpio_external_in.load(Ordering::Relaxed);
-        self.bus
-            .gpio_in
-            .store((out_lo & !ext_mask) | (ext_val & ext_mask), Ordering::Relaxed);
+        let lo = (out_lo & !ext_mask) | (ext_val & ext_mask);
         let ext_mask_hi = self.bus.gpio_external_mask_hi;
         let ext_val_hi = self.bus.gpio_external_in_hi.load(Ordering::Relaxed);
-        self.bus
-            .gpio_in_hi
-            .store((out_hi & !ext_mask_hi) | (ext_val_hi & ext_mask_hi), Ordering::Relaxed);
+        let hi = (out_hi & !ext_mask_hi) | (ext_val_hi & ext_mask_hi);
+        (lo, hi)
+    }
+
+    /// Fused PIO-only trace (LOCAL FORK, superopt fast path). Steps the
+    /// released PIO blocks for `cycles` system clocks and captures the level +
+    /// output-enable of each pin in `pins` every cycle, returning one packed
+    /// word per cycle (bit `j` = level of `pins[j]`, bit `16+j` = its OE).
+    ///
+    /// Byte-identical to looping [`Self::tick_pio`] + [`Self::gpio_read_all`]
+    /// (the superopt's `fast_step_matches_full` test gates it). The win: the
+    /// composed GPIO word is threaded through a local instead of being stored
+    /// to `bus.gpio_in` and reloaded by the next tick + the capture read — six
+    /// atomic memory ops per cycle the profile showed dominating the compose.
+    pub fn trace_pio_fast(&mut self, block: usize, pins: &[u8], cycles: u64) -> Vec<u32> {
+        let resets = self.bus.resets_state;
+        // Initial view (equivalent to the hoisted `refresh_gpio` the old
+        // `trace_pads` did before its loop).
+        let (mut lo, mut hi) = self.compose_released_pins();
+        let mut out = Vec::with_capacity(cycles as usize);
+        for _ in 0..cycles {
+            self.clock.advance(1);
+            let gpio_pins = (lo as u64) | ((hi as u64) << 32);
+            for (i, pio) in self.bus.pio.iter_mut().enumerate() {
+                let bit = crate::bus::RESET_PIO0 + i as u8;
+                if (resets & (1u32 << bit)) == 0 {
+                    pio.step_n_with_pins(1, gpio_pins);
+                }
+            }
+            let composed = self.compose_released_pins();
+            lo = composed.0;
+            hi = composed.1;
+            let levels = (lo as u64) | ((hi as u64) << 32);
+            let oe = self.bus.pio[block].pad_oe;
+            let mut w = 0u32;
+            for (j, &p) in pins.iter().enumerate() {
+                if (levels >> p) & 1 != 0 {
+                    w |= 1 << j;
+                }
+                if (oe >> p) & 1 != 0 {
+                    w |= 1 << (16 + j);
+                }
+            }
+            out.push(w);
+        }
+        // Leave `bus.gpio_in` consistent for any post-trace reads.
+        self.bus.gpio_in.store(lo, Ordering::Relaxed);
+        self.bus.gpio_in_hi.store(hi, Ordering::Relaxed);
+        out
     }
 
     /// Serial-mode single-quantum step. Shared by [`Self::step`] and
