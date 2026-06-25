@@ -1842,6 +1842,19 @@ mod tests {
     /// need a search-algorithm change, e.g. quality-diversity)? Reports edge-cost
     /// (per active cell, so comparable across corpus length), the held-out gate,
     /// and the champion structure. Run: `cargo test --release -- --ignored dme_breed_random --nocapture`
+    ///
+    /// FINDING (16-code random, 3 seeds): multi-corpus does NOT break the
+    /// attractor. (1) It DID close the overfitting hole — held-out is now ~= train
+    /// (was ~2x on the 4-code corpus), so champions generalize their wrongness
+    /// equally; the data-generalization concern is genuinely resolved, not just
+    /// gated. (2) But champions STILL level-drive (`mov Pins,InvertOsr`,
+    /// `out Pins`<-data); the matched fraction merely DROPPED (best 23% boundary /
+    /// 38% mid vs 50%/55% on 4 codes) because the strategy generalizes poorly.
+    /// Level-driving is a general wrong strategy, not corpus-overfit — more data
+    /// dilutes its accidental credit but does not redirect the search to the
+    /// conditional-toggle structure. Conclusion: scale, breadth, AND
+    /// data-diversity are all exhausted; the plateau is a search-algorithm /
+    /// deceptive-landscape problem. Next lever: quality-diversity (MAP-Elites).
     #[test]
     #[ignore = "multi-corpus breed (~3min); run with --release ... --nocapture"]
     fn dme_breed_random() {
