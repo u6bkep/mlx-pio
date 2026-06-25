@@ -1150,6 +1150,29 @@ mod tests {
         assert_eq!(dme_validate(&r), (0, 0), "reference must generalize to held-out data");
     }
 
+    /// RANDOM-DATA GENERATOR PIN (runs in the normal suite): the reference
+    /// encoder, run on a random corpus, reproduces its own captured output
+    /// (correctness 0), the generated golden carries the data-conditional
+    /// structure (boundaries + one mid per 1-bit), and the window is trimmed (no
+    /// trailing stall). Guards [`dme_random_golden`] — the free-data primitive.
+    #[test]
+    fn dme_random_golden_is_valid() {
+        use crate::fixtures::dme_random_golden;
+        let n = 16;
+        let (sp, golden, mask) = dme_random_golden(n, 0xC0FFEE);
+        // Reference matches its own generated golden.
+        assert_eq!(score_masked(&dme_ref(DME_H).lower(), &golden, &mask, &sp).correctness, 0);
+        // Structural: 5 boundaries/code minus the one pre-window startup edge,
+        // plus one mid per 1-bit across the random corpus.
+        let edges = golden.windows(2).filter(|w| (w[0] ^ w[1]) & 1 != 0).count();
+        let pop: u32 = sp.inputs.iter().map(|c| (c & 0x1F).count_ones()).sum();
+        assert_eq!(edges as u32, 5 * n as u32 - 1 + pop, "boundary + popcount-mid structure");
+        // Window is trimmed to the active region: the last captured cycle is a
+        // transition's settle, not a long constant tail.
+        let tail = golden.len() - 1 - golden.windows(2).rposition(|w| (w[0] ^ w[1]) & 1 != 0).unwrap();
+        assert!(tail <= DME_H as usize + 2, "window not inflated by stall (tail={tail})");
+    }
+
     /// FORK CORRECTNESS GATE (ticket 004): the PIO-only fast step (`run`, via
     /// `step_pio_only`) must produce byte-identical waveforms to the full-
     /// fidelity emulator step (`run_full`). Covers the real DME reference, the
@@ -1806,6 +1829,62 @@ mod tests {
             }
         }
         eprintln!("\nbreed@10x best edge-cost={be:.1} (breed@scale ~18) wrap {}..{}", bp.wrap_bottom, bp.wrap_top);
+        eprintln!("  [{}]", parts.join("  "));
+    }
+
+    /// MULTI-CORPUS / RANDOM-DATA (the deceptive-landscape experiment): train the
+    /// breed engine on a LARGE random corpus instead of the locked 4-code one.
+    /// Comms protocols make data free — generate it through the reference. The
+    /// question this answers: is the level-driving attractor sustained by
+    /// corpus-specific accidental credit (then a long random corpus weakens it,
+    /// and champions shift away from `out Pins`<-data), or is level-driving a
+    /// general wrong strategy (then more data doesn't change the basin and we
+    /// need a search-algorithm change, e.g. quality-diversity)? Reports edge-cost
+    /// (per active cell, so comparable across corpus length), the held-out gate,
+    /// and the champion structure. Run: `cargo test --release -- --ignored dme_breed_random --nocapture`
+    #[test]
+    #[ignore = "multi-corpus breed (~3min); run with --release ... --nocapture"]
+    fn dme_breed_random() {
+        use crate::program::Program;
+        let n_codes = 16;
+        let (sp, golden, mask) = crate::fixtures::dme_random_golden(n_codes, 0xDA7A_5EED);
+        let zsp = RunSpec { inputs: vec![0; n_codes], ..sp.clone() };
+        let boundaries = dme_edges01(&run(&dme_ref(DME_H).lower(), &zsp));
+        let total_mids: u32 = sp.inputs.iter().map(|c| (c & 0x1F).count_ones()).sum();
+        eprintln!("training on {n_codes}-code random corpus: {} golden edges ({} boundary, {total_mids} mid), {} cycles", dme_edges01(&golden).len(), boundaries.len(), golden.len());
+
+        let template = Program::empty(dme_cfg());
+        let space = crate::search::Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        let params = Params { iters: 1_200_000, ..Params::default() };
+        let mut windows = Vec::new();
+        for &(win, count) in &[(8usize, 4), (6, 4), (4, 4), (3, 4), (2, 4), (1, 6), (0, 6)] {
+            for _ in 0..count {
+                windows.push(win);
+            }
+        }
+        assert_eq!(windows.len(), 32);
+        let seeds: Vec<u64> = (0..3u64).map(|i| 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+
+        let mut best: Option<(f64, Program)> = None;
+        for &seed in &seeds {
+            let (champ, _) = crate::search::synthesize_flat_breed(&template, &space, &golden, &mask, &sp, &params, &windows, seed);
+            let cw = run(&champ, &sp);
+            let ec = edge_cost(&golden, &cw, &mask, 0);
+            let (vtrain, vheld) = crate::fixtures::dme_validate(&champ);
+            eprintln!("  seed{seed:#018x}:  [gate train={vtrain} held-out={vheld}]");
+            dme_diagnose_wave(&golden, &cw, &mask, &boundaries);
+            if best.as_ref().map_or(true, |(bc, _)| ec < *bc) {
+                best = Some((ec, champ));
+            }
+        }
+        let (be, bp) = best.unwrap();
+        let mut parts = Vec::new();
+        for i in 0..32usize {
+            if let Some(insn) = &bp.slots[i] {
+                parts.push(format!("{i}:{}", brief_insn(insn)));
+            }
+        }
+        eprintln!("\nbreed@random({n_codes} codes) best edge-cost={be:.1} wrap {}..{}", bp.wrap_bottom, bp.wrap_top);
         eprintln!("  [{}]", parts.join("  "));
     }
 

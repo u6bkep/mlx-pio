@@ -100,6 +100,33 @@ pub fn dme_golden() -> (RunSpec, Vec<u32>, Vec<u32>) {
     (sp, golden, mask)
 }
 
+/// RANDOM-DATA training set — communication protocols make labeled data free:
+/// run arbitrary inputs through the reference encoder and capture its output, so
+/// we can synthesize as much (input, golden) data as we want. Returns `(spec,
+/// golden, full_mask)` for `n_codes` random 5-bit codes drawn from `seed`, with
+/// the capture window sized to the active region (last transition + a half-bit
+/// tail) so a long constant stall can't inflate "correctness".
+///
+/// A larger, more-diverse corpus strips out the corpus-specific partial credit a
+/// champion can earn by accident — a fixed-pattern replay or a level-driven
+/// fake aligns with a *short* golden far more easily than with a long random
+/// one. The held-out [`dme_validate`] gate is the independent generalization
+/// check on top of this.
+pub fn dme_random_golden(n_codes: usize, seed: u64) -> (RunSpec, Vec<u32>, Vec<u32>) {
+    let mut rng = crate::rng::Rng::new(seed);
+    let corpus: Vec<u32> = (0..n_codes).map(|_| rng.below(32)).collect();
+    let lowered = dme_ref(DME_H).lower();
+    // Probe generously, then trim the window to the last transition + tail.
+    let probe = RunSpec { inputs: corpus.clone(), cycles: n_codes as u64 * 80 + 64, ..dme_spec(0) };
+    let full = run(&lowered, &probe);
+    let last = full.windows(2).rposition(|w| (w[0] ^ w[1]) & 1 != 0).map(|i| i + 1).unwrap_or(0);
+    let cycles = (last + DME_H as usize + 2) as u64;
+    let sp = RunSpec { inputs: corpus, cycles, ..dme_spec(0) };
+    let golden = run(&lowered, &sp);
+    let mask = vec![u32::MAX; golden.len()];
+    (sp, golden, mask)
+}
+
 /// HELD-OUT validation corpus: 4 distinct 4B/5B data codes, none of which appear
 /// in [`dme_corpus`], with a different mid-transition pattern. The search trains
 /// on `dme_corpus`; this is the generalization oracle. A program that *overfits*
