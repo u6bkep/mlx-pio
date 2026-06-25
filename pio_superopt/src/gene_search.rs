@@ -2101,6 +2101,13 @@ mod tests {
     /// {2,3,4} cells together so only a loop scores well, short lengths giving the
     /// gradient) or a generality filter (re-search a rung whose champion fails at
     /// L+1). The conjunction itself is solved.
+    ///
+    /// UPDATE: the findability window is razor-thin — L=3 from scratch ALSO stalls
+    /// (level-driving), so ONLY L=2 cracks from random. Multi-length variants (see
+    /// dme_curriculum_multilength) also stall. So the path is forced: crack at L=2,
+    /// then gently extend a LOOPY L=2 champion (low temperature so it can't jump
+    /// back to the attractor) — which needs a generality filter to pick a looping
+    /// L=2 solution, since L=2 admits non-looping ones too.
     #[test]
     #[ignore = "length-progressive curriculum (~3min); run with --release ... --nocapture"]
     fn dme_curriculum_length() {
