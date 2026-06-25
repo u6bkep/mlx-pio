@@ -1126,6 +1126,120 @@ pub fn synthesize_flat_breed(
     (p, sc)
 }
 
+/// **Breadth-first "rainbow" synthesis** — the depth-vs-breadth counterpart to
+/// [`synthesize_flat_breed`]. The island engine climbs only ~32 random starts,
+/// each very deeply; its high seed-variance on DME (the strict edge-cost swings
+/// 18–24 purely by seed) is evidence that the *starting basin* dominates the
+/// climb. This trades depth for breadth: sample a large pool of random programs,
+/// score each once (cheap — we lean on raw eval throughput), keep the best
+/// `keep_k` basins, then run a shallow anneal + polish from each. The pool is
+/// the "rainbow table" — millions of one-shot evals — and the survivors are the
+/// diverse launch points the deep engine never sees.
+///
+/// `pool_size` random starts are scored at edge-`window`; the top `keep_k` are
+/// each refined by a `params.iters` anneal then a cheap (1-opt) [`polish`].
+/// Certified by strict (window-0) edge cost; gate the winner with `dme_validate`
+/// before trusting it.
+pub fn synthesize_rainbow(
+    template: &Program,
+    space: &Space,
+    golden: &[u32],
+    mask: &[u32],
+    spec: &RunSpec,
+    params: &Params,
+    pool_size: usize,
+    keep_k: usize,
+    window: usize,
+    seed: u64,
+) -> (Program, crate::cost::Score) {
+    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).max(1);
+    let keep_k = keep_k.max(1);
+
+    // ---- Phase 1: breadth. Sample a large pool; keep the top keep_k basins. ----
+    // Each thread keeps a sorted top-keep_k of its own slice; the slices merge
+    // into the global top-keep_k. Insertion into the bounded list is O(keep_k)
+    // but only happens for the rare improver, so sampling stays eval-bound.
+    let per_thread = pool_size.div_ceil(n_threads);
+    let mut survivors: Vec<(f64, Program)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..n_threads)
+            .map(|tid| {
+                let cs = seed ^ (tid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                s.spawn(move || {
+                    let mut rng = Rng::new(cs);
+                    let mut top: Vec<(f64, Program)> = Vec::with_capacity(keep_k + 1);
+                    for _ in 0..per_thread {
+                        let p = random_program(template, space, &mut rng);
+                        let c = edge_breed_cost(&p, golden, mask, spec, params.w, window, params.densify_w);
+                        if top.len() < keep_k {
+                            let pos = top.partition_point(|x| x.0 <= c);
+                            top.insert(pos, (c, p));
+                        } else if c < top[keep_k - 1].0 {
+                            let pos = top.partition_point(|x| x.0 <= c);
+                            top.insert(pos, (c, p));
+                            top.truncate(keep_k);
+                        }
+                    }
+                    top
+                })
+            })
+            .collect();
+        let mut all: Vec<(f64, Program)> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        all.truncate(keep_k);
+        all
+    });
+
+    // ---- Phase 2: depth-lite. Shallow anneal + 1-opt polish from each basin. ----
+    let starts: Vec<Program> = survivors.drain(..).map(|(_, p)| p).collect();
+    let starts_ref = &starts;
+    let chunk = starts.len().div_ceil(n_threads).max(1);
+    let refined: Vec<(Program, f64)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..n_threads)
+            .map(|tid| {
+                let cs = seed ^ 0x0DDC0FFEE ^ (tid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                s.spawn(move || {
+                    let mut rng = Rng::new(cs);
+                    let lo = tid * chunk;
+                    let hi = ((tid + 1) * chunk).min(starts_ref.len());
+                    let mut out = Vec::new();
+                    for start in &starts_ref[lo.min(starts_ref.len())..hi] {
+                        let mut cur = start.clone();
+                        let mut cur_cost = edge_breed_cost(&cur, golden, mask, spec, params.w, window, params.densify_w);
+                        let mut best = (cur.clone(), cur_cost);
+                        for i in 0..params.iters {
+                            let t = params.t0 * (params.t_end / params.t0).powf(i as f64 / params.iters.max(1) as f64);
+                            let cand = mutate(&cur, space, false, &mut rng);
+                            let cc = edge_breed_cost(&cand, golden, mask, spec, params.w, window, params.densify_w);
+                            if cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / t).exp() {
+                                cur = cand;
+                                cur_cost = cc;
+                            }
+                            if cur_cost < best.1 {
+                                best = (cur.clone(), cur_cost);
+                            }
+                        }
+                        let p = polish_masked(&best.0, space, golden, mask, spec, params.w, false);
+                        let ec = edge_cost(golden, &run(&p, spec), mask, 0) + p.size() as f64 * 1e-6;
+                        out.push((p, ec));
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+
+    // Overall best by strict (window-0) edge cost. NOTE: a final wide (2-opt)
+    // polish is intentionally NOT applied here — at 20 slots it re-sweeps
+    // O(slots²·ops²) after every micro-improvement and runs effectively
+    // unbounded on a far-from-optimal champion. A *bounded* wider-radius polish
+    // (the "expand how far the polish checks" lever) is a separate build; this
+    // engine isolates the pure breadth effect with the per-survivor 1-opt polish.
+    let (bp, _) = refined.into_iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).expect("at least one survivor");
+    let sc = score_masked(&bp, golden, mask, spec);
+    (bp, sc)
+}
+
 // ---- meta-optimization: tune the breeding engine's hyperparameters (ticket
 // 002), modeled on mlx86's *_hyperparameters.cpp — the optimizer optimizes its
 // own knobs. Multiplicative (scale-invariant) perturbation + hard clamps; the

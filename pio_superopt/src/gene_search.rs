@@ -1750,6 +1750,52 @@ mod tests {
         eprintln!("  [{}]", parts.join("  "));
     }
 
+    /// BREADTH vs DEPTH (the rainbow experiment): same DME target and total
+    /// wall-clock ballpark as `dme_breed_scale`, but allocated breadth-first —
+    /// a huge random pool, keep the best basins, shallow-anneal + polish each.
+    /// Does sampling-dominated breadth beat 32 deep climbs? Reports the gate +
+    /// boundary/mid breakdown per seed for direct comparison to the breed engine.
+    ///
+    /// Run: `cargo test --release -- --ignored dme_rainbow --nocapture`
+    #[test]
+    #[ignore = "rainbow breadth engine (~2min); run with --release ... --nocapture"]
+    fn dme_rainbow() {
+        use crate::program::Program;
+        let (sp, golden, mask) = dme_golden();
+        let zsp = RunSpec { inputs: vec![0, 0, 0, 0], ..sp.clone() };
+        let boundaries = dme_edges01(&run(&dme_ref(DME_H).lower(), &zsp));
+
+        let template = Program::empty(dme_cfg());
+        let space = crate::search::Space { slots: 20, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        // Breadth-first budget: 4M-sample pool, keep 512 basins, 20k-iter shallow
+        // anneal each. Sampling window 4 (smooth gradient for basin selection).
+        let params = Params { iters: 20_000, ..Params::default() };
+        let (pool, keep, window) = (4_000_000usize, 512usize, 4usize);
+        let seeds: Vec<u64> = (0..3u64).map(|i| 0x5EED ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+
+        let mut best: Option<(f64, Program)> = None;
+        for &seed in &seeds {
+            let (champ, _) = crate::search::synthesize_rainbow(&template, &space, &golden, &mask, &sp, &params, pool, keep, window, seed);
+            let cw = run(&champ, &sp);
+            let ec = edge_cost(&golden, &cw, &mask, 0);
+            let (vtrain, vheld) = crate::fixtures::dme_validate(&champ);
+            eprintln!("  seed{seed:#018x}:  [gate train={vtrain} held-out={vheld}]");
+            dme_diagnose_wave(&golden, &cw, &mask, &boundaries);
+            if best.as_ref().map_or(true, |(bc, _)| ec < *bc) {
+                best = Some((ec, champ));
+            }
+        }
+        let (be, bp) = best.unwrap();
+        let mut parts = Vec::new();
+        for i in 0..32usize {
+            if let Some(insn) = &bp.slots[i] {
+                parts.push(format!("{i}:{}", brief_insn(insn)));
+            }
+        }
+        eprintln!("\nrainbow best edge-cost={be:.1} (breed@scale ~18) wrap {}..{}", bp.wrap_bottom, bp.wrap_top);
+        eprintln!("  [{}]", parts.join("  "));
+    }
+
     /// PLATEAU DIAGNOSIS: take a flat-engine champion and decompose its edge
     /// errors against golden. Golden edges are classified **boundary** (the
     /// data-independent clock — present in an all-zeros-corpus reference) vs
