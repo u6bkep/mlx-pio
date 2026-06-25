@@ -1395,6 +1395,248 @@ pub fn synthesize_curriculum_ramp(
     results.into_iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap()
 }
 
+/// Unweighted raw edge-error total for a single length-`group` of a curriculum
+/// dataset (no size term, no cost weight) — the promotion gate's currency. A
+/// frontier rung is "solved" when this falls to (or below) `solve_eps`.
+fn group_edge_errors(p: &Program, dataset: &[(RunSpec, Vec<u32>, Vec<u32>)], groups: &[usize], group: usize, spurious_w: f64) -> f64 {
+    if p.validate().is_err() {
+        return f64::INFINITY;
+    }
+    let mut total = 0.0;
+    for (i, (sp, g, m)) in dataset.iter().enumerate() {
+        if groups[i] == group {
+            total += edge_cost_w(g, &run(p, sp), m, 0, spurious_w);
+        }
+    }
+    total
+}
+
+/// The schedule **shape** meta-genome for the performance-gated curriculum ladder
+/// ([`synthesize_curriculum_gated`]). The *trigger* — advance to a longer length
+/// only once the current frontier length is solved — is structural and fixed;
+/// these are the continuous knobs the meta-tuner anneals *around* that fixed
+/// trigger. Compute scale (restarts, per-rung iters) is passed separately: it's
+/// budget, not shape.
+#[derive(Clone, Copy, Debug)]
+pub struct CurriculumHp {
+    /// Cost weight on edge-errors vs the (once-counted) size term.
+    pub w: f64,
+    /// Spurious-edge weight in [`edge_cost_w`] (<1 densifies the gradient).
+    pub densify_w: f64,
+    /// The SCRATCH (first/L=2) rung's start temperature — the from-scratch crack
+    /// of the conjunction. Hot.
+    pub t0: f64,
+    /// Every rung's end temperature.
+    pub t_end: f64,
+    /// Warm-rung **reheat**, as a fraction of the `t0..t_end` span: a promoted
+    /// (warm-started) rung restarts at `t_end + reheat·(t0 − t_end)`. reheat→1 is
+    /// a full reheat (hot enough to jump basins back to the level-driving
+    /// attractor — destroys the loop); reheat→0 is pure low-temperature
+    /// refinement (can't graft the new length's structure). The sweet spot — hot
+    /// enough to extend the loop, cold enough to keep it — is the central knob.
+    pub reheat: f64,
+    /// **Handoff** width: the newest (frontier) length's weight ramps 0→1 over
+    /// this fraction of the rung (0 = step straight to full weight). A soft
+    /// handoff introduces the new length while the rung is still hot, so the
+    /// search adapts to it instead of hitting a cost cliff at full weight.
+    pub handoff: f64,
+    /// Weight held on already-solved lengths (1 = fully anchored, never forget
+    /// the structure that solved them; <1 = let old lengths fade so the frontier
+    /// dominates the gradient).
+    pub anchor: f64,
+}
+
+impl Default for CurriculumHp {
+    fn default() -> Self {
+        CurriculumHp { w: 64.0, densify_w: 0.5, t0: 128.0, t_end: 1.0, reheat: 0.15, handoff: 0.3, anchor: 1.0 }
+    }
+}
+
+impl CurriculumHp {
+    /// Perturb one schedule knob multiplicatively, then clamp. `w` is held fixed
+    /// (it trades edge-errors against size, not schedule shape); the six tuned
+    /// fields are the temperatures, reheat, handoff, anchor, and densify.
+    pub fn perturb(&self, rng: &mut Rng) -> CurriculumHp {
+        let mut h = *self;
+        match rng.below(6) {
+            0 => h.t0 = (h.t0 * meta_mult(rng)).clamp(2.0, 8192.0),
+            1 => h.t_end = (h.t_end * meta_mult(rng)).clamp(0.05, 64.0),
+            2 => h.reheat = (h.reheat * meta_mult(rng)).clamp(0.01, 1.0),
+            3 => h.handoff = (h.handoff * meta_mult(rng)).clamp(0.02, 0.95),
+            4 => h.anchor = (h.anchor * meta_mult(rng)).clamp(0.1, 1.0),
+            _ => h.densify_w = (h.densify_w * meta_mult(rng)).clamp(0.05, 1.0),
+        }
+        if h.t_end >= h.t0 {
+            h.t_end = h.t0 * 0.5;
+        }
+        h
+    }
+}
+
+/// **Performance-gated curriculum ladder** — the generality engine. The trigger
+/// is structural: start with only the shortest length active and advance to the
+/// next length **only when the current frontier is solved** (its raw edge-errors
+/// fall to `solve_eps`), warm-starting each new rung from the previous champion.
+/// This is the decisive fix over the open-loop weight-ramp ([`synthesize_curriculum_ramp`]),
+/// which advanced longer lengths on an iteration clock regardless of whether the
+/// conjunction was assembled yet — so the search chased level-driving on the
+/// longer sequence before it had a loop. Here a length cannot flood the gradient
+/// until the prior structure exists.
+///
+/// Within a rung the temperature cools `t_start → hp.t_end` while the frontier
+/// length's weight ramps in over `hp.handoff` (already-solved lengths held at
+/// `hp.anchor`). The scratch rung starts hot (`hp.t0`); promoted rungs reheat
+/// only partway (`hp.reheat`) so they extend the loop without jumping basins.
+/// `restarts` parallel anneals run per rung; the rung champion is selected by a
+/// **generality filter** — best over all active lengths *plus one length beyond*
+/// the frontier — so that when a length admits both a general loop and a
+/// memoryless length-specific fit (both zero-cost on the frontier), the loop that
+/// also handles the next length is the one promoted. Promotion itself is judged
+/// on the frontier alone.
+///
+/// Returns `(champion, full-objective cost over every length, highest solved
+/// group +1)`. A full cost below `hp.w` with `solved == n_groups` is a general
+/// data-driven loop. All schedule shape lives in [`CurriculumHp`]; only compute
+/// budget is passed here.
+pub fn synthesize_curriculum_gated(
+    template: &Program,
+    space: &Space,
+    dataset: &[(RunSpec, Vec<u32>, Vec<u32>)],
+    groups: &[usize],
+    n_groups: usize,
+    hp: &CurriculumHp,
+    restarts: usize,
+    rung_iters: u32,
+    solve_eps: f64,
+    seed: u64,
+    mut on_rung: impl FnMut(usize, &Program, f64, bool),
+) -> (Program, f64, usize) {
+    let mut champ: Option<Program> = None;
+    let mut solved_through = 0usize; // groups [0, solved_through) are solved
+    for frontier in 0..n_groups {
+        // Selection metric (the GENERALITY FILTER): unweighted cost over every
+        // active length PLUS one length beyond the frontier. A length L admits
+        // two zero-cost basins — the general conjunction (a loop) and a memoryless
+        // length-specific fit (level-driving) — and the gated trigger can't tell
+        // them apart on the frontier alone. The lookahead group breaks the tie:
+        // the conjunction partially handles the next length, the level-driving fit
+        // fails it badly, so promotion always carries the loopy champion forward.
+        // The anneal itself never optimizes this group (its anneal weight stays 0);
+        // it only ranks which restart to promote.
+        let look = (frontier + 1).min(n_groups - 1);
+        let active_ones: Vec<f64> = (0..n_groups).map(|g| if g <= look { 1.0 } else { 0.0 }).collect();
+        let scratch = champ.is_none();
+        let t_start = if scratch { hp.t0 } else { hp.t_end + hp.reheat * (hp.t0 - hp.t_end) };
+
+        let results: Vec<(Program, f64)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..restarts.max(1))
+                .map(|r| {
+                    let cs = seed ^ ((frontier as u64) << 40) ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    let warm = champ.clone();
+                    let active_ones = &active_ones;
+                    s.spawn(move || {
+                        let mut rng = Rng::new(cs);
+                        let step = (rung_iters / 256).max(1);
+                        // Weights for the frontier rung at within-rung fraction `f`.
+                        // The handoff ramp only applies to PROMOTED rungs (easing a
+                        // new length in alongside existing structure); the scratch
+                        // rung has nothing to hand off from, so its frontier carries
+                        // full weight throughout — a sub-1 weight there would briefly
+                        // make the cost size-only and drift toward the empty program.
+                        let weights_at = |f: f64| -> Vec<f64> {
+                            let front = if scratch || hp.handoff <= 0.0 { 1.0 } else { (f / hp.handoff).min(1.0) };
+                            (0..n_groups)
+                                .map(|g| if g < frontier { hp.anchor } else if g == frontier { front } else { 0.0 })
+                                .collect::<Vec<f64>>()
+                        };
+                        let mut cur = match &warm {
+                            Some(w) => w.clone(),
+                            None => random_program(template, space, &mut rng),
+                        };
+                        let mut weights = weights_at(0.0);
+                        let mut cur_cost = weighted_multidata_cost(&cur, dataset, groups, &weights, hp.w, hp.densify_w);
+                        // Track the best by the SELECTION metric (all active lengths).
+                        let mut best = (cur.clone(), weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w));
+                        for i in 0..rung_iters {
+                            if i % step == 0 {
+                                weights = weights_at(i as f64 / rung_iters as f64);
+                                cur_cost = weighted_multidata_cost(&cur, dataset, groups, &weights, hp.w, hp.densify_w);
+                                let active = weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w);
+                                if active < best.1 {
+                                    best = (cur.clone(), active);
+                                }
+                            }
+                            let temp = t_start * (hp.t_end / t_start).powf(i as f64 / rung_iters.max(1) as f64);
+                            let cand = mutate(&cur, space, false, &mut rng);
+                            let cc = weighted_multidata_cost(&cand, dataset, groups, &weights, hp.w, hp.densify_w);
+                            if cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / temp).exp() {
+                                cur = cand;
+                                cur_cost = cc;
+                            }
+                        }
+                        let active = weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w);
+                        if active < best.1 {
+                            best = (cur, active);
+                        }
+                        best
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let (rc, _) = results.into_iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
+        let front_err = group_edge_errors(&rc, dataset, groups, frontier, hp.densify_w);
+        let solved_this = front_err <= solve_eps;
+        // Per-rung progress hook — fires as each rung completes so a long ladder
+        // streams its climb instead of going dark until the final return.
+        on_rung(frontier, &rc, front_err, solved_this);
+        champ = Some(rc);
+        if solved_this {
+            solved_through = frontier + 1;
+        } else {
+            break; // frontier unsolved — the ladder stops here
+        }
+    }
+    let c = champ.expect("at least one group");
+    let full = multidata_cost(&c, dataset, hp.w, 0, hp.densify_w);
+    (c, full, solved_through)
+}
+
+/// **Meta-anneal** over [`CurriculumHp`] — tune the gated ladder's schedule shape.
+/// Mirrors [`meta_anneal`] but over the curriculum genome and starting from a
+/// caller-supplied `seed_hp` (so the base shape / compute budget is set outside).
+/// The `eval` closure runs the ladder at a reduced budget and returns a
+/// meta-cost to MINIMIZE — for generality that should be held-out validation
+/// failures (+ a small size term), never training edge-cost, which overfits the
+/// tuner. `meta_t0`/`meta_t_end` set the meta-temperature to the eval's scale.
+pub fn meta_anneal_curriculum<F: Fn(&CurriculumHp) -> f64>(
+    seed_hp: CurriculumHp,
+    eval: F,
+    meta_iters: u32,
+    meta_t0: f64,
+    meta_t_end: f64,
+    seed: u64,
+) -> (CurriculumHp, f64) {
+    let mut rng = Rng::new(seed);
+    let mut cur = seed_hp;
+    let mut cur_cost = eval(&cur);
+    let mut best = (cur, cur_cost);
+    for i in 0..meta_iters {
+        let t = meta_t0 * (meta_t_end / meta_t0).powf(i as f64 / meta_iters.max(1) as f64);
+        let cand = cur.perturb(&mut rng);
+        let cc = eval(&cand);
+        if cc <= cur_cost || rng.unit() < (-(cc - cur_cost) / t).exp() {
+            cur = cand;
+            cur_cost = cc;
+        }
+        if cc < best.1 {
+            best = (cand, cc);
+        }
+    }
+    best
+}
+
 /// **Output-only behavior descriptor** for novelty search: the transition-density
 /// profile of the captured waveform — `n_bins` buckets over the capture window,
 /// each holding the count of bit-0 transitions that fall in it. It characterizes

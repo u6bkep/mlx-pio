@@ -2231,6 +2231,152 @@ mod tests {
         eprintln!("gate: train={vt} held-out={vh}  (0/0 == a general data-driven DME loop)");
     }
 
+    /// Build a pooled multi-length DME curriculum dataset: exhaustive sequences
+    /// (vary the first `len` bits) at each length in `lengths` while `2^len <=
+    /// cap`, else `cap` sampled sequences, each windowed to its length's boundary
+    /// grid +3. Returns `(dataset, group-tags)` where group `i` = `lengths[i]`.
+    fn dme_multilength_dataset(lengths: &[usize], cap: u64) -> (Vec<(RunSpec, Vec<u32>, Vec<u32>)>, Vec<usize>) {
+        let reff = dme_ref(DME_H).lower();
+        let gsp = RunSpec { inputs: vec![0, 0, 0, 0], cycles: 320, ..dme_spec(0) };
+        let grid: Vec<usize> = dme_edges01(&run(&reff, &gsp)).iter().map(|&(c, _)| c).collect();
+        let mut dataset: Vec<(RunSpec, Vec<u32>, Vec<u32>)> = Vec::new();
+        let mut groups: Vec<usize> = Vec::new();
+        for (gi, &len) in lengths.iter().enumerate() {
+            let win = (grid[len.min(grid.len() - 1)] + 3) as u64;
+            let exhaustive = (1u64 << len) <= cap;
+            let n = if exhaustive { 1u64 << len } else { cap };
+            let mut drng = Rng::new(0xDA7A_5EED ^ len as u64);
+            for s in 0..n {
+                let bits = if exhaustive { s } else { drng.below(1u32 << len) as u64 };
+                let sp = RunSpec { inputs: seq_words(bits, len), cycles: win, ..dme_spec(0) };
+                let g = run(&reff, &sp);
+                let m = vec![u32::MAX; g.len()];
+                dataset.push((sp, g, m));
+                groups.push(gi);
+            }
+        }
+        (dataset, groups)
+    }
+
+    /// GATED CURRICULUM LADDER (the generality engine): the structural fix for the
+    /// stalls in [`dme_curriculum_length`]/[`dme_curriculum_multilength`]. The
+    /// trigger is now PERFORMANCE, not iteration — advance to the next length only
+    /// once the current frontier is solved (raw edge-errors == 0), warm-starting
+    /// each rung from the prior champion with a PARTIAL reheat so it extends the
+    /// loop without jumping basins. This is one run of the engine with default
+    /// [`CurriculumHp`]; the schedule shape is then tuned in
+    /// [`dme_curriculum_meta_tune`]. Climbing all lengths with held-out gate 0/0 is
+    /// a general data-driven DME loop. Run: `cargo test --release -- --ignored
+    /// dme_curriculum_gated --nocapture`.
+    ///
+    /// FINDING (the wall is broken): with default HP the ladder climbs **past the
+    /// L=3 stall that defeated every prior approach**. The generality-filter
+    /// lookahead is decisive: at L=2 it promotes the conjunction restart (toggle +
+    /// conditional branch + loop) over the equally-zero-cost level-driving fit that
+    /// used to win and carry nothing upward. L=2 ✓, L=3 ✓, and crucially **L=4 ✓**
+    /// — a 4-cell window can't be unrolled in 10 slots, so a zero-error L=4
+    /// solution is a genuine data-driven LOOP (`out`-a-bit + `mov Pins,InvertPins`
+    /// toggle + `jmp Pin`/`jmp XneY` branch, wrap-looped). So the gated trigger +
+    /// per-rung partial reheat + lookahead selection is the combination that
+    /// carries the L=2 conjunction up to a general loop. Champions are general but
+    /// not yet minimal (stray `mov Pins,InvertOsr`, `out Pins`) — shape tuning
+    /// ([`dme_curriculum_meta_tune`]) is for squeezing size and robustness.
+    #[test]
+    #[ignore = "gated curriculum ladder (several min); run with --release ... --nocapture"]
+    fn dme_curriculum_gated() {
+        use crate::program::Program;
+        use crate::search::{synthesize_curriculum_gated, CurriculumHp};
+        let space = crate::search::Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        let template = Program::empty(dme_cfg());
+        let lengths: Vec<usize> = (2..=8).collect();
+        let (dataset, groups) = dme_multilength_dataset(&lengths, 32);
+        eprintln!("gated ladder: lengths {lengths:?}, {} sequences", dataset.len());
+
+        let hp = CurriculumHp::default();
+        let lens = lengths.clone();
+        let (champ, cost, solved) = synthesize_curriculum_gated(
+            &template, &space, &dataset, &groups, lengths.len(), &hp, 32, 4_000_000, 0.0, 0x5EED,
+            |frontier, rc, front_err, ok| {
+                let parts: Vec<_> = (0..space.slots as usize)
+                    .filter_map(|i| rc.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
+                    .collect();
+                eprintln!(
+                    "RUNG L={:<2} {} front_err={front_err:6.1} size={} wrap {}..{}: [{}]",
+                    lens[frontier], if ok { "SOLVED" } else { "STALL " }, rc.size(), rc.wrap_bottom, rc.wrap_top, parts.join("  ")
+                );
+            },
+        );
+        let parts: Vec<_> = (0..space.slots as usize)
+            .filter_map(|i| champ.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
+            .collect();
+        let (vt, vh) = crate::fixtures::dme_validate(&champ);
+        eprintln!(
+            "solved {solved}/{} lengths  cost={cost:.1} size={} [gate train={vt} held-out={vh}] wrap {}..{}: [{}]",
+            lengths.len(), champ.size(), champ.wrap_bottom, champ.wrap_top, parts.join("  ")
+        );
+    }
+
+    /// META-TUNE the gated ladder's SCHEDULE SHAPE. The trigger is fixed
+    /// structurally (gated); here we anneal the continuous knobs around it —
+    /// temperatures, the warm-rung reheat fraction, the frontier handoff width,
+    /// the solved-length anchor, and densify — via [`meta_anneal_curriculum`]. The
+    /// meta-objective is HELD-OUT validation failures (+ a small size term), NOT
+    /// training cost: tuning against training edge-cost overfits the tuner. Each
+    /// meta-eval runs a reduced-budget ladder up to L=4 (deep enough to exercise
+    /// generality — L=2 alone wouldn't) averaged over a couple of seeds. After the
+    /// meta-anneal, the winning HP is confirmed at full budget over lengths 2..=8.
+    /// Heavy (hours): run with `cargo test --release -- --ignored
+    /// dme_curriculum_meta_tune --nocapture`.
+    #[test]
+    #[ignore = "meta-tune of the gated curriculum schedule (HOURS); run with --release ... --nocapture"]
+    fn dme_curriculum_meta_tune() {
+        use crate::program::Program;
+        use crate::search::{meta_anneal_curriculum, synthesize_curriculum_gated, CurriculumHp};
+        let space = crate::search::Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        let template = Program::empty(dme_cfg());
+
+        // Mini-trial: ladder up to L=4 at reduced budget, scored by held-out gate.
+        let mini_lengths: Vec<usize> = (2..=4).collect();
+        let (ds_mini, grp_mini) = dme_multilength_dataset(&mini_lengths, 32);
+        let (mini_restarts, mini_iters, eval_seeds) = (16usize, 1_500_000u32, 2u64);
+
+        let eval = |hp: &CurriculumHp| -> f64 {
+            let mut acc = 0.0;
+            for sd in 0..eval_seeds {
+                let (champ, _cost, _solved) = synthesize_curriculum_gated(
+                    &template, &space, &ds_mini, &grp_mini, mini_lengths.len(), hp, mini_restarts, mini_iters, 0.0, 0xACE_5EED ^ sd,
+                    |_, _, _, _| {},
+                );
+                let (_vt, vh) = crate::fixtures::dme_validate(&champ);
+                acc += vh as f64 + 0.01 * champ.size() as f64;
+            }
+            acc / eval_seeds as f64
+        };
+
+        let meta_iters = 40u32;
+        let (best, mcost) = meta_anneal_curriculum(CurriculumHp::default(), eval, meta_iters, 30.0, 1.0, 0xB17_7000);
+        eprintln!("\nmeta-best (meta-cost {mcost:.2}): {best:?}");
+
+        // Confirm the winning schedule at full budget on the full ladder.
+        let lengths: Vec<usize> = (2..=8).collect();
+        let (dataset, groups) = dme_multilength_dataset(&lengths, 32);
+        let lens = lengths.clone();
+        let (champ, cost, solved) = synthesize_curriculum_gated(
+            &template, &space, &dataset, &groups, lengths.len(), &best, 32, 4_000_000, 0.0, 0x5EED,
+            |frontier, rc, front_err, ok| {
+                eprintln!("RUNG L={:<2} {} front_err={front_err:6.1} size={}", lens[frontier], if ok { "SOLVED" } else { "STALL " }, rc.size());
+            },
+        );
+        let parts: Vec<_> = (0..space.slots as usize)
+            .filter_map(|i| champ.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
+            .collect();
+        let (vt, vh) = crate::fixtures::dme_validate(&champ);
+        eprintln!(
+            "CONFIRM solved {solved}/{} lengths  cost={cost:.1} size={} [gate train={vt} held-out={vh}]: [{}]",
+            lengths.len(), champ.size(), parts.join("  ")
+        );
+    }
+
     /// PLATEAU DIAGNOSIS: take a flat-engine champion and decompose its edge
     /// errors against golden. Golden edges are classified **boundary** (the
     /// data-independent clock — present in an all-zeros-corpus reference) vs
