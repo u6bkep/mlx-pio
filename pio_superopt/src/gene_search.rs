@@ -2081,17 +2081,26 @@ mod tests {
     /// and does a clean data-driven loop emerge? Run with `--ignored
     /// dme_curriculum_length --nocapture`.
     ///
-    /// FINDING: the testbed works mechanically but the ladder breaks at the first
-    /// rung. L=1 SOLVES — but its champion is pure level-driving (`mov
-    /// Pins,InvertOsr`): at a SINGLE cell, pin-follows-data is a *valid* solution,
-    /// so L=1 rewards the attractor rather than forcing the conditional toggle.
-    /// L=2 then STALLS (differential carry makes level-driving fail), and the
-    /// search can't assemble the read+branch+toggle conjunction — not in 20 slots,
-    /// not even in 10. Multi-data scoring (forces conditionality, kills the
-    /// attractor over >1 cell) and a small slot budget (shrinks the space) are
-    /// both necessary but together still NOT sufficient: stochastic point-mutation
-    /// search does not find this conjunction from scratch at L=2. The recurring
-    /// wall across the whole session is the conjunction assembly itself.
+    /// FINDING (BREAKTHROUGH): skipping L=1 (where level-driving is a *valid*
+    /// single-cell solution and poisons the warm-start) and scoring L=2 from
+    /// scratch CRACKS the conjunction — for the first time the search assembles
+    /// `mov X,Osr` (read) + `jmp XPostDec` (branch) + `mov Pins,InvertPins`
+    /// (toggle) + a loop, and solves all 4 two-bit sequences exactly. So
+    /// multi-data scoring (forces conditionality + makes the toggle output-visible)
+    /// + a small slot budget (shrinks the space) + starting where level-driving is
+    /// INVALID (L>=2) is the combination that finds it. The conjunction is NOT an
+    /// unconditional wall.
+    ///
+    /// REMAINING (Goldilocks): the ladder doesn't yet climb. L=2 has room for a
+    /// NON-general (2-cell-specific, non-looping) solution, which the search may
+    /// settle on (whichever hits 0 first), and that warm-start carries nothing to
+    /// L=3 -> stall. Forcing a loop by starting higher (L=4: 4 cells can't unroll
+    /// in 10 slots) makes solutions general but is unfindable from scratch (falls
+    /// back to level-driving). The open problem is purely carrying a *general*
+    /// solution up: candidate fixes are multi-LENGTH scoring in one stage (score
+    /// {2,3,4} cells together so only a loop scores well, short lengths giving the
+    /// gradient) or a generality filter (re-search a rung whose champion fails at
+    /// L+1). The conjunction itself is solved.
     #[test]
     #[ignore = "length-progressive curriculum (~3min); run with --release ... --nocapture"]
     fn dme_curriculum_length() {
@@ -2108,10 +2117,16 @@ mod tests {
         let space = crate::search::Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
         let template = Program::empty(dme_cfg());
         let params = Params::default();
-        let (cap, restarts, iters, max_l) = (32u64, 24usize, 800_000u32, 14usize);
+        let (cap, restarts, iters, max_l) = (32u64, 32usize, 4_000_000u32, 14usize);
 
+        // Skip L=1: at a single cell level-driving is a VALID solution, so L=1
+        // rewards the attractor and poisons the warm-start. Start at L=2, where
+        // differential carry makes level-driving fail — the first stage runs from
+        // scratch (champ=None), giving multi-data + small slots an unpoisoned shot
+        // at the conjunction. Later stages warm-start from a *real* structure.
+        let start_l = 2usize;
         let mut champ: Option<Program> = None;
-        for l in 1..=max_l {
+        for l in start_l..=max_l {
             let win = (grid[l.min(grid.len() - 1)] + 3) as u64;
             let exhaustive = (1u64 << l) <= cap;
             let n = if exhaustive { 1u64 << l } else { cap };
