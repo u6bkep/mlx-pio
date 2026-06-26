@@ -2294,39 +2294,74 @@ mod tests {
     /// multi-word generality. Fixing this is a testbed-design choice (enable
     /// autopull so `out` refills in hardware, vs. extend the curriculum past word
     /// boundaries so the loop must learn its own refill), not a schedule knob.
+    ///
+    /// CONFIG-GENE EXPERIMENT (negative result): opening SM config as search genes
+    /// — to let the optimizer DISCOVER the refill instead of hard-coding it —
+    /// degrades the search monotonically with the number of genes opened. Fixed
+    /// config solves L=2..5 (stalls L=6); +autopull+pull_threshold STALLS at L=5
+    /// (3/7, converging to the misaligned `ap=true pt=4` that drops a data bit);
+    /// +clkdiv STALLS at L=2 (0/7, `div=2` can't even crack the conjunction). The
+    /// cause: config genes add search dimensions with NO fitness gradient at the
+    /// curriculum's dominant short (single-word) lengths, where the hard work
+    /// (conjunction crack, single-word loop) happens — and the only correct values
+    /// are needles (`pull_threshold=5` of 32, `clkdiv=1`) surrounded by bad values
+    /// the search wanders into. The pressure that would SELECT the right config
+    /// (multi-word) only appears at L>=6, too late. So broad config search is the
+    /// wrong tool here. Productive alternatives: (a) pin threshold=5, search ONLY
+    /// the autopull BIT (a 1-bit flip the L=6 anneal can make under pressure); (b)
+    /// FIX autopull=true and confirm the loop logic reaches held-out 0/0; (c) fix
+    /// config, extend the curriculum past several word boundaries so the search
+    /// discovers an in-loop pull in the PROGRAM (mechanism, not config crutch).
     #[test]
     #[ignore = "gated curriculum ladder (several min); run with --release ... --nocapture"]
     fn dme_curriculum_gated() {
         use crate::program::Program;
-        use crate::search::{synthesize_curriculum_gated, CurriculumHp};
-        let space = crate::search::Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: crate::search::Genes::default() };
+        use crate::search::{synthesize_curriculum_gated, CurriculumHp, Genes, Space};
         let template = Program::empty(dme_cfg());
         let lengths: Vec<usize> = (2..=8).collect();
         let (dataset, groups) = dme_multilength_dataset(&lengths, 32);
-        eprintln!("gated ladder: lengths {lengths:?}, {} sequences", dataset.len());
-
         let hp = CurriculumHp::default();
-        let lens = lengths.clone();
-        let (champ, cost, solved) = synthesize_curriculum_gated(
-            &template, &space, &dataset, &groups, lengths.len(), &hp, 32, 4_000_000, 0.0, 0x5EED,
-            |frontier, rc, front_err, ok| {
-                let parts: Vec<_> = (0..space.slots as usize)
-                    .filter_map(|i| rc.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
-                    .collect();
-                eprintln!(
-                    "RUNG L={:<2} {} front_err={front_err:6.1} size={} wrap {}..{}: [{}]",
-                    lens[frontier], if ok { "SOLVED" } else { "STALL " }, rc.size(), rc.wrap_bottom, rc.wrap_top, parts.join("  ")
-                );
-            },
-        );
-        let parts: Vec<_> = (0..space.slots as usize)
-            .filter_map(|i| champ.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
-            .collect();
-        let (vt, vh) = crate::fixtures::dme_validate(&champ);
-        eprintln!(
-            "solved {solved}/{} lengths  cost={cost:.1} size={} [gate train={vt} held-out={vh}] wrap {}..{}: [{}]",
-            lengths.len(), champ.size(), champ.wrap_bottom, champ.wrap_top, parts.join("  ")
-        );
+
+        // Make SM config part of the genome so the search DISCOVERS the refill
+        // mechanism instead of us hard-coding it (the word-boundary fix). Config A
+        // opens autopull + pull_threshold (the data-flow knobs that govern the
+        // OSR refill across 5-bit words); B additionally opens clkdiv to see
+        // whether trading explicit delays for clock division yields novel
+        // solutions. out_dir stays fixed (it's the protocol's bit order).
+        let configs: Vec<(&str, Genes)> = vec![
+            ("A:autopull+thresh", Genes { autopull: true, pull_threshold: true, ..Genes::default() }),
+            ("B:+clkdiv", Genes { autopull: true, pull_threshold: true, clkdiv: true, ..Genes::default() }),
+        ];
+
+        for (label, genes) in configs {
+            let space = Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes };
+            eprintln!("\n=== {label} === gated ladder lengths {lengths:?}, {} sequences, genes {genes:?}", dataset.len());
+            let lens = lengths.clone();
+            let lbl = label;
+            let (champ, cost, solved) = synthesize_curriculum_gated(
+                &template, &space, &dataset, &groups, lengths.len(), &hp, 32, 4_000_000, 0.0, 0x5EED,
+                |frontier, rc, front_err, ok| {
+                    let parts: Vec<_> = (0..space.slots as usize)
+                        .filter_map(|i| rc.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
+                        .collect();
+                    eprintln!(
+                        "{lbl} RUNG L={:<2} {} front_err={front_err:6.1} size={} cfg[ap={} pt={} div={}/{}] wrap {}..{}: [{}]",
+                        lens[frontier], if ok { "SOLVED" } else { "STALL " }, rc.size(),
+                        rc.config.shift.autopull, rc.config.shift.pull_threshold, rc.config.clkdiv_int, rc.config.clkdiv_frac,
+                        rc.wrap_bottom, rc.wrap_top, parts.join("  ")
+                    );
+                },
+            );
+            let parts: Vec<_> = (0..space.slots as usize)
+                .filter_map(|i| champ.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
+                .collect();
+            let (vt, vh) = crate::fixtures::dme_validate(&champ);
+            eprintln!(
+                "{label} DONE solved {solved}/{} cost={cost:.1} size={} cfg[ap={} pt={} div={}/{}] [gate train={vt} held-out={vh}] wrap {}..{}: [{}]",
+                lengths.len(), champ.size(), champ.config.shift.autopull, champ.config.shift.pull_threshold,
+                champ.config.clkdiv_int, champ.config.clkdiv_frac, champ.wrap_bottom, champ.wrap_top, parts.join("  ")
+            );
+        }
     }
 
     /// META-TUNE the gated ladder's SCHEDULE SHAPE. The trigger is fixed
