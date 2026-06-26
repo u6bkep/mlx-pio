@@ -2248,7 +2248,17 @@ mod tests {
             let mut drng = Rng::new(0xDA7A_5EED ^ len as u64);
             for s in 0..n {
                 let bits = if exhaustive { s } else { drng.below(1u32 << len) as u64 };
-                let sp = RunSpec { inputs: seq_words(bits, len), cycles: win, ..dme_spec(0) };
+                // Keep the FIFO FED: append spare symbols past the `len` cells the
+                // window scores. This is the real DME operating condition (the FIFO
+                // is continuously fed), and it lets autopull's prefetch — which
+                // fetches the next word as the threshold-th bit shifts out — always
+                // find a word at a 5-bit boundary instead of starving. The window
+                // (grid[len]+3) captures only the first `len` cells, and the golden
+                // is generated on the SAME padded input, so the padding never
+                // affects the score; it just feeds the prefetch.
+                let mut inputs = seq_words(bits, len);
+                inputs.extend_from_slice(&[0, 0]);
+                let sp = RunSpec { inputs, cycles: win, ..dme_spec(0) };
                 let g = run(&reff, &sp);
                 let m = vec![u32::MAX; g.len()];
                 dataset.push((sp, g, m));
@@ -2256,6 +2266,42 @@ mod tests {
             }
         }
         (dataset, groups)
+    }
+
+    /// Run one gated-ladder phase with FIXED config (`genes` off): build the
+    /// multi-length dataset, climb, stream a labeled `RUNG` marker per rung, and
+    /// print the held-out gate on the final champion. Shared by the gated test's
+    /// phases (autopull-on confirmation, in-loop-pull discovery).
+    fn run_gated_ladder(label: &str, template: &Program, lengths: &[usize], hp: &crate::search::CurriculumHp) {
+        use crate::search::{synthesize_curriculum_gated, Genes, Space};
+        let space = Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: Genes::default() };
+        let (dataset, groups) = dme_multilength_dataset(lengths, 32);
+        eprintln!(
+            "\n=== {label} === lengths {lengths:?} ({} seqs), config autopull={} threshold={}",
+            dataset.len(), template.config.shift.autopull, template.config.shift.pull_threshold
+        );
+        let lens = lengths.to_vec();
+        let lbl = label;
+        let (champ, cost, solved) = synthesize_curriculum_gated(
+            template, &space, &dataset, &groups, lengths.len(), hp, 32, 4_000_000, 0.0, 0x5EED,
+            |frontier, rc, front_err, ok| {
+                let parts: Vec<_> = (0..space.slots as usize)
+                    .filter_map(|i| rc.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
+                    .collect();
+                eprintln!(
+                    "{lbl} RUNG L={:<2} {} front_err={front_err:6.1} size={} wrap {}..{}: [{}]",
+                    lens[frontier], if ok { "SOLVED" } else { "STALL " }, rc.size(), rc.wrap_bottom, rc.wrap_top, parts.join("  ")
+                );
+            },
+        );
+        let parts: Vec<_> = (0..space.slots as usize)
+            .filter_map(|i| champ.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
+            .collect();
+        let (vt, vh) = crate::fixtures::dme_validate(&champ);
+        eprintln!(
+            "{label} DONE solved {solved}/{} cost={cost:.1} size={} [gate train={vt} held-out={vh}] wrap {}..{}: [{}]",
+            lengths.len(), champ.size(), champ.wrap_bottom, champ.wrap_top, parts.join("  ")
+        );
     }
 
     /// GATED CURRICULUM LADDER (the generality engine): the structural fix for the
@@ -2312,56 +2358,42 @@ mod tests {
     /// FIX autopull=true and confirm the loop logic reaches held-out 0/0; (c) fix
     /// config, extend the curriculum past several word boundaries so the search
     /// discovers an in-loop pull in the PROGRAM (mechanism, not config crutch).
+    ///
+    /// AUTOPULL EXPERIMENTS (autopull fights the search, even fixed): tried fixing
+    /// autopull=true (instruction-minimal: it drops the explicit `pull` + the
+    /// OSR-empty check). Three outcomes, all worse than autopull-off: (1) fixed
+    /// autopull, exact-length data — solves L=2..4 but STALLS at L=5, because
+    /// autopull eagerly prefetches the next word as the 5th bit shifts out and the
+    /// dataset only pushed ceil(L/5) words, so the prefetch starves at the word
+    /// boundary. (2) Fixed autopull + the FIFO kept fed (dataset padded with spare
+    /// symbols past the window) — fixes the starve but STALLS at L=2 (0/13): can't
+    /// even crack the conjunction. (3) [earlier] autopull as a search gene —
+    /// monotone worse. Hypothesis (fits all three): a DOUBLE-CONSUME conflict — the
+    /// search builds the conjunction from explicit `pull`/`out X,1` reads, and
+    /// autopull's automatic consume races them and desyncs the data stream, so no
+    /// stable conjunction assembles. autopull-off has no such race and is the only
+    /// reliable search config. Resolution (planned): SEARCH with autopull off, then
+    /// a deterministic END config-polish — flip autopull on and delete the now-
+    /// redundant pull/OSR-empty instructions, re-validating each removal against the
+    /// gate — to capture the instruction saving without the search fighting autopull.
+    /// The FIFO-fed padding lives in `dme_multilength_dataset` (harmless with
+    /// autopull off; required if autopull is retried).
     #[test]
     #[ignore = "gated curriculum ladder (several min); run with --release ... --nocapture"]
     fn dme_curriculum_gated() {
         use crate::program::Program;
-        use crate::search::{synthesize_curriculum_gated, CurriculumHp, Genes, Space};
-        let template = Program::empty(dme_cfg());
-        let lengths: Vec<usize> = (2..=8).collect();
-        let (dataset, groups) = dme_multilength_dataset(&lengths, 32);
+        use crate::search::CurriculumHp;
         let hp = CurriculumHp::default();
 
-        // Make SM config part of the genome so the search DISCOVERS the refill
-        // mechanism instead of us hard-coding it (the word-boundary fix). Config A
-        // opens autopull + pull_threshold (the data-flow knobs that govern the
-        // OSR refill across 5-bit words); B additionally opens clkdiv to see
-        // whether trading explicit delays for clock division yields novel
-        // solutions. out_dir stays fixed (it's the protocol's bit order).
-        let configs: Vec<(&str, Genes)> = vec![
-            ("A:autopull+thresh", Genes { autopull: true, pull_threshold: true, ..Genes::default() }),
-            ("B:+clkdiv", Genes { autopull: true, pull_threshold: true, clkdiv: true, ..Genes::default() }),
-        ];
-
-        for (label, genes) in configs {
-            let space = Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes };
-            eprintln!("\n=== {label} === gated ladder lengths {lengths:?}, {} sequences, genes {genes:?}", dataset.len());
-            let lens = lengths.clone();
-            let lbl = label;
-            let (champ, cost, solved) = synthesize_curriculum_gated(
-                &template, &space, &dataset, &groups, lengths.len(), &hp, 32, 4_000_000, 0.0, 0x5EED,
-                |frontier, rc, front_err, ok| {
-                    let parts: Vec<_> = (0..space.slots as usize)
-                        .filter_map(|i| rc.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
-                        .collect();
-                    eprintln!(
-                        "{lbl} RUNG L={:<2} {} front_err={front_err:6.1} size={} cfg[ap={} pt={} div={}/{}] wrap {}..{}: [{}]",
-                        lens[frontier], if ok { "SOLVED" } else { "STALL " }, rc.size(),
-                        rc.config.shift.autopull, rc.config.shift.pull_threshold, rc.config.clkdiv_int, rc.config.clkdiv_frac,
-                        rc.wrap_bottom, rc.wrap_top, parts.join("  ")
-                    );
-                },
-            );
-            let parts: Vec<_> = (0..space.slots as usize)
-                .filter_map(|i| champ.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
-                .collect();
-            let (vt, vh) = crate::fixtures::dme_validate(&champ);
-            eprintln!(
-                "{label} DONE solved {solved}/{} cost={cost:.1} size={} cfg[ap={} pt={} div={}/{}] [gate train={vt} held-out={vh}] wrap {}..{}: [{}]",
-                lengths.len(), champ.size(), champ.config.shift.autopull, champ.config.shift.pull_threshold,
-                champ.config.clkdiv_int, champ.config.clkdiv_frac, champ.wrap_bottom, champ.wrap_top, parts.join("  ")
-            );
-        }
+        // autopull OFF — the only config the SEARCH handles reliably (see the
+        // autopull findings in this test's doc-comment: autopull's automatic
+        // FIFO consume races the search's explicit `pull`/`out` reads and
+        // destabilizes the conjunction crack). Extend the curriculum past both
+        // word boundaries (L=6 at bit 5, L=11 at bit 10) so the search must
+        // DISCOVER an in-loop pull. The instruction-saving autopull form is a
+        // separate END-of-search config-polish, not a search the conjunction
+        // has to survive.
+        run_gated_ladder("inloop-pull", &Program::empty(dme_cfg()), &(2..=14).collect::<Vec<_>>(), &hp);
     }
 
     /// META-TUNE the gated ladder's SCHEDULE SHAPE. The trigger is fixed
