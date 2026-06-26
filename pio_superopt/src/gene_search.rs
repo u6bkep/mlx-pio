@@ -2281,6 +2281,19 @@ mod tests {
     /// carries the L=2 conjunction up to a general loop. Champions are general but
     /// not yet minimal (stray `mov Pins,InvertOsr`, `out Pins`) — shape tuning
     /// ([`dme_curriculum_meta_tune`]) is for squeezing size and robustness.
+    ///
+    /// UPDATE (the real ceiling is a WORD BOUNDARY, not the schedule): the ladder
+    /// reliably solves L=2..5 but **stalls at L=6**, and the cause is the testbed,
+    /// not tuning. `dme_cfg` has `pull_threshold=5, autopull=false`, and champions
+    /// place a single `pull` OUTSIDE the loop — so the loop drives bits from ONE
+    /// 5-bit OSR word, and after 5 shifts the empty OSR yields zeros. Lengths 2..5
+    /// all fit in that one word, so the curriculum never exercises a refill; L=6 is
+    /// the first length crossing into a 2nd word, needing an in-loop pull the
+    /// search was never pressured to find. So the champions are "single-word
+    /// general", and the held-out gate (4 codes = 20 bits = 4 words) needs full
+    /// multi-word generality. Fixing this is a testbed-design choice (enable
+    /// autopull so `out` refills in hardware, vs. extend the curriculum past word
+    /// boundaries so the loop must learn its own refill), not a schedule knob.
     #[test]
     #[ignore = "gated curriculum ladder (several min); run with --release ... --nocapture"]
     fn dme_curriculum_gated() {

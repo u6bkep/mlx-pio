@@ -1525,6 +1525,25 @@ pub fn synthesize_curriculum_gated(
         // it only ranks which restart to promote.
         let look = (frontier + 1).min(n_groups - 1);
         let active_ones: Vec<f64> = (0..n_groups).map(|g| if g <= look { 1.0 } else { 0.0 }).collect();
+
+        // Early-promote: once a champion is a genuine loop it already solves every
+        // longer length, so re-annealing the full per-rung budget at each higher
+        // rung is pure waste — if the warm-start already clears the frontier, carry
+        // it up instantly. Gate on the frontier ALONE (not frontier+1): a fragile
+        // near-loop that passes a length without generalizing is self-correcting —
+        // it gets early-promoted one rung, then fails the next frontier and falls
+        // through to a fresh anneal. Gating on the lookahead instead would block the
+        // cascade entirely, since these champions verify general one length at a
+        // time, so every rung would re-anneal. Quality is already protected by the
+        // lookahead in rung SELECTION; this is purely the carry-forward speedup.
+        if let Some(w) = &champ {
+            let fe = group_edge_errors(w, dataset, groups, frontier, hp.densify_w);
+            if fe <= solve_eps {
+                on_rung(frontier, w, fe, true);
+                solved_through = frontier + 1;
+                continue;
+            }
+        }
         let scratch = champ.is_none();
         let t_start = if scratch { hp.t0 } else { hp.t_end + hp.reheat * (hp.t0 - hp.t_end) };
 
