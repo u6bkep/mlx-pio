@@ -2235,7 +2235,17 @@ mod tests {
     /// (vary the first `len` bits) at each length in `lengths` while `2^len <=
     /// cap`, else `cap` sampled sequences, each windowed to its length's boundary
     /// grid +3. Returns `(dataset, group-tags)` where group `i` = `lengths[i]`.
-    fn dme_multilength_dataset(lengths: &[usize], cap: u64) -> (Vec<(RunSpec, Vec<u32>, Vec<u32>)>, Vec<usize>) {
+    ///
+    /// `pad` appends two spare `0` symbols past the scored window to keep the FIFO
+    /// FED. This is REQUIRED for any autopull retry (autopull's prefetch fetches the
+    /// next word as the threshold-th bit shifts out and starves at a word boundary
+    /// without spare symbols), but it BREAKS the autopull-off conjunction crack that
+    /// the gated ladder relies on, so autopull-off callers must pass `false`.
+    /// A/B (same seed 0x5EED, 32 restarts, 4M iters): padded stalls at L=2 (0/13,
+    /// front_err=1.5) — can't even crack the conjunction; unpadded solves L=2..5 and
+    /// stalls at L=6 (front_err=63). Why padding poisons the autopull-off crack is
+    /// unexplained; keep the knob for future autopull experiments but default it off.
+    fn dme_multilength_dataset(lengths: &[usize], cap: u64, pad: bool) -> (Vec<(RunSpec, Vec<u32>, Vec<u32>)>, Vec<usize>) {
         let reff = dme_ref(DME_H).lower();
         let gsp = RunSpec { inputs: vec![0, 0, 0, 0], cycles: 320, ..dme_spec(0) };
         let grid: Vec<usize> = dme_edges01(&run(&reff, &gsp)).iter().map(|&(c, _)| c).collect();
@@ -2248,16 +2258,18 @@ mod tests {
             let mut drng = Rng::new(0xDA7A_5EED ^ len as u64);
             for s in 0..n {
                 let bits = if exhaustive { s } else { drng.below(1u32 << len) as u64 };
-                // Keep the FIFO FED: append spare symbols past the `len` cells the
-                // window scores. This is the real DME operating condition (the FIFO
-                // is continuously fed), and it lets autopull's prefetch — which
-                // fetches the next word as the threshold-th bit shifts out — always
-                // find a word at a 5-bit boundary instead of starving. The window
-                // (grid[len]+3) captures only the first `len` cells, and the golden
-                // is generated on the SAME padded input, so the padding never
-                // affects the score; it just feeds the prefetch.
+                // Optionally keep the FIFO FED: append spare symbols past the `len`
+                // cells the window scores. The window (grid[len]+3) captures only
+                // the first `len` cells and the golden is generated on the SAME
+                // padded input, so padding never changes the score — it only feeds
+                // autopull's prefetch (which fetches the next word as the
+                // threshold-th bit shifts out and would otherwise starve at a word
+                // boundary). REQUIRED for autopull retries; breaks the autopull-off
+                // conjunction crack, so autopull-off callers pass `pad = false`.
                 let mut inputs = seq_words(bits, len);
-                inputs.extend_from_slice(&[0, 0]);
+                if pad {
+                    inputs.extend_from_slice(&[0, 0]);
+                }
                 let sp = RunSpec { inputs, cycles: win, ..dme_spec(0) };
                 let g = run(&reff, &sp);
                 let m = vec![u32::MAX; g.len()];
@@ -2275,7 +2287,7 @@ mod tests {
     fn run_gated_ladder(label: &str, template: &Program, lengths: &[usize], hp: &crate::search::CurriculumHp) {
         use crate::search::{synthesize_curriculum_gated, Genes, Space};
         let space = Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: Genes::default() };
-        let (dataset, groups) = dme_multilength_dataset(lengths, 32);
+        let (dataset, groups) = dme_multilength_dataset(lengths, 32, false);
         eprintln!(
             "\n=== {label} === lengths {lengths:?} ({} seqs), config autopull={} threshold={}",
             dataset.len(), template.config.shift.autopull, template.config.shift.pull_threshold
@@ -2361,23 +2373,31 @@ mod tests {
     ///
     /// AUTOPULL EXPERIMENTS (autopull fights the search, even fixed): tried fixing
     /// autopull=true (instruction-minimal: it drops the explicit `pull` + the
-    /// OSR-empty check). Three outcomes, all worse than autopull-off: (1) fixed
-    /// autopull, exact-length data — solves L=2..4 but STALLS at L=5, because
-    /// autopull eagerly prefetches the next word as the 5th bit shifts out and the
-    /// dataset only pushed ceil(L/5) words, so the prefetch starves at the word
-    /// boundary. (2) Fixed autopull + the FIFO kept fed (dataset padded with spare
-    /// symbols past the window) — fixes the starve but STALLS at L=2 (0/13): can't
-    /// even crack the conjunction. (3) [earlier] autopull as a search gene —
-    /// monotone worse. Hypothesis (fits all three): a DOUBLE-CONSUME conflict — the
-    /// search builds the conjunction from explicit `pull`/`out X,1` reads, and
-    /// autopull's automatic consume races them and desyncs the data stream, so no
-    /// stable conjunction assembles. autopull-off has no such race and is the only
-    /// reliable search config. Resolution (planned): SEARCH with autopull off, then
-    /// a deterministic END config-polish — flip autopull on and delete the now-
-    /// redundant pull/OSR-empty instructions, re-validating each removal against the
-    /// gate — to capture the instruction saving without the search fighting autopull.
-    /// The FIFO-fed padding lives in `dme_multilength_dataset` (harmless with
-    /// autopull off; required if autopull is retried).
+    /// OSR-empty check). Three outcomes: (1) fixed autopull, exact-length data —
+    /// solves L=2..4 but STALLS at L=5, because autopull eagerly prefetches the next
+    /// word as the 5th bit shifts out and the dataset only pushed ceil(L/5) words,
+    /// so the prefetch starves at the word boundary. (2) Fixed autopull + the FIFO
+    /// kept fed (dataset padded with spare symbols past the window) — STALLED at L=2
+    /// (0/13). (3) [earlier] autopull as a search gene — monotone worse. The old
+    /// DOUBLE-CONSUME hypothesis (autopull's automatic consume races the search's
+    /// explicit `pull`/`out X,1` reads and desyncs the stream) rested on outcome (2).
+    ///
+    /// CORRECTION (2026-07-03): outcome (2) is CONFOUNDED and the double-consume
+    /// hypothesis is UNSUPPORTED. The FIFO-fed padding was itself a regression: an
+    /// A/B on the AUTOPULL-OFF ladder (same seed 0x5EED, 32 restarts, 4M iters)
+    /// showed padding ALONE stalls L=2 at 0/13 (front_err=1.5), while removing only
+    /// the padding solves L=2..5 and stalls at L=6 (front_err=63). So the L=2 stall
+    /// in outcome (2) is the padding signature, not an autopull effect — autopull
+    /// WITH a fed FIFO was never cleanly tested, and its result is UNKNOWN, not
+    /// negative. autopull-off (unpadded) remains the reliable search config on the
+    /// evidence, but the reason is no longer "autopull races the reads"; that story
+    /// is retracted. A clean autopull retry needs the padding (see
+    /// `dme_multilength_dataset`'s `pad` flag) AND a way to crack the conjunction
+    /// that padding otherwise blocks — an open question. Resolution (planned): SEARCH
+    /// with autopull off, then a deterministic END config-polish — flip autopull on
+    /// and delete the now-redundant pull/OSR-empty instructions, re-validating each
+    /// removal against the gate — to capture the instruction saving without the
+    /// search fighting autopull.
     #[test]
     #[ignore = "gated curriculum ladder (several min); run with --release ... --nocapture"]
     fn dme_curriculum_gated() {
@@ -2385,10 +2405,10 @@ mod tests {
         use crate::search::CurriculumHp;
         let hp = CurriculumHp::default();
 
-        // autopull OFF — the only config the SEARCH handles reliably (see the
-        // autopull findings in this test's doc-comment: autopull's automatic
-        // FIFO consume races the search's explicit `pull`/`out` reads and
-        // destabilizes the conjunction crack). Extend the curriculum past both
+        // autopull OFF — the config the SEARCH handles reliably on current
+        // evidence (see the autopull findings in this test's doc-comment; note
+        // the CORRECTION: the old "autopull races the reads" explanation is
+        // retracted, and a clean autopull retry is untested). Extend the curriculum past both
         // word boundaries (L=6 at bit 5, L=11 at bit 10) so the search must
         // DISCOVER an in-loop pull. The instruction-saving autopull form is a
         // separate END-of-search config-polish, not a search the conjunction
@@ -2417,7 +2437,7 @@ mod tests {
 
         // Mini-trial: ladder up to L=4 at reduced budget, scored by held-out gate.
         let mini_lengths: Vec<usize> = (2..=4).collect();
-        let (ds_mini, grp_mini) = dme_multilength_dataset(&mini_lengths, 32);
+        let (ds_mini, grp_mini) = dme_multilength_dataset(&mini_lengths, 32, false);
         let (mini_restarts, mini_iters, eval_seeds) = (16usize, 1_500_000u32, 2u64);
 
         let eval = |hp: &CurriculumHp| -> f64 {
@@ -2439,7 +2459,7 @@ mod tests {
 
         // Confirm the winning schedule at full budget on the full ladder.
         let lengths: Vec<usize> = (2..=8).collect();
-        let (dataset, groups) = dme_multilength_dataset(&lengths, 32);
+        let (dataset, groups) = dme_multilength_dataset(&lengths, 32, false);
         let lens = lengths.clone();
         let (champ, cost, solved) = synthesize_curriculum_gated(
             &template, &space, &dataset, &groups, lengths.len(), &best, 32, 4_000_000, 0.0, 0x5EED,
