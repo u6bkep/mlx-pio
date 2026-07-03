@@ -1487,12 +1487,23 @@ impl CurriculumHp {
 /// length's weight ramps in over `hp.handoff` (already-solved lengths held at
 /// `hp.anchor`). The scratch rung starts hot (`hp.t0`); promoted rungs reheat
 /// only partway (`hp.reheat`) so they extend the loop without jumping basins.
-/// `restarts` parallel anneals run per rung; the rung champion is selected by a
-/// **generality filter** — best over all active lengths *plus one length beyond*
-/// the frontier — so that when a length admits both a general loop and a
-/// memoryless length-specific fit (both zero-cost on the frontier), the loop that
-/// also handles the next length is the one promoted. Promotion itself is judged
-/// on the frontier alone.
+/// `restarts` parallel anneals run per rung. Rung selection is **lexicographic**:
+/// restarts that SOLVED the frontier (edge-errors <= `solve_eps`) are preferred,
+/// and among them the **generality filter** — best over all active lengths *plus
+/// one length beyond* the frontier — picks the champion, so that when a length
+/// admits both a general loop and a memoryless length-specific fit (both zero-cost
+/// on the frontier), the loop that also handles the next length is promoted. Only
+/// if no restart solved does selection fall back to argmin of the generality
+/// metric. (Preferring solvers first stops a frontier-solver from losing selection
+/// to a lower-metric non-solver and stalling the ladder falsely.)
+///
+/// A stalled frontier is RETRIED (up to a small fixed number of attempts) with
+/// escalating exploration — a hotter reheat and a half-random restart pool — and
+/// the ladder only breaks once every attempt stalls. Within a rung, restarts
+/// **early-stop** once any of them clears the frontier: a shared flag, read at
+/// per-checkpoint barriers that keep the restarts in lockstep, makes that
+/// decision a deterministic function of the seeds (independent of thread timing).
+/// From restart 0 a heartbeat line streams to stderr each ~1/8 rung.
 ///
 /// Returns `(champion, full-objective cost over every length, highest solved
 /// group +1)`. A full cost below `hp.w` with `solved == n_groups` is a general
@@ -1544,77 +1555,182 @@ pub fn synthesize_curriculum_gated(
                 continue;
             }
         }
-        let scratch = champ.is_none();
-        let t_start = if scratch { hp.t0 } else { hp.t_end + hp.reheat * (hp.t0 - hp.t_end) };
+        // STALL RECOVERY: the incoming champion (previous rung) is the warm base
+        // for EVERY attempt of this rung. On a stalled frontier, retry the rung up
+        // to `MAX_RETRIES` times with escalating exploration — a hotter reheat and a
+        // half-random restart pool — before giving up and breaking the ladder.
+        let warm_base = champ.clone();
+        let scratch = warm_base.is_none();
+        const MAX_RETRIES: usize = 2;
+        let mut reheat = hp.reheat;
+        let mut chosen: Option<(Program, f64)> = None; // (rung champion, its frontier error)
+        for attempt in 0..=MAX_RETRIES {
+            // Promoted rungs reheat only partway; the scratch rung always starts
+            // hot (reheat does not apply). Each retry bumps reheat toward 1.0.
+            let t_start = if scratch { hp.t0 } else { hp.t_end + reheat * (hp.t0 - hp.t_end) };
+            // On retries, half the restarts start from a fresh random program
+            // instead of the warm champion (mirrors `synthesize_curriculum_stage`),
+            // to break out of the warm basin the earlier attempt got stuck in.
+            let half_random = attempt > 0;
 
-        let results: Vec<(Program, f64)> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..restarts.max(1))
-                .map(|r| {
-                    let cs = seed ^ ((frontier as u64) << 40) ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                    let warm = champ.clone();
-                    let active_ones = &active_ones;
-                    s.spawn(move || {
-                        let mut rng = Rng::new(cs);
-                        let step = (rung_iters / 256).max(1);
-                        // Weights for the frontier rung at within-rung fraction `f`.
-                        // The handoff ramp only applies to PROMOTED rungs (easing a
-                        // new length in alongside existing structure); the scratch
-                        // rung has nothing to hand off from, so its frontier carries
-                        // full weight throughout — a sub-1 weight there would briefly
-                        // make the cost size-only and drift toward the empty program.
-                        let weights_at = |f: f64| -> Vec<f64> {
-                            let front = if scratch || hp.handoff <= 0.0 { 1.0 } else { (f / hp.handoff).min(1.0) };
-                            (0..n_groups)
-                                .map(|g| if g < frontier { hp.anchor } else if g == frontier { front } else { 0.0 })
-                                .collect::<Vec<f64>>()
-                        };
-                        let mut cur = match &warm {
-                            Some(w) => w.clone(),
-                            None => random_program(template, space, &mut rng),
-                        };
-                        let mut weights = weights_at(0.0);
-                        let mut cur_cost = weighted_multidata_cost(&cur, dataset, groups, &weights, hp.w, hp.densify_w);
-                        // Track the best by the SELECTION metric (all active lengths).
-                        let mut best = (cur.clone(), weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w));
-                        for i in 0..rung_iters {
-                            if i % step == 0 {
-                                weights = weights_at(i as f64 / rung_iters as f64);
-                                cur_cost = weighted_multidata_cost(&cur, dataset, groups, &weights, hp.w, hp.densify_w);
-                                let active = weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w);
-                                if active < best.1 {
-                                    best = (cur.clone(), active);
+            // EARLY-STOP + HEARTBEAT shared state, per attempt. `solved_flag` is set
+            // by any restart whose best hits frontier edge-errors <= solve_eps. The
+            // per-checkpoint `barrier` forces all restarts into lockstep at
+            // checkpoint granularity so the flag read is DETERMINISTIC (see the
+            // determinism note below), not dependent on wall-clock thread order.
+            let solved_flag = std::sync::atomic::AtomicBool::new(false);
+            let barrier = std::sync::Barrier::new(restarts.max(1));
+
+            // Each restart returns (best program, its SELECTION cost, its frontier
+            // edge-error) — the frontier error is returned so rung selection needn't
+            // re-evaluate it.
+            let results: Vec<(Program, f64, f64)> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..restarts.max(1))
+                    .map(|r| {
+                        let cs = seed
+                            ^ ((frontier as u64) << 40)
+                            ^ ((attempt as u64) << 52)
+                            ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        // Half-random pool on retries: odd restarts go random.
+                        let warm = if half_random && r % 2 == 1 { None } else { warm_base.clone() };
+                        let active_ones = &active_ones;
+                        let solved_flag = &solved_flag;
+                        let barrier = &barrier;
+                        s.spawn(move || {
+                            let mut rng = Rng::new(cs);
+                            let step = (rung_iters / 256).max(1);
+                            let hb = (rung_iters / 8).max(1); // heartbeat cadence (~1/8 rung)
+                            // Weights for the frontier rung at within-rung fraction `f`.
+                            // The handoff ramp only applies to PROMOTED rungs (easing a
+                            // new length in alongside existing structure); the scratch
+                            // rung has nothing to hand off from, so its frontier carries
+                            // full weight throughout — a sub-1 weight there would briefly
+                            // make the cost size-only and drift toward the empty program.
+                            let weights_at = |f: f64| -> Vec<f64> {
+                                let front = if scratch || hp.handoff <= 0.0 { 1.0 } else { (f / hp.handoff).min(1.0) };
+                                (0..n_groups)
+                                    .map(|g| if g < frontier { hp.anchor } else if g == frontier { front } else { 0.0 })
+                                    .collect::<Vec<f64>>()
+                            };
+                            let mut cur = match &warm {
+                                Some(w) => w.clone(),
+                                None => random_program(template, space, &mut rng),
+                            };
+                            let mut weights = weights_at(0.0);
+                            let mut cur_cost = weighted_multidata_cost(&cur, dataset, groups, &weights, hp.w, hp.densify_w);
+                            // Track the best by the SELECTION metric (all active lengths).
+                            let mut best = (cur.clone(), weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w));
+                            for i in 0..rung_iters {
+                                if i % step == 0 {
+                                    weights = weights_at(i as f64 / rung_iters as f64);
+                                    cur_cost = weighted_multidata_cost(&cur, dataset, groups, &weights, hp.w, hp.densify_w);
+                                    let active = weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w);
+                                    if active < best.1 {
+                                        best = (cur.clone(), active);
+                                    }
+                                    // Solve detection on the current best; set the shared
+                                    // flag if this restart has cleared the frontier.
+                                    let bfe = group_edge_errors(&best.0, dataset, groups, frontier, hp.densify_w);
+                                    if bfe <= solve_eps {
+                                        solved_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                    // Lockstep barrier: every restart is at the same
+                                    // checkpoint here, so the store above (from any
+                                    // restart) is visible to the load below on all of
+                                    // them. This makes the early-stop decision a pure
+                                    // function of the seeds, independent of thread timing.
+                                    barrier.wait();
+                                    let done = solved_flag.load(std::sync::atomic::Ordering::SeqCst);
+                                    // Heartbeat: restart 0 only, ~1/8 rung, at a checkpoint
+                                    // (never in the hot path).
+                                    if r == 0 && i % hb == 0 {
+                                        eprintln!(
+                                            "  [hb] rung#{frontier} attempt {attempt} iter {i}/{rung_iters} best_sel={:.1} best_fe={bfe:.1}{}",
+                                            best.1, if done { "  (frontier solved)" } else { "" }
+                                        );
+                                    }
+                                    // Early stop once ANY restart has solved the frontier.
+                                    // All restarts are at this same checkpoint (barrier),
+                                    // so they all break together — no thread is left
+                                    // waiting on a barrier that a broken peer will never
+                                    // reach, and the break checkpoint is identical for all.
+                                    if done {
+                                        break;
+                                    }
+                                }
+                                let temp = t_start * (hp.t_end / t_start).powf(i as f64 / rung_iters.max(1) as f64);
+                                let cand = mutate(&cur, space, false, &mut rng);
+                                let cc = weighted_multidata_cost(&cand, dataset, groups, &weights, hp.w, hp.densify_w);
+                                if cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / temp).exp() {
+                                    cur = cand;
+                                    cur_cost = cc;
+                                    // MISS FIX: the periodic sample above only checks the
+                                    // selection metric every `step` iters. When the anneal
+                                    // cost drops below `w` the weighted edge-error is < 1
+                                    // (possibly zero) — a moment the sample can miss — so
+                                    // check the selection metric immediately.
+                                    if cur_cost < hp.w {
+                                        let active = weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w);
+                                        if active < best.1 {
+                                            best = (cur.clone(), active);
+                                        }
+                                    }
                                 }
                             }
-                            let temp = t_start * (hp.t_end / t_start).powf(i as f64 / rung_iters.max(1) as f64);
-                            let cand = mutate(&cur, space, false, &mut rng);
-                            let cc = weighted_multidata_cost(&cand, dataset, groups, &weights, hp.w, hp.densify_w);
-                            if cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / temp).exp() {
-                                cur = cand;
-                                cur_cost = cc;
+                            let active = weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w);
+                            if active < best.1 {
+                                best = (cur, active);
                             }
-                        }
-                        let active = weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w);
-                        if active < best.1 {
-                            best = (cur, active);
-                        }
-                        best
+                            let fe = group_edge_errors(&best.0, dataset, groups, frontier, hp.densify_w);
+                            (best.0, best.1, fe)
+                        })
                     })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
 
-        let (rc, _) = results.into_iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
-        let front_err = group_edge_errors(&rc, dataset, groups, frontier, hp.densify_w);
-        let solved_this = front_err <= solve_eps;
-        // Per-rung progress hook — fires as each rung completes so a long ladder
-        // streams its climb instead of going dark until the final return.
-        on_rung(frontier, &rc, front_err, solved_this);
+            // LEXICOGRAPHIC RUNG SELECTION: prefer restarts that SOLVED the frontier
+            // (edge-errors <= solve_eps), ranking those by the selection metric (the
+            // lookahead group still breaks the general-loop vs level-driving tie).
+            // Only if no restart solved do we fall back to argmin selection metric.
+            // This stops a frontier-solver from losing selection to a lower-metric
+            // non-solver and stalling the ladder falsely.
+            //
+            // DETERMINISM (early-stop is result-safe): with the per-checkpoint
+            // barrier all restarts break at the SAME checkpoint — the first at which
+            // any restart's best cleared the frontier — which is a deterministic
+            // function of the seeds. So each restart's returned triple is
+            // deterministic, and the set of solvers and their selection costs do not
+            // depend on thread timing. (Early-stop DOES change the result versus not
+            // having it: a would-be solver that only clears the frontier at a later
+            // checkpoint is cut off — but that cut-off is itself deterministic, so
+            // two runs of the same seed return the identical champion. `min_by`
+            // returns the first minimum, and restarts are collected in index order,
+            // so metric ties resolve deterministically too.)
+            let has_solver = results.iter().any(|(_, _, fe)| *fe <= solve_eps);
+            let (rc, _rc_sel, rc_fe) = results
+                .into_iter()
+                .filter(|(_, _, fe)| !has_solver || *fe <= solve_eps)
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .unwrap();
+            let solved_this = rc_fe <= solve_eps;
+            // Per-rung/attempt progress hook — fires each attempt so a long ladder
+            // streams its climb (and its retries) instead of going dark.
+            on_rung(frontier, &rc, rc_fe, solved_this);
+            chosen = Some((rc, rc_fe));
+            if solved_this {
+                break; // frontier solved — no more retries
+            }
+            // Escalate exploration for the next attempt.
+            reheat = reheat + (1.0 - reheat) * 0.5;
+        }
+
+        let (rc, rc_fe) = chosen.expect("at least one attempt runs");
         champ = Some(rc);
-        if solved_this {
+        if rc_fe <= solve_eps {
             solved_through = frontier + 1;
         } else {
-            break; // frontier unsolved — the ladder stops here
+            break; // frontier unsolved after all retries — the ladder stops here
         }
     }
     let c = champ.expect("at least one group");
