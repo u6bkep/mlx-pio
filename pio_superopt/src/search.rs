@@ -1473,6 +1473,64 @@ impl CurriculumHp {
     }
 }
 
+/// Structured trace event emitted by [`synthesize_curriculum_gated`] when a trace
+/// sink is attached (`on_trace = Some(..)`). Every event carries the rung
+/// (`frontier`) and `attempt`, and the per-restart events also the restart index
+/// `r` and `iter` — enough keys that the log, which interleaves across the scoped
+/// restart threads, can be grouped and ordered in post-processing. Programs are
+/// passed by reference so the sink formats them (via [`Program::brief`]) only if
+/// it wants to; a `None` sink costs nothing. The sink is only ever handed values
+/// the search already computed (it never triggers an extra eval on the hot path),
+/// so logging cannot perturb the RNG stream or the accept/reject decisions.
+#[derive(Clone, Debug)]
+pub enum TraceEvent<'a> {
+    /// Periodic time-series sample — one per checkpoint per restart.
+    Checkpoint {
+        frontier: usize,
+        attempt: usize,
+        r: usize,
+        iter: u32,
+        temp: f64,
+        cur_cost: f64,
+        best_sel_cost: f64,
+        best_frontier_err: f64,
+        best_size: u8,
+    },
+    /// A restart's running best improved (at a checkpoint or via the miss-fix path).
+    NewBest {
+        frontier: usize,
+        attempt: usize,
+        r: usize,
+        iter: u32,
+        program: &'a Program,
+        sel_cost: f64,
+        frontier_err: f64,
+        size: u8,
+    },
+    /// A restart finished its attempt — its final best. Emitted for ALL restarts:
+    /// this is the minima-distribution data (which basins the restarts settled in).
+    RestartEnd {
+        frontier: usize,
+        attempt: usize,
+        r: usize,
+        program: &'a Program,
+        sel_cost: f64,
+        frontier_err: f64,
+        size: u8,
+    },
+    /// An attempt finished — the chosen rung champion plus early-stop metadata.
+    AttemptEnd {
+        frontier: usize,
+        attempt: usize,
+        program: &'a Program,
+        solved: bool,
+        reheat: f64,
+        /// Checkpoint iteration at which early-stop fired, or `None` if the
+        /// attempt ran to full budget without any restart clearing the frontier.
+        early_stop_checkpoint: Option<u32>,
+    },
+}
+
 /// **Performance-gated curriculum ladder** — the generality engine. The trigger
 /// is structural: start with only the shortest length active and advance to the
 /// next length **only when the current frontier is solved** (its raw edge-errors
@@ -1520,6 +1578,7 @@ pub fn synthesize_curriculum_gated(
     rung_iters: u32,
     solve_eps: f64,
     seed: u64,
+    on_trace: Option<&(dyn Fn(&TraceEvent) + Sync)>,
     mut on_rung: impl FnMut(usize, &Program, f64, bool),
 ) -> (Program, f64, usize) {
     let mut champ: Option<Program> = None;
@@ -1579,6 +1638,11 @@ pub fn synthesize_curriculum_gated(
             // checkpoint granularity so the flag read is DETERMINISTIC (see the
             // determinism note below), not dependent on wall-clock thread order.
             let solved_flag = std::sync::atomic::AtomicBool::new(false);
+            // The (deterministic) checkpoint iteration at which the frontier was
+            // first cleared, for the AttemptEnd trace. `fetch_min` is order-free,
+            // and — since the barrier makes every restart break at that same
+            // checkpoint — it is only ever written at that one checkpoint.
+            let early_stop_iter = std::sync::atomic::AtomicU32::new(u32::MAX);
             let barrier = std::sync::Barrier::new(restarts.max(1));
 
             // Each restart returns (best program, its SELECTION cost, its frontier
@@ -1595,6 +1659,7 @@ pub fn synthesize_curriculum_gated(
                         let warm = if half_random && r % 2 == 1 { None } else { warm_base.clone() };
                         let active_ones = &active_ones;
                         let solved_flag = &solved_flag;
+                        let early_stop_iter = &early_stop_iter;
                         let barrier = &barrier;
                         s.spawn(move || {
                             let mut rng = Rng::new(cs);
@@ -1621,11 +1686,15 @@ pub fn synthesize_curriculum_gated(
                             // Track the best by the SELECTION metric (all active lengths).
                             let mut best = (cur.clone(), weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w));
                             for i in 0..rung_iters {
+                                // Temp is computed here (unconditionally, unchanged) so
+                                // the checkpoint trace can report it without recomputing.
+                                let temp = t_start * (hp.t_end / t_start).powf(i as f64 / rung_iters.max(1) as f64);
                                 if i % step == 0 {
                                     weights = weights_at(i as f64 / rung_iters as f64);
                                     cur_cost = weighted_multidata_cost(&cur, dataset, groups, &weights, hp.w, hp.densify_w);
                                     let active = weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w);
-                                    if active < best.1 {
+                                    let improved = active < best.1;
+                                    if improved {
                                         best = (cur.clone(), active);
                                     }
                                     // Solve detection on the current best; set the shared
@@ -1633,6 +1702,21 @@ pub fn synthesize_curriculum_gated(
                                     let bfe = group_edge_errors(&best.0, dataset, groups, frontier, hp.densify_w);
                                     if bfe <= solve_eps {
                                         solved_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        early_stop_iter.fetch_min(i, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                    // Trace: reuse the values just computed (no extra
+                                    // evals), so on/off logging is search-identical.
+                                    if let Some(tr) = on_trace {
+                                        if improved {
+                                            tr(&TraceEvent::NewBest {
+                                                frontier, attempt, r, iter: i,
+                                                program: &best.0, sel_cost: best.1, frontier_err: bfe, size: best.0.size(),
+                                            });
+                                        }
+                                        tr(&TraceEvent::Checkpoint {
+                                            frontier, attempt, r, iter: i, temp,
+                                            cur_cost, best_sel_cost: best.1, best_frontier_err: bfe, best_size: best.0.size(),
+                                        });
                                     }
                                     // Lockstep barrier: every restart is at the same
                                     // checkpoint here, so the store above (from any
@@ -1658,7 +1742,6 @@ pub fn synthesize_curriculum_gated(
                                         break;
                                     }
                                 }
-                                let temp = t_start * (hp.t_end / t_start).powf(i as f64 / rung_iters.max(1) as f64);
                                 let cand = mutate(&cur, space, false, &mut rng);
                                 let cc = weighted_multidata_cost(&cand, dataset, groups, &weights, hp.w, hp.densify_w);
                                 if cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / temp).exp() {
@@ -1673,6 +1756,18 @@ pub fn synthesize_curriculum_gated(
                                         let active = weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w);
                                         if active < best.1 {
                                             best = (cur.clone(), active);
+                                            if let Some(tr) = on_trace {
+                                                // Frontier error is not tracked between
+                                                // checkpoints; compute it only when a sink
+                                                // is attached. This eval is RNG-free and
+                                                // never runs with logging off, so on/off
+                                                // determinism is preserved.
+                                                let fe = group_edge_errors(&best.0, dataset, groups, frontier, hp.densify_w);
+                                                tr(&TraceEvent::NewBest {
+                                                    frontier, attempt, r, iter: i,
+                                                    program: &best.0, sel_cost: active, frontier_err: fe, size: best.0.size(),
+                                                });
+                                            }
                                         }
                                     }
                                 }
@@ -1682,6 +1777,13 @@ pub fn synthesize_curriculum_gated(
                                 best = (cur, active);
                             }
                             let fe = group_edge_errors(&best.0, dataset, groups, frontier, hp.densify_w);
+                            // RestartEnd — final best of every restart (minima data).
+                            if let Some(tr) = on_trace {
+                                tr(&TraceEvent::RestartEnd {
+                                    frontier, attempt, r,
+                                    program: &best.0, sel_cost: best.1, frontier_err: fe, size: best.0.size(),
+                                });
+                            }
                             (best.0, best.1, fe)
                         })
                     })
@@ -1717,6 +1819,15 @@ pub fn synthesize_curriculum_gated(
             // Per-rung/attempt progress hook — fires each attempt so a long ladder
             // streams its climb (and its retries) instead of going dark.
             on_rung(frontier, &rc, rc_fe, solved_this);
+            if let Some(tr) = on_trace {
+                let esc = match early_stop_iter.load(std::sync::atomic::Ordering::SeqCst) {
+                    u32::MAX => None,
+                    v => Some(v),
+                };
+                tr(&TraceEvent::AttemptEnd {
+                    frontier, attempt, program: &rc, solved: solved_this, reheat, early_stop_checkpoint: esc,
+                });
+            }
             chosen = Some((rc, rc_fe));
             if solved_this {
                 break; // frontier solved — no more retries

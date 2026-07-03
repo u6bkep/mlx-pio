@@ -123,6 +123,16 @@ impl Program {
         }
     }
 
+    /// Compact one-line rendering for experiment logs and traces: occupied
+    /// slots as `idx:insn` (via [`Insn::brief`]) plus the wrap range, e.g.
+    /// `[0:pull  1:mov Pins,InvertOsr  ...] wrap 6..9`.
+    pub fn brief(&self) -> String {
+        let parts: Vec<String> = (0..32usize)
+            .filter_map(|i| self.slots[i].as_ref().map(|ins| format!("{i}:{}", ins.brief())))
+            .collect();
+        format!("[{}] wrap {}..{}", parts.join("  "), self.wrap_bottom, self.wrap_top)
+    }
+
     /// Encode all 32 slots to machine words (empty slots -> NOP). Targets
     /// are absolute slot indices, loaded as-is at instruction address ==
     /// slot index (no relocation).

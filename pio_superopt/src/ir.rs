@@ -29,6 +29,29 @@ impl Insn {
         Insn::plain(Op::Mov { dst: MovDst::Y, op: MovOp::None, src: MovSrc::Y })
     }
 
+    /// Compact one-line rendering of this instruction for experiment logs and
+    /// traces (e.g. `out Pins,24[6]`, `jmp Pin->1`, `mov Pins,InvertOsr`).
+    /// Delay is shown as `[n]`, an explicit side-set as `.sN`.
+    pub fn brief(&self) -> String {
+        let d = if self.delay > 0 { format!("[{}]", self.delay) } else { String::new() };
+        let ss = match self.sideset {
+            Some(v) => format!(".s{v}"),
+            None => String::new(),
+        };
+        let op = match &self.op {
+            Op::Jmp { cond, target } => format!("jmp {cond:?}->{target}"),
+            Op::Wait { polarity, src, index } => format!("wait{} {src:?}{index}", *polarity as u8),
+            Op::In { src, count } => format!("in {src:?},{count}"),
+            Op::Out { dst, count } => format!("out {dst:?},{count}"),
+            Op::Push { .. } => "push".into(),
+            Op::Pull { .. } => "pull".into(),
+            Op::Mov { dst, op, src } => format!("mov {dst:?},{op:?}{src:?}"),
+            Op::Irq { index, .. } => format!("irq {index}"),
+            Op::Set { dst, data } => format!("set {dst:?},{data}"),
+        };
+        format!("{op}{ss}{d}")
+    }
+
     /// A NOP that is *legal under `side`*: when side-set is mandatory
     /// (`count > 0`, no enable bit) every instruction must drive it, so the
     /// fill NOP carries `Some(0)`; otherwise it opts out. Used to encode

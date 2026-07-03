@@ -2294,8 +2294,29 @@ mod tests {
         );
         let lens = lengths.to_vec();
         let lbl = label;
+
+        // Structured JSONL trace sink: one line per event, written under `runs/`
+        // at the workspace root (git-ignored). The name has no wall-clock, so a
+        // rerun overwrites and diffs cleanly. A `Mutex<BufWriter>` serializes the
+        // 32 restart threads' events; keys (rung/attempt/r/iter) let the
+        // interleaved lines be regrouped in analysis.
+        let seed = 0x5EEDu64;
+        std::fs::create_dir_all("runs").expect("create runs/ dir");
+        let trace_path = format!("runs/{label}-{seed:#x}.jsonl");
+        let sink = std::sync::Mutex::new(std::io::BufWriter::new(
+            std::fs::File::create(&trace_path).expect("create trace file"),
+        ));
+        eprintln!("trace -> {trace_path}");
+        let trace = |ev: &crate::search::TraceEvent| {
+            use std::io::Write;
+            let line = trace_json(ev);
+            let mut w = sink.lock().unwrap();
+            let _ = writeln!(w, "{line}");
+        };
+
         let (champ, cost, solved) = synthesize_curriculum_gated(
-            template, &space, &dataset, &groups, lengths.len(), hp, 32, 4_000_000, 0.0, 0x5EED,
+            template, &space, &dataset, &groups, lengths.len(), hp, 32, 4_000_000, 0.0, seed,
+            Some(&trace),
             |frontier, rc, front_err, ok| {
                 let parts: Vec<_> = (0..space.slots as usize)
                     .filter_map(|i| rc.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
@@ -2314,6 +2335,52 @@ mod tests {
             "{label} DONE solved {solved}/{} cost={cost:.1} size={} [gate train={vt} held-out={vh}] wrap {}..{}: [{}]",
             lengths.len(), champ.size(), champ.wrap_bottom, champ.wrap_top, parts.join("  ")
         );
+    }
+
+    /// Serialize one [`crate::search::TraceEvent`] as a single JSON object (one
+    /// JSONL record). Hand-formatted — the crate has no serde dependency. Numbers
+    /// are emitted bare (non-finite -> `null` to stay valid JSON); the program
+    /// disassembly is the only string field and is minimally escaped.
+    fn trace_json(ev: &crate::search::TraceEvent) -> String {
+        use crate::search::TraceEvent::*;
+        // Bare finite number, or `null` (JSON has no inf/nan).
+        fn jf(x: f64) -> String {
+            if x.is_finite() { format!("{x}") } else { "null".into() }
+        }
+        fn esc(s: &str) -> String {
+            let mut o = String::with_capacity(s.len() + 2);
+            for c in s.chars() {
+                match c {
+                    '"' => o.push_str("\\\""),
+                    '\\' => o.push_str("\\\\"),
+                    '\n' => o.push_str("\\n"),
+                    '\t' => o.push_str("\\t"),
+                    c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => o.push(c),
+                }
+            }
+            o
+        }
+        match ev {
+            Checkpoint { frontier, attempt, r, iter, temp, cur_cost, best_sel_cost, best_frontier_err, best_size } => format!(
+                "{{\"kind\":\"checkpoint\",\"rung\":{frontier},\"attempt\":{attempt},\"r\":{r},\"iter\":{iter},\"temp\":{},\"cur_cost\":{},\"best_sel\":{},\"best_fe\":{},\"best_size\":{best_size}}}",
+                jf(*temp), jf(*cur_cost), jf(*best_sel_cost), jf(*best_frontier_err)
+            ),
+            NewBest { frontier, attempt, r, iter, program, sel_cost, frontier_err, size } => format!(
+                "{{\"kind\":\"new_best\",\"rung\":{frontier},\"attempt\":{attempt},\"r\":{r},\"iter\":{iter},\"sel\":{},\"fe\":{},\"size\":{size},\"prog\":\"{}\"}}",
+                jf(*sel_cost), jf(*frontier_err), esc(&program.brief())
+            ),
+            RestartEnd { frontier, attempt, r, program, sel_cost, frontier_err, size } => format!(
+                "{{\"kind\":\"restart_end\",\"rung\":{frontier},\"attempt\":{attempt},\"r\":{r},\"sel\":{},\"fe\":{},\"size\":{size},\"prog\":\"{}\"}}",
+                jf(*sel_cost), jf(*frontier_err), esc(&program.brief())
+            ),
+            AttemptEnd { frontier, attempt, program, solved, reheat, early_stop_checkpoint } => format!(
+                "{{\"kind\":\"attempt_end\",\"rung\":{frontier},\"attempt\":{attempt},\"solved\":{solved},\"reheat\":{},\"early_stop\":{},\"prog\":\"{}\"}}",
+                jf(*reheat),
+                match early_stop_checkpoint { Some(v) => v.to_string(), None => "null".into() },
+                esc(&program.brief())
+            ),
+        }
     }
 
     /// GATED CURRICULUM LADDER (the generality engine): the structural fix for the
@@ -2398,6 +2465,18 @@ mod tests {
     /// and delete the now-redundant pull/OSR-empty instructions, re-validating each
     /// removal against the gate — to capture the instruction saving without the
     /// search fighting autopull.
+    ///
+    /// ANALYZING THE TRACE: each ladder phase writes a JSONL trace to
+    /// `runs/<label>-<seed>.jsonl` (one event per line: `checkpoint`, `new_best`,
+    /// `restart_end`, `attempt_end`; keys `rung`/`attempt`/`r`/`iter` let the
+    /// thread-interleaved lines be regrouped). Useful jq one-liners:
+    /// - Minima distribution for a (stalled) rung — how many distinct basins the
+    ///   restarts fell into, and their multiplicity:
+    ///   `jq -rc 'select(.kind=="restart_end" and .rung==0)|.prog' F | sort | uniq -c | sort -rn`
+    /// - best-frontier-error time-series for one restart (does it descend or flatline):
+    ///   `jq -rc 'select(.kind=="checkpoint" and .rung==0 and .r==0)|[.iter,.best_fe]|@tsv' F`
+    /// - when early-stop fired per rung (null = ran full budget, i.e. the rung stalled):
+    ///   `jq -rc 'select(.kind=="attempt_end")|[.rung,.attempt,.early_stop]|@tsv' F`
     #[test]
     #[ignore = "gated curriculum ladder (several min); run with --release ... --nocapture"]
     fn dme_curriculum_gated() {
@@ -2445,6 +2524,7 @@ mod tests {
             for sd in 0..eval_seeds {
                 let (champ, _cost, _solved) = synthesize_curriculum_gated(
                     &template, &space, &ds_mini, &grp_mini, mini_lengths.len(), hp, mini_restarts, mini_iters, 0.0, 0xACE_5EED ^ sd,
+                    None,
                     |_, _, _, _| {},
                 );
                 let (_vt, vh) = crate::fixtures::dme_validate(&champ);
@@ -2463,6 +2543,7 @@ mod tests {
         let lens = lengths.clone();
         let (champ, cost, solved) = synthesize_curriculum_gated(
             &template, &space, &dataset, &groups, lengths.len(), &best, 32, 4_000_000, 0.0, 0x5EED,
+            None,
             |frontier, rc, front_err, ok| {
                 eprintln!("RUNG L={:<2} {} front_err={front_err:6.1} size={}", lens[frontier], if ok { "SOLVED" } else { "STALL " }, rc.size());
             },
@@ -2881,25 +2962,10 @@ mod tests {
     }
 }
 
-/// Compact rendering of one instruction (op + delay + side-set).
+/// Compact rendering of one instruction (op + delay + side-set). Thin wrapper
+/// over [`Insn::brief`] so the many test call sites stay unchanged.
 fn brief_insn(ins: &Insn) -> String {
-    let d = if ins.delay > 0 { format!("[{}]", ins.delay) } else { String::new() };
-    let ss = match ins.sideset {
-        Some(v) => format!(".s{v}"),
-        None => String::new(),
-    };
-    let op = match &ins.op {
-        Op::Jmp { cond, target } => format!("jmp {cond:?}->{target}"),
-        Op::Wait { polarity, src, index } => format!("wait{} {src:?}{index}", *polarity as u8),
-        Op::In { src, count } => format!("in {src:?},{count}"),
-        Op::Out { dst, count } => format!("out {dst:?},{count}"),
-        Op::Push { .. } => "push".into(),
-        Op::Pull { .. } => "pull".into(),
-        Op::Mov { dst, op, src } => format!("mov {dst:?},{op:?}{src:?}"),
-        Op::Irq { index, .. } => format!("irq {index}"),
-        Op::Set { dst, data } => format!("set {dst:?},{data}"),
-    };
-    format!("{op}{ss}{d}")
+    ins.brief()
 }
 
 /// Compact one-line rendering of a gene's node tree, for experiment logs.

@@ -8,3 +8,7 @@
 
 #out of tree non dependancy reference material
 reference/
+
+# Structured JSONL traces from gated-ladder search runs
+/runs
+runs/
