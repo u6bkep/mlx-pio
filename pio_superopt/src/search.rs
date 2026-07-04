@@ -332,8 +332,23 @@ fn mutate_immediate(insn: &mut Insn, slots: u8, rng: &mut Rng) {
 /// `pub` so the eval-hot-path benches (ticket 004) can measure the real
 /// per-iteration move; not otherwise part of the public API.
 pub fn mutate(p: &Program, space: &Space, macros: bool, rng: &mut Rng) -> Program {
+    mutate_lib(p, space, macros, &[], rng)
+}
+
+/// [`mutate`] with a library of **self-mined macros** (see [`mine_macros`]):
+/// when `lib` is non-empty, ~1 move in 8 splices a library idiom over a random
+/// contiguous window instead of a point edit. With an empty library the RNG
+/// stream is byte-identical to [`mutate`] (the splice branch draws nothing),
+/// so enabling mining only on retry attempts leaves first attempts unchanged.
+pub fn mutate_lib(p: &Program, space: &Space, macros: bool, lib: &[MinedMacro], rng: &mut Rng) -> Program {
     let mut m = p.clone();
     let slots = space.slots;
+    // Mined-macro move: ~1 in 8 when a library is present.
+    if !lib.is_empty() && rng.below(8) == 0 {
+        let mac = &lib[rng.below(lib.len() as u32) as usize];
+        splice_macro(&mut m, mac, slots, rng);
+        return m;
+    }
     // Building-block move: ~1 in 8 when enabled and the window has room.
     if macros && slots >= 4 && rng.below(8) == 0 {
         insert_counted_loop(&mut m, space, rng);
@@ -405,6 +420,125 @@ fn pick_occupied(p: &Program, slots: u8, rng: &mut Rng) -> Option<usize> {
         None
     } else {
         Some(occ[rng.below(occ.len() as u32) as usize])
+    }
+}
+
+/// A **self-mined macro**: a short contiguous instruction run harvested from a
+/// population of search minima (rather than hand-authored — hand macros encode
+/// human priors; mined macros encode what the search itself keeps discovering,
+/// e.g. the OSR-refill idiom `jmp NotOsrEmpty / pull`). Jmp targets that
+/// pointed inside the run (or one slot past its end — the "skip over" shape)
+/// are stored RELATIVE to the run start with the matching `rel` flag set, so a
+/// splice rebases them to wherever the macro lands; targets pointing elsewhere
+/// stay absolute (they were context-specific — point edits can retune them).
+#[derive(Clone, Debug)]
+pub struct MinedMacro {
+    pub insns: Vec<Insn>,
+    /// Per-insn: is this a jmp whose target is stored run-relative?
+    pub rel: Vec<bool>,
+}
+
+impl MinedMacro {
+    /// One-line rendering for logs, e.g. `jmp NotOsrEmpty->+2 ; pull`.
+    pub fn brief(&self) -> String {
+        self.insns
+            .iter()
+            .zip(&self.rel)
+            .map(|(i, r)| {
+                let s = i.brief();
+                if *r { s.replace("->", "->+") } else { s }
+            })
+            .collect::<Vec<_>>()
+            .join(" ; ")
+    }
+}
+
+/// A program's op-level structure key: opcode+operands per slot plus the wrap
+/// region, ignoring delays and side-sets. Two programs with the same key are
+/// timing variants of the same structure — used to dedup restart minima into a
+/// structurally diverse pool (64 warm restarts parked in one basin collapse to
+/// a single entry).
+fn structure_key(p: &Program, slots: u8) -> String {
+    let ops: Vec<String> = (0..slots as usize)
+        .map(|i| match &p.slots[i] {
+            Some(insn) => format!("{:?}", insn.op),
+            None => "-".into(),
+        })
+        .collect();
+    format!("{}|w{}..{}", ops.join(";"), p.wrap_bottom, p.wrap_top)
+}
+
+/// Harvest recurring instruction runs (lengths 2..=3, all slots occupied) from
+/// a population of programs, count them by op structure (delays/side-sets
+/// ignored so timing variants of one idiom pool together; the first-seen
+/// representative's fields are kept), and return the most frequent ones. Only
+/// runs seen in at least two DISTINCT programs qualify — callers should dedup
+/// the population by [`structure_key`] first so a monoculture basin doesn't
+/// vote many times. Fully deterministic: ties order by key string.
+pub fn mine_macros(pool: &[&Program], slots: u8, max: usize) -> Vec<MinedMacro> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, (u32, MinedMacro)> = HashMap::new();
+    for p in pool {
+        let mut seen_here: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for len in 2..=3usize {
+            if (slots as usize) < len {
+                continue;
+            }
+            for start in 0..=(slots as usize - len) {
+                let window: Option<Vec<Insn>> = (0..len).map(|k| p.slots[start + k].clone()).collect();
+                let Some(mut insns) = window else { continue };
+                let mut rel = vec![false; len];
+                for (k, insn) in insns.iter_mut().enumerate() {
+                    if let Op::Jmp { target, .. } = &mut insn.op {
+                        let t = *target as usize;
+                        // Internal targets (incl. one-past-end) become relative.
+                        if t >= start && t <= start + len {
+                            *target = (t - start) as u8;
+                            rel[k] = true;
+                        }
+                    }
+                }
+                let key: String = insns
+                    .iter()
+                    .zip(&rel)
+                    .map(|(i, r)| format!("{:?}|{r}", i.op))
+                    .collect::<Vec<_>>()
+                    .join(";");
+                // Count each distinct run once per program.
+                if !seen_here.insert(key.clone()) {
+                    continue;
+                }
+                counts
+                    .entry(key)
+                    .and_modify(|e| e.0 += 1)
+                    .or_insert((1, MinedMacro { insns, rel }));
+            }
+        }
+    }
+    let mut v: Vec<(String, (u32, MinedMacro))> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
+    v.into_iter().filter(|(_, (c, _))| *c >= 2).take(max).map(|(_, (_, m))| m).collect()
+}
+
+/// Overwrite a random contiguous window with a mined macro, rebasing its
+/// relative jmp targets to the landing position (clamped into the window
+/// space — a one-past-end target landing at the top edge clamps to the last
+/// slot; a point edit can retune it).
+fn splice_macro(m: &mut Program, mac: &MinedMacro, slots: u8, rng: &mut Rng) {
+    let len = mac.insns.len();
+    let slots = slots as usize;
+    if len == 0 || len > slots {
+        return;
+    }
+    let t = rng.below((slots - len + 1) as u32) as usize;
+    for (k, (insn, rel)) in mac.insns.iter().zip(&mac.rel).enumerate() {
+        let mut insn = insn.clone();
+        if *rel {
+            if let Op::Jmp { target, .. } = &mut insn.op {
+                *target = (t + *target as usize).min(slots - 1) as u8;
+            }
+        }
+        m.slots[t + k] = Some(insn);
     }
 }
 
@@ -1556,8 +1690,11 @@ pub enum TraceEvent<'a> {
 /// to a lower-metric non-solver and stalling the ladder falsely.)
 ///
 /// A stalled frontier is RETRIED (up to a small fixed number of attempts) with
-/// escalating exploration — a hotter reheat and a half-random restart pool — and
-/// the ladder only breaks once every attempt stalls. Within a rung, restarts
+/// escalating exploration — a hotter reheat, a half-random restart pool, and
+/// (from the failed attempt's restart minima) a structurally-deduped **warm
+/// pool** the retry's warm restarts fan out across plus a **self-mined macro
+/// library** ([`mine_macros`]) whose idioms become splice moves — and the
+/// ladder only breaks once every attempt stalls. Within a rung, restarts
 /// **early-stop** once any of them clears the frontier: a shared flag, read at
 /// per-checkpoint barriers that keep the restarts in lockstep, makes that
 /// decision a deterministic function of the seeds (independent of thread timing).
@@ -1621,6 +1758,22 @@ pub fn synthesize_curriculum_gated(
         let warm_base = champ.clone();
         let scratch = warm_base.is_none();
         const MAX_RETRIES: usize = 2;
+        // CROSS-POLLINATION + SELF-MINED MACROS (added after the 2026-07-04
+        // trace analysis: on a stalled rung ALL warm restarts ended at exactly
+        // the warm champ — a monoculture parked in one deep basin — while random
+        // restarts independently assembled useful idioms, e.g. the OSR-refill
+        // `jmp NotOsrEmpty / pull`, but plateaued 3-4x above the champ).
+        // After a failed attempt the restart minima are (a) deduped by op
+        // structure into a diverse WARM POOL — retry restarts fan out across it
+        // instead of 32 copies of one champ — and (b) mined for recurring
+        // instruction runs, which become macro splice moves so a warm restart
+        // can graft a random restart's idiom without walking there point-edit
+        // by point-edit. Attempt 0 keeps the pure warm start and an empty
+        // library (RNG stream unchanged vs the pre-mining engine).
+        const POOL_MAX: usize = 8;
+        const LIB_MAX: usize = 8;
+        let mut pool: Vec<Program> = warm_base.iter().cloned().collect();
+        let mut lib: Vec<MinedMacro> = Vec::new();
         let mut reheat = hp.reheat;
         let mut chosen: Option<(Program, f64)> = None; // (rung champion, its frontier error)
         for attempt in 0..=MAX_RETRIES {
@@ -1656,8 +1809,14 @@ pub fn synthesize_curriculum_gated(
                             ^ ((attempt as u64) << 52)
                             ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                         // Half-random pool on retries: odd restarts go random.
-                        let warm = if half_random && r % 2 == 1 { None } else { warm_base.clone() };
+                        // Warm restarts fan out over the (diverse) warm pool.
+                        let warm = if pool.is_empty() || (half_random && r % 2 == 1) {
+                            None
+                        } else {
+                            Some(pool[(r / 2) % pool.len()].clone())
+                        };
                         let active_ones = &active_ones;
+                        let lib = &lib;
                         let solved_flag = &solved_flag;
                         let early_stop_iter = &early_stop_iter;
                         let barrier = &barrier;
@@ -1742,7 +1901,7 @@ pub fn synthesize_curriculum_gated(
                                         break;
                                     }
                                 }
-                                let cand = mutate(&cur, space, false, &mut rng);
+                                let cand = mutate_lib(&cur, space, false, lib, &mut rng);
                                 let cc = weighted_multidata_cost(&cand, dataset, groups, &weights, hp.w, hp.densify_w);
                                 if cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / temp).exp() {
                                     cur = cand;
@@ -1811,9 +1970,10 @@ pub fn synthesize_curriculum_gated(
             // so metric ties resolve deterministically too.)
             let has_solver = results.iter().any(|(_, _, fe)| *fe <= solve_eps);
             let (rc, _rc_sel, rc_fe) = results
-                .into_iter()
+                .iter()
                 .filter(|(_, _, fe)| !has_solver || *fe <= solve_eps)
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .cloned()
                 .unwrap();
             let solved_this = rc_fe <= solve_eps;
             // Per-rung/attempt progress hook — fires each attempt so a long ladder
@@ -1831,6 +1991,26 @@ pub fn synthesize_curriculum_gated(
             chosen = Some((rc, rc_fe));
             if solved_this {
                 break; // frontier solved — no more retries
+            }
+            // FAILED ATTEMPT — rebuild the warm pool and macro library from this
+            // attempt's restart minima for the retry. Rank by selection cost
+            // (stable sort: ties keep restart-index order — deterministic), dedup
+            // by op structure so one basin contributes one pool entry, then mine
+            // macros from ALL structurally distinct minima (not just the top
+            // POOL_MAX — a mid-ranked random restart may hold the needed idiom).
+            let mut ranked: Vec<&(Program, f64, f64)> = results.iter().collect();
+            ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            let mut seen = std::collections::HashSet::new();
+            let distinct: Vec<&Program> =
+                ranked.iter().filter(|(p, _, _)| seen.insert(structure_key(p, space.slots))).map(|(p, _, _)| p).collect();
+            lib = mine_macros(&distinct, space.slots, LIB_MAX);
+            pool = distinct.iter().take(POOL_MAX).map(|p| (*p).clone()).collect();
+            eprintln!(
+                "  [mine] rung#{frontier} attempt {attempt}: {} distinct minima -> pool={} lib={}",
+                distinct.len(), pool.len(), lib.len()
+            );
+            for m in &lib {
+                eprintln!("  [mine]   {}", m.brief());
             }
             // Escalate exploration for the next attempt.
             reheat = reheat + (1.0 - reheat) * 0.5;
@@ -2933,6 +3113,40 @@ mod tests {
         let (b, s) = best.unwrap();
         eprintln!("autopull serializer: best correctness={} size={}", s.correctness, s.size);
         eprintln!("  {}", show(&b, 3));
+    }
+
+    #[test]
+    fn mined_macros_harvest_and_splice() {
+        // Two structurally distinct programs sharing the OSR-refill idiom
+        // `jmp NotOsrEmpty (skip 2) ; pull` at DIFFERENT positions: mining must
+        // relativize the internal skip target so the two occurrences pool into
+        // one macro, and a splice must rebase that target to the landing slot.
+        let mut a = spi_template();
+        a.slots[4] = Some(Insn::plain(Op::Jmp { cond: JmpCond::NotOsrEmpty, target: 6 }));
+        a.slots[5] = Some(Insn::plain(Op::Pull { if_empty: false, block: true }));
+        let mut b = spi_template();
+        b.slots[0] = Some(Insn::plain(Op::Jmp { cond: JmpCond::NotOsrEmpty, target: 2 }));
+        b.slots[1] = Some(Insn::plain(Op::Pull { if_empty: false, block: true }));
+        b.slots[2] = Some(Insn::nop());
+        let lib = mine_macros(&[&a, &b], 10, 8);
+        // Only the shared bigram is seen in >= 2 distinct programs.
+        assert_eq!(lib.len(), 1, "lib: {:?}", lib.iter().map(|m| m.brief()).collect::<Vec<_>>());
+        let refill = &lib[0];
+        assert_eq!(refill.brief(), "jmp NotOsrEmpty->+2 ; pull");
+        assert_eq!(refill.rel, vec![true, false]);
+        // Splice rebases the relative target to landing-slot + 2 (clamped to
+        // the top slot at the edge), for every landing position the RNG picks.
+        let mut rng = Rng::new(7);
+        for _ in 0..64 {
+            let mut m = spi_template();
+            splice_macro(&mut m, refill, 10, &mut rng);
+            let t = (0..10).find(|&i| m.slots[i].is_some()).unwrap();
+            match &m.slots[t].as_ref().unwrap().op {
+                Op::Jmp { target, .. } => assert_eq!(*target as usize, (t + 2).min(9)),
+                op => panic!("expected jmp at slot {t}, got {op:?}"),
+            }
+            assert!(matches!(m.slots[t + 1].as_ref().unwrap().op, Op::Pull { .. }));
+        }
     }
 
     /// BUILDING-BLOCK MOVES on the SPINE (A/B, fast): does the self-sufficient

@@ -2492,7 +2492,10 @@ mod tests {
         // DISCOVER an in-loop pull. The instruction-saving autopull form is a
         // separate END-of-search config-polish, not a search the conjunction
         // has to survive.
-        run_gated_ladder("inloop-pull", &Program::empty(dme_cfg()), &(2..=14).collect::<Vec<_>>(), &hp);
+        // Label bump: "xpoll-mined" = the cross-pollination + self-mined-macro
+        // retry engine (2026-07-04), so its trace doesn't overwrite the
+        // monoculture-stall baseline in runs/inloop-pull-0x5eed.jsonl.
+        run_gated_ladder("xpoll-mined", &Program::empty(dme_cfg()), &(2..=14).collect::<Vec<_>>(), &hp);
     }
 
     /// META-TUNE the gated ladder's SCHEDULE SHAPE. The trigger is fixed
