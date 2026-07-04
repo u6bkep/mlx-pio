@@ -197,11 +197,12 @@ trait Oracle: Sync {
    and the resolution reality-check above). The residual knob is the *search
    metric's* `eps` (pure gradient shaping, certifier unaffected) — an
    engineering choice to tune, not a spec question.
-2. **Is `T` itself searchable?** The spec pins the *rate* (±100 ppm) but not the
-   *realization* — any clkdiv×schedule product hitting 12.5 MBd nominal is
-   legal. Do we re-enable clkdiv genes immediately (re-run the config-gene
-   experiment, letting the search trade cycles-per-cell against schedule), or
-   keep clkdiv pinned for v1 and grant only phase/polarity freedom?
+2. ~~Is `T` itself searchable?~~ **RESOLVED 2026-07-04 (user): clkdiv stays OUT
+   of the genes for v1.** The spec pins the rate to ±100 ppm; fractional-div
+   wander only fits the 5 ns jitter budget above ~200 MHz sys clock, and while
+   some RP2350s overclock well past that, "needs an overclocked part" doesn't
+   make a good PIO program. v1 grants phase/polarity/schedule freedom at pinned
+   clkdiv. Revisit only alongside a deliberate high-sys-clock target.
 3. **Scope of v1**: DME TX bit-cells only (current testbed), or include
    10BASE-T1S framing realities (SYNC/beacon, idle line state, BEACON/COMMIT)
    where phase freedom interacts with the protocol state machine?
