@@ -2138,13 +2138,13 @@ mod tests {
             let exhaustive = (1u64 << l) <= cap;
             let n = if exhaustive { 1u64 << l } else { cap };
             let mut drng = Rng::new(0xDA7A_5EED ^ l as u64);
-            let dataset: Vec<(RunSpec, Vec<u32>, Vec<u32>)> = (0..n)
+            let dataset: Vec<(RunSpec, crate::search::Target)> = (0..n)
                 .map(|s| {
                     let bits = if exhaustive { s } else { drng.below(1u32 << l) as u64 };
                     let sp = RunSpec { inputs: seq_words(bits, l), cycles: win, ..dme_spec(0) };
                     let g = run(&reff, &sp);
                     let m = vec![u32::MAX; g.len()];
-                    (sp, g, m)
+                    (sp, crate::search::Target::Wave { golden: g, mask: m })
                 })
                 .collect();
 
@@ -2203,7 +2203,7 @@ mod tests {
         // exhaustive (vary the first `len` bits) while 2^len <= cap.
         let lengths = [2usize, 3, 4, 5];
         let cap = 32u64;
-        let mut dataset: Vec<(RunSpec, Vec<u32>, Vec<u32>)> = Vec::new();
+        let mut dataset: Vec<(RunSpec, crate::search::Target)> = Vec::new();
         let mut groups: Vec<usize> = Vec::new();
         for (gi, &len) in lengths.iter().enumerate() {
             let win = (grid[len.min(grid.len() - 1)] + 3) as u64;
@@ -2215,7 +2215,7 @@ mod tests {
                 let sp = RunSpec { inputs: seq_words(bits, len), cycles: win, ..dme_spec(0) };
                 let g = run(&reff, &sp);
                 let m = vec![u32::MAX; g.len()];
-                dataset.push((sp, g, m));
+                dataset.push((sp, crate::search::Target::Wave { golden: g, mask: m }));
                 groups.push(gi);
             }
         }
@@ -2245,11 +2245,11 @@ mod tests {
     /// front_err=1.5) — can't even crack the conjunction; unpadded solves L=2..5 and
     /// stalls at L=6 (front_err=63). Why padding poisons the autopull-off crack is
     /// unexplained; keep the knob for future autopull experiments but default it off.
-    fn dme_multilength_dataset(lengths: &[usize], cap: u64, pad: bool) -> (Vec<(RunSpec, Vec<u32>, Vec<u32>)>, Vec<usize>) {
+    fn dme_multilength_dataset(lengths: &[usize], cap: u64, pad: bool) -> (Vec<(RunSpec, crate::search::Target)>, Vec<usize>) {
         let reff = dme_ref(DME_H).lower();
         let gsp = RunSpec { inputs: vec![0, 0, 0, 0], cycles: 320, ..dme_spec(0) };
         let grid: Vec<usize> = dme_edges01(&run(&reff, &gsp)).iter().map(|&(c, _)| c).collect();
-        let mut dataset: Vec<(RunSpec, Vec<u32>, Vec<u32>)> = Vec::new();
+        let mut dataset: Vec<(RunSpec, crate::search::Target)> = Vec::new();
         let mut groups: Vec<usize> = Vec::new();
         for (gi, &len) in lengths.iter().enumerate() {
             let win = (grid[len.min(grid.len() - 1)] + 3) as u64;
@@ -2273,7 +2273,7 @@ mod tests {
                 let sp = RunSpec { inputs, cycles: win, ..dme_spec(0) };
                 let g = run(&reff, &sp);
                 let m = vec![u32::MAX; g.len()];
-                dataset.push((sp, g, m));
+                dataset.push((sp, crate::search::Target::Wave { golden: g, mask: m }));
                 groups.push(gi);
             }
         }
@@ -2381,6 +2381,219 @@ mod tests {
                 esc(&program.brief())
             ),
         }
+    }
+
+    // ===================== SPEC-ORACLE TESTBED (ticket 005) =====================
+    //
+    // Mirror of the cycle-exact multi-length ladder above, but scored by the
+    // SPEC oracle (`spec_cost` via `Target::SpecBits`) instead of the reference
+    // waveform, and GATED by the independent certifier (`certify_dme`) instead
+    // of `dme_validate`'s Hamming-against-`dme_ref`. The nominal cell is the
+    // DECIDED v1 shape: 16 cycles, data transition at +8 (half-cell = 8) — NOT
+    // the reference encoder's 14-cycle/+6 shape (which `certify.rs`'s
+    // `dme_ref_is_not_spec_shaped` proves is non-compliant), so a spec champion
+    // is a target `dme_ref` does not meet, and the certifier — not `dme_ref` —
+    // is the only gate.
+
+    /// Half-cell for the spec testbed (`DME_H` analogue): nominal cell = `2*8`
+    /// cycles, mid-bit data transition at `+8`.
+    const SPEC_H: usize = 8;
+    /// Startup-phase bound: the first boundary edge may land anywhere in
+    /// `[1, SPEC_PHI_MAX]`. Generous, so the search keeps phase freedom.
+    const SPEC_PHI_MAX: usize = 32;
+
+    /// Build a pooled multi-length SPEC curriculum dataset: exhaustive length-L
+    /// bit sequences (vary the first `len` bits) while `2^len <= cap`, else `cap`
+    /// sampled — the SAME enumeration and RNG discipline as
+    /// [`dme_multilength_dataset`] (seed `0xDA7A_5EED ^ len`), so determinism is
+    /// identical. Rows carry the expected BITS directly (not a golden waveform):
+    /// `Target::SpecBits { bits, h = SPEC_H, phi_max = SPEC_PHI_MAX }`. The
+    /// RunSpec packs those bits LSB-first into 5-bit words exactly like
+    /// `seq_words` (config `dme_cfg`: pull_threshold 5, autopull off, clkdiv
+    /// pinned). Capture window = `phi_max` slack + `len * cell` frame + a
+    /// half-cell tail, so a compliant frame at any admissible phase fits and a
+    /// runaway loop's post-frame toggles show up as spurious edges.
+    fn dme_spec_multilength_dataset(lengths: &[usize], cap: u64) -> (Vec<(RunSpec, crate::search::Target)>, Vec<usize>) {
+        use crate::search::Target;
+        let cell = 2 * SPEC_H;
+        let mut dataset: Vec<(RunSpec, Target)> = Vec::new();
+        let mut groups: Vec<usize> = Vec::new();
+        for (gi, &len) in lengths.iter().enumerate() {
+            let win = (SPEC_PHI_MAX + len * cell + SPEC_H) as u64;
+            let exhaustive = (1u64 << len) <= cap;
+            let n = if exhaustive { 1u64 << len } else { cap };
+            let mut drng = Rng::new(0xDA7A_5EED ^ len as u64);
+            for s in 0..n {
+                let bitval = if exhaustive { s } else { drng.below(1u32 << len) as u64 };
+                let bits: Vec<bool> = (0..len).map(|i| (bitval >> i) & 1 == 1).collect();
+                let sp = RunSpec { inputs: seq_words(bitval, len), cycles: win, ..dme_spec(0) };
+                dataset.push((sp, Target::SpecBits { bits, h: SPEC_H, phi_max: SPEC_PHI_MAX }));
+                groups.push(gi);
+            }
+        }
+        (dataset, groups)
+    }
+
+    /// Certify `champ` against the spec at the testbed's 16-cycle cell on one
+    /// data corpus. Returns the certifier's violation count (0 = PASS). The
+    /// capture is sized `phi_max + n_bits*cell + cell` so `strict_tail` catches a
+    /// loop that keeps clocking after the data ends. Expected bits are the 5-bit
+    /// line codes LSB-first (clause 147.4.2 / `dme_cfg`'s pull_threshold 5).
+    fn spec_certify_corpus(champ: &Program, corpus: &[u32]) -> usize {
+        use crate::certify::{certify_dme, channel_levels, DmeParams};
+        let cell = 2 * SPEC_H;
+        let mut expected: Vec<bool> = Vec::new();
+        for &w in corpus {
+            for i in 0..5 {
+                expected.push((w >> i) & 1 == 1);
+            }
+        }
+        let cycles = (SPEC_PHI_MAX + expected.len() * cell + cell) as u64;
+        let sp = RunSpec { inputs: corpus.to_vec(), cycles, ..dme_spec(0) };
+        let wave = run(champ, &sp);
+        let levels = channel_levels(&wave, 0, cycles as usize);
+        let p = DmeParams { half_cell: SPEC_H, phi_max: SPEC_PHI_MAX, strict_tail: true };
+        certify_dme(&levels, &expected, &p).violations.len()
+    }
+
+    /// `PASS` or `FAIL(n)` for a certifier violation count.
+    fn fmt_cert(n: usize) -> String {
+        if n == 0 { "PASS".into() } else { format!("FAIL({n})") }
+    }
+
+    /// Run one SPEC gated-ladder phase: build the spec dataset, climb the gated
+    /// curriculum ([`crate::search::synthesize_curriculum_gated`] — the SAME
+    /// engine the cycle-exact ladder uses, only the row `Target` differs),
+    /// stream a labeled `RUNG` marker per rung, write the JSONL trace, and gate
+    /// the final champion with the INDEPENDENT certifier on the training and
+    /// held-out corpora.
+    fn run_spec_gated_ladder(label: &str, template: &Program, lengths: &[usize], hp: &crate::search::CurriculumHp) {
+        use crate::search::{synthesize_curriculum_gated, Genes, Space};
+        let space = Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: Genes::default() };
+        let (dataset, groups) = dme_spec_multilength_dataset(lengths, 32);
+        eprintln!(
+            "\n=== {label} (SPEC oracle) === lengths {lengths:?} ({} seqs), cell={} data@+{SPEC_H} phi_max={SPEC_PHI_MAX}",
+            dataset.len(), 2 * SPEC_H
+        );
+        let lens = lengths.to_vec();
+        let lbl = label;
+
+        let seed = 0x5EEDu64;
+        std::fs::create_dir_all("runs").expect("create runs/ dir");
+        let trace_path = format!("runs/{label}-{seed:#x}.jsonl");
+        let sink = std::sync::Mutex::new(std::io::BufWriter::new(
+            std::fs::File::create(&trace_path).expect("create trace file"),
+        ));
+        eprintln!("trace -> {trace_path}");
+        let trace = |ev: &crate::search::TraceEvent| {
+            use std::io::Write;
+            let line = trace_json(ev);
+            let mut w = sink.lock().unwrap();
+            let _ = writeln!(w, "{line}");
+        };
+
+        let (champ, cost, solved) = synthesize_curriculum_gated(
+            template, &space, &dataset, &groups, lengths.len(), hp, 32, 4_000_000, 0.0, seed,
+            Some(&trace),
+            |frontier, rc, front_err, ok| {
+                let parts: Vec<_> = (0..space.slots as usize)
+                    .filter_map(|i| rc.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
+                    .collect();
+                eprintln!(
+                    "{lbl} RUNG L={:<2} {} front_err={front_err:6.1} size={} wrap {}..{}: [{}]",
+                    lens[frontier], if ok { "SOLVED" } else { "STALL " }, rc.size(), rc.wrap_bottom, rc.wrap_top, parts.join("  ")
+                );
+            },
+        );
+        let parts: Vec<_> = (0..space.slots as usize)
+            .filter_map(|i| champ.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
+            .collect();
+        let ct = spec_certify_corpus(&champ, &crate::fixtures::dme_corpus());
+        let cv = spec_certify_corpus(&champ, &crate::fixtures::dme_validation_corpus());
+        eprintln!(
+            "{label} DONE solved {solved}/{} cost={cost:.1} size={} [cert train={} held-out={}] wrap {}..{}: [{}]",
+            lengths.len(), champ.size(), fmt_cert(ct), fmt_cert(cv), champ.wrap_bottom, champ.wrap_top, parts.join("  ")
+        );
+    }
+
+    /// SPEC-ORACLE gated curriculum ladder (ticket 005) — the counterpart of
+    /// [`dme_curriculum_gated`] scored by the tolerance-band spec metric and
+    /// gated by the independent certifier. This is the user's next long run; DO
+    /// NOT expect it to finish in the fast suite. Run: `cargo test --release --
+    /// --ignored dme_spec_curriculum_gated --nocapture`.
+    #[test]
+    #[ignore = "spec-oracle gated curriculum ladder (several min); run with --release ... --nocapture"]
+    fn dme_spec_curriculum_gated() {
+        use crate::program::Program;
+        use crate::search::CurriculumHp;
+        let hp = CurriculumHp::default();
+        run_spec_gated_ladder("spec-oracle", &Program::empty(dme_cfg()), &(2..=14).collect::<Vec<_>>(), &hp);
+    }
+
+    /// END-TO-END SEARCHABILITY (the spec gradient reaches strict 0). Run the
+    /// SAME gated engine over the spec dataset at L=2 only and assert it drives
+    /// the strict frontier error (spec-cost at window 0) to 0 — a program whose
+    /// transitions land exactly on a compliant 16-cycle DME grid for all four
+    /// 2-bit sequences at some phase/polarity. This proves the spec metric has a
+    /// real, climbable gradient end to end (not that the champion generalizes —
+    /// that is the long run's job).
+    ///
+    /// FINDING (why this is `#[ignore]`, ~90s, not a fast smoke test): under the
+    /// spec oracle the L=2 conjunction is MATERIALLY HARDER to crack than under
+    /// the cycle-exact oracle, and needs the full 32×4M budget. The cause is the
+    /// Thompson hazard the ticket predicts: the tolerance-band metric (free phase,
+    /// free polarity) is charitable to a data-INDEPENDENT "toggle every half-cell"
+    /// program — the all-ones DME pattern — which matches every 1-bit exactly and
+    /// costs only `densify_w` (0.5) per 0-bit, so it sits in a strong, shallow
+    /// exploit basin with little gradient out of it. Under the cycle-exact oracle
+    /// a 0-bit's flat golden actively punishes every stray mid-toggle, so that
+    /// basin is far less attractive. Budget sweep at seed 0x5EED, default HP:
+    /// 16×1M → stalls at the toggler (frontier error 1.0); 24×2M → a
+    /// near-conjunction (3/4 sequences exact, error 0.5); 32×4M → cracks (error
+    /// 0). So the gradient IS searchable, but re-tuning the schedule / densify for
+    /// the spec oracle (migration-plan step 3) is the real lever, not brute
+    /// budget — left for the user's long run.
+    #[test]
+    #[ignore = "spec L=2 conjunction crack (~90s at 32x4M); run with --release ... --nocapture"]
+    fn dme_spec_ladder_crack_l2() {
+        use crate::program::Program;
+        use crate::search::{synthesize_curriculum_gated, CurriculumHp, Genes, Space};
+        let space = Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: Genes::default() };
+        let template = Program::empty(dme_cfg());
+        let (dataset, groups) = dme_spec_multilength_dataset(&[2], 32);
+        let hp = CurriculumHp::default();
+        let (champ, _cost, solved) = synthesize_curriculum_gated(
+            &template, &space, &dataset, &groups, 1, &hp, 32, 4_000_000, 0.0, 0x5EED,
+            None,
+            |_, _, _, _| {},
+        );
+        let parts: Vec<_> = (0..space.slots as usize)
+            .filter_map(|i| champ.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
+            .collect();
+        eprintln!("champ wrap {}..{} size {}: [{}]", champ.wrap_bottom, champ.wrap_top, champ.size(), parts.join("  "));
+        assert_eq!(solved, 1, "L=2 spec frontier must reach edge-error 0 (the gradient must be searchable)");
+    }
+
+    /// DETERMINISM: the same seed yields a byte-identical champion on the smoke
+    /// test (no wall-clock, no HashMap-order leak). Uses a tiny budget — this
+    /// checks reproducibility, not solve quality.
+    #[test]
+    fn dme_spec_ladder_deterministic() {
+        use crate::program::Program;
+        use crate::search::{synthesize_curriculum_gated, CurriculumHp, Genes, Space};
+        let space = Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: Genes::default() };
+        let template = Program::empty(dme_cfg());
+        let (dataset, groups) = dme_spec_multilength_dataset(&[2], 32);
+        let hp = CurriculumHp::default();
+        let run_once = || {
+            let (c, _, _) = synthesize_curriculum_gated(
+                &template, &space, &dataset, &groups, 1, &hp, 4, 50_000, 0.0, 0xD37,
+                None,
+                |_, _, _, _| {},
+            );
+            c.brief()
+        };
+        assert_eq!(run_once(), run_once(), "same seed must produce an identical champion");
     }
 
     /// GATED CURRICULUM LADDER (the generality engine): the structural fix for the

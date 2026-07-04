@@ -14,7 +14,42 @@ use crate::ir::*;
 use crate::program::{Config, Program, ShiftDir};
 use crate::rng::Rng;
 use crate::run::{run, RunSpec};
+use crate::spec_cost::spec_cost;
 use std::sync::Mutex;
+
+/// The oracle target one curriculum dataset row scores a candidate capture
+/// against (ticket 005's row-type generalization). One curriculum engine, two
+/// oracle row types — the ladder, retries, mining, and trace never fork; only
+/// the per-row cost dispatches here.
+///
+/// The two variants are the two tiers' *search* metrics: [`Target::Wave`] is
+/// the cycle-exact reference-waveform oracle master's testbed depends on;
+/// [`Target::SpecBits`] is the loose spec oracle. Both share the banded-edit-
+/// distance shape (missing = 1, spurious = `spurious_w`, matched = `Δ/(win+1)`),
+/// so the same `window`/`spurious_w` knobs and the same `window = 0` strict
+/// form drive either without any change to the search.
+#[derive(Clone, Debug)]
+pub enum Target {
+    /// Cycle-exact oracle: the capture must match `golden` edge-for-edge under
+    /// `mask` ([`edge_cost_w`]).
+    Wave { golden: Vec<u32>, mask: Vec<u32> },
+    /// Spec oracle: the capture's bit-0 transitions must land on the nearest
+    /// spec-compliant DME grid for `bits` (cell `2*h`, data at `+h`, phase
+    /// `<= phi_max`, polarity free — [`spec_cost`]).
+    SpecBits { bits: Vec<bool>, h: usize, phi_max: usize },
+}
+
+impl Target {
+    /// Smooth search cost of a candidate capture `wave` against this target,
+    /// with gradient-shaping `window` (timing band) and `spurious_w`. The
+    /// strict per-row error (the gate currency) is this at `window = 0`.
+    pub fn search_cost(&self, wave: &[u32], window: usize, spurious_w: f64) -> f64 {
+        match self {
+            Target::Wave { golden, mask } => edge_cost_w(golden, wave, mask, window, spurious_w),
+            Target::SpecBits { bits, h, phi_max } => spec_cost(wave, bits, *h, *phi_max, window, spurious_w),
+        }
+    }
+}
 
 /// What the search may vary: the first `slots` instruction slots, the wrap
 /// bounds, and the config `genes`. Everything not searched is taken from
@@ -1379,13 +1414,13 @@ pub fn synthesize_rainbow(
 /// across multiple data values is what makes the data-CONDITIONAL toggle
 /// output-visible — it is precisely the difference between the sequences' golden
 /// traces — and forbids hardcoding a single waveform. Size is counted once.
-fn multidata_cost(p: &Program, dataset: &[(RunSpec, Vec<u32>, Vec<u32>)], w: f64, window: usize, spurious_w: f64) -> f64 {
+fn multidata_cost(p: &Program, dataset: &[(RunSpec, Target)], w: f64, window: usize, spurious_w: f64) -> f64 {
     if p.validate().is_err() {
         return f64::INFINITY;
     }
     let mut total = 0.0;
-    for (sp, g, m) in dataset {
-        total += edge_cost_w(g, &run(p, sp), m, window, spurious_w);
+    for (sp, target) in dataset {
+        total += target.search_cost(&run(p, sp), window, spurious_w);
     }
     w * total + p.size() as f64
 }
@@ -1400,7 +1435,7 @@ fn multidata_cost(p: &Program, dataset: &[(RunSpec, Vec<u32>, Vec<u32>)], w: f64
 pub fn synthesize_curriculum_stage(
     template: &Program,
     space: &Space,
-    dataset: &[(RunSpec, Vec<u32>, Vec<u32>)],
+    dataset: &[(RunSpec, Target)],
     params: &Params,
     warm: Option<&Program>,
     restarts: usize,
@@ -1446,15 +1481,15 @@ pub fn synthesize_curriculum_stage(
 /// contribution is scaled by its length-group's `weights[group]`. Entries whose
 /// weight is 0 are skipped entirely (so early, long-length-zero iterations only
 /// run the short sequences — a real speedup). Strict window (0).
-fn weighted_multidata_cost(p: &Program, dataset: &[(RunSpec, Vec<u32>, Vec<u32>)], groups: &[usize], weights: &[f64], w: f64, spurious_w: f64) -> f64 {
+fn weighted_multidata_cost(p: &Program, dataset: &[(RunSpec, Target)], groups: &[usize], weights: &[f64], w: f64, spurious_w: f64) -> f64 {
     if p.validate().is_err() {
         return f64::INFINITY;
     }
     let mut total = 0.0;
-    for (i, (sp, g, m)) in dataset.iter().enumerate() {
+    for (i, (sp, target)) in dataset.iter().enumerate() {
         let wt = weights[groups[i]];
         if wt > 0.0 {
-            total += wt * edge_cost_w(g, &run(p, sp), m, 0, spurious_w);
+            total += wt * target.search_cost(&run(p, sp), 0, spurious_w);
         }
     }
     w * total + p.size() as f64
@@ -1474,7 +1509,7 @@ fn weighted_multidata_cost(p: &Program, dataset: &[(RunSpec, Vec<u32>, Vec<u32>)
 pub fn synthesize_curriculum_ramp(
     template: &Program,
     space: &Space,
-    dataset: &[(RunSpec, Vec<u32>, Vec<u32>)],
+    dataset: &[(RunSpec, Target)],
     groups: &[usize],
     n_groups: usize,
     params: &Params,
@@ -1532,14 +1567,14 @@ pub fn synthesize_curriculum_ramp(
 /// Unweighted raw edge-error total for a single length-`group` of a curriculum
 /// dataset (no size term, no cost weight) — the promotion gate's currency. A
 /// frontier rung is "solved" when this falls to (or below) `solve_eps`.
-fn group_edge_errors(p: &Program, dataset: &[(RunSpec, Vec<u32>, Vec<u32>)], groups: &[usize], group: usize, spurious_w: f64) -> f64 {
+fn group_edge_errors(p: &Program, dataset: &[(RunSpec, Target)], groups: &[usize], group: usize, spurious_w: f64) -> f64 {
     if p.validate().is_err() {
         return f64::INFINITY;
     }
     let mut total = 0.0;
-    for (i, (sp, g, m)) in dataset.iter().enumerate() {
+    for (i, (sp, target)) in dataset.iter().enumerate() {
         if groups[i] == group {
-            total += edge_cost_w(g, &run(p, sp), m, 0, spurious_w);
+            total += target.search_cost(&run(p, sp), 0, spurious_w);
         }
     }
     total
@@ -1707,7 +1742,7 @@ pub enum TraceEvent<'a> {
 pub fn synthesize_curriculum_gated(
     template: &Program,
     space: &Space,
-    dataset: &[(RunSpec, Vec<u32>, Vec<u32>)],
+    dataset: &[(RunSpec, Target)],
     groups: &[usize],
     n_groups: usize,
     hp: &CurriculumHp,
