@@ -1774,6 +1774,11 @@ pub fn synthesize_curriculum_gated(
         const LIB_MAX: usize = 8;
         let mut pool: Vec<Program> = warm_base.iter().cloned().collect();
         let mut lib: Vec<MinedMacro> = Vec::new();
+        // Restart minima accumulated across ALL attempts of this rung. Attempt 0
+        // is all-warm and typically ends as a monoculture (one distinct basin),
+        // so mining only the latest attempt would leave the first retry with
+        // nothing; the union keeps every basin any attempt ever reached.
+        let mut minima: Vec<(Program, f64, f64)> = Vec::new();
         let mut reheat = hp.reheat;
         let mut chosen: Option<(Program, f64)> = None; // (rung champion, its frontier error)
         for attempt in 0..=MAX_RETRIES {
@@ -1992,13 +1997,15 @@ pub fn synthesize_curriculum_gated(
             if solved_this {
                 break; // frontier solved — no more retries
             }
-            // FAILED ATTEMPT — rebuild the warm pool and macro library from this
-            // attempt's restart minima for the retry. Rank by selection cost
-            // (stable sort: ties keep restart-index order — deterministic), dedup
-            // by op structure so one basin contributes one pool entry, then mine
-            // macros from ALL structurally distinct minima (not just the top
-            // POOL_MAX — a mid-ranked random restart may hold the needed idiom).
-            let mut ranked: Vec<&(Program, f64, f64)> = results.iter().collect();
+            // FAILED ATTEMPT — rebuild the warm pool and macro library from the
+            // minima of EVERY attempt so far (accumulated union). Rank by
+            // selection cost (stable sort: ties keep accumulation order —
+            // deterministic), dedup by op structure so one basin contributes one
+            // pool entry, then mine macros from ALL structurally distinct minima
+            // (not just the top POOL_MAX — a mid-ranked random restart may hold
+            // the needed idiom).
+            minima.extend(results.iter().cloned());
+            let mut ranked: Vec<&(Program, f64, f64)> = minima.iter().collect();
             ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
             let mut seen = std::collections::HashSet::new();
             let distinct: Vec<&Program> =
