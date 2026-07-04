@@ -15,6 +15,7 @@
 //!     every value in the IR encodes to a legal instruction and reserved
 //!     bit patterns are unrepresentable.
 
+pub mod certify;
 pub mod cost;
 pub mod decode;
 pub mod encode;

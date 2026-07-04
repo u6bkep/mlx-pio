@@ -109,6 +109,28 @@ Polarity falls out for free (decode only looks at transitions). Note `eps` is in
 simulation resolution, so `eps` is our sim-resolution stand-in for the
 receiver's eye tolerance — one more reason the HW tier exists.
 
+## FINDING (2026-07-04, certifier v1): the reference encoder is not spec-shaped
+
+The first thing the independent certifier (`src/certify.rs`) caught was
+`dme_ref` itself. Its real waveform (probe dump in `certify.rs`) is a
+**14-cycle bit-cell with the data transition at +6** — not the mid-cell the
+spec's T3 (40 of 80 ns) demands — plus a **+1-cycle slip at every 5-bit word
+boundary** (the in-loop `pull` latency; ≈5.7 ns of symbol-to-symbol jitter at
+the 14-cycle↔80 ns mapping, over the 5 ns budget). Under any consistent ns
+mapping the reference is non-compliant on both counts; pinned as the
+`dme_ref_is_not_spec_shaped` test.
+
+Consequences: (a) every cycle-exact champion to date has been *forced* to
+reproduce these implementation artifacts — the strongest concrete case yet for
+this ticket; (b) the spec oracle is not "the reference, loosened" but a target
+the reference doesn't meet — champions can no longer be validated by Hamming
+against `dme_ref`, the certifier replaces that gate entirely; (c) a compliant
+TX must center its data transitions and hide the refill latency, which is
+exactly what **autopull** (or balanced refill delay slots) buys — the
+config-polish thread and this ticket converge; (d) the spec testbed must pick
+a nominal cell (e.g. 16 cycles, mid at +8, room for a balanced refill path) —
+`DME_H` no longer follows from the reference's shape.
+
 ## Search metric: fitted-grid edge distance (recommendation)
 
 Reuse the machinery that already works, aimed at a *fitted* target instead of a
