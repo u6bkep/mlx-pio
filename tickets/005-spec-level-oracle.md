@@ -203,10 +203,14 @@ trait Oracle: Sync {
    some RP2350s overclock well past that, "needs an overclocked part" doesn't
    make a good PIO program. v1 grants phase/polarity/schedule freedom at pinned
    clkdiv. Revisit only alongside a deliberate high-sys-clock target.
-3. **Scope of v1**: DME TX bit-cells only (current testbed), or include
-   10BASE-T1S framing realities (SYNC/beacon, idle line state, BEACON/COMMIT)
-   where phase freedom interacts with the protocol state machine?
-4. **Certifier independence standard**: separate module written from the spec
-   text is the plan — is "same author (this project), different code" enough, or
-   should the certifier eventually be cross-validated against an external
-   implementation / captured real-PHY waveforms before we trust champions?
+3. ~~Scope of v1~~ **RESOLVED 2026-07-04 (user): bare DME bit-cells only** while
+   the oracle and curriculum are in flux — keeps runs fast. Framing (T1 gap,
+   extra DME `0` + high-Z idle, SYNC/beacon) comes later as its own stage.
+4. ~~Certifier independence standard~~ **RESOLVED 2026-07-04 (user)**:
+   separately-written in-repo decoder (no shared code with `dme_ref` or the
+   search metric, mutant-tested) is sufficient for now; a **real-scope
+   cross-check is wanted eventually** and remains the HW-tier backstop —
+   deferred, not dropped.
+
+All four design questions are resolved; the ticket is unblocked for
+implementation in the migration-plan order above (certifier first).
