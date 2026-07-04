@@ -128,8 +128,13 @@ against `dme_ref`, the certifier replaces that gate entirely; (c) a compliant
 TX must center its data transitions and hide the refill latency, which is
 exactly what **autopull** (or balanced refill delay slots) buys — the
 config-polish thread and this ticket converge; (d) the spec testbed must pick
-a nominal cell (e.g. 16 cycles, mid at +8, room for a balanced refill path) —
-`DME_H` no longer follows from the reference's shape.
+a nominal cell — `DME_H` no longer follows from the reference's shape.
+**DECIDED 2026-07-04 (user): nominal cell = 16 cycles, data transition at +8**
+(power-of-two friendly, slack for a balanced refill path).
+
+Implementation started 2026-07-04 on branch `spec-oracle` (worktree in the
+sibling folder `../pio_optimization-spec-oracle`) while the xpoll-mined ladder
+run finishes on master.
 
 ## Search metric: fitted-grid edge distance (recommendation)
 
