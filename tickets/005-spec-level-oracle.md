@@ -62,15 +62,38 @@ actively searches for the interpretation most charitable to the candidate. So:
 
 ## The spec, formalized (DME TX v1)
 
+Real numbers from IEEE 802.3-2022 Clause 147 (extracts + citations in
+`docs/802.3-clause147-dme-timing.md`): bit-cell **T2 = 80 ns ± 100 ppm**
+(clock-to-clock transition), mid-cell data transition **T3 = 40 ns, band
+38–42 ns**, transmitter jitter **< 5 ns symbol-to-symbol**, inter-transmission
+gap **T1 ≥ 480 ns**, idle = one extra DME `0` then high-Z / diff-0V.
+
+**Resolution reality check.** At the testbed's 8 cycles/cell one sys-cycle is
+10 ns; at a real 150 MHz target, 6.67 ns. Every per-edge freedom above (±2 ns
+on T3, 5 ns jitter) is *sub-cycle* at these resolutions, and ±100 ppm is
+crystal-class rate accuracy, not slack. So a compliant PIO transmitter must
+hit the exact nominal integer grid — the spec-level oracle's payoff on TX is
+**not edge fuzz** but the *family* of compliant waveforms: phase/startup
+latency, polarity, and the schedule/clkdiv realization of the grid. (It also
+bounds the oversampling dream: fractional-clkdiv ±1-cycle wander on the bit
+clock is only in-spec when one sys-cycle < 5 ns, i.e. sys clock > 200 MHz.)
+The looser `eps` in the *search metric* below is therefore pure gradient
+shaping — intermediate candidates get partial credit for near-miss edges —
+while the certifier enforces spec-true placement at the target resolution.
+The full tolerance bands become load-bearing in the **RX direction**, where a
+receiver program must decode worst-case compliant input (±100 ppm, 5 ns
+jitter, T3 anywhere in 38–42 ns) — there the oracle generates the adversarial
+input family instead of accepting an output family.
+
 A captured waveform `w` (per-cycle pin samples, sys-clock resolution) is
 **compliant for data bits `b[0..n]`** iff there exist parameters within bands —
 
-| param | meaning | band (PROPOSED, see open questions) |
+| param | meaning | band |
 |---|---|---|
-| `T` | bit-cell period, cycles | `T_nom ± tol_T` (e.g. 8 ± 0.5 at DME_H=4) |
+| `T` | bit-cell period, cycles | spec-true: nominal integer grid (80 ns ↔ 8 cells at DME_H=4); ±100 ppm is sub-resolution |
 | `phi` | phase of first boundary edge | `[0, phi_max)` — bounded startup latency |
 | `pol` | polarity | free: `{normal, inverted}` |
-| `eps` | per-edge jitter budget, cycles | edges within `± eps` of ideal grid |
+| `eps` | per-edge budget, cycles | certifier: spec-true (0 at ≤ 500 MHz); search metric: a gradient-shaping knob |
 
 — such that the transition sequence of `w` decodes to `b`:
 
@@ -169,12 +192,16 @@ trait Oracle: Sync {
 
 ## Open questions (USER INPUT NEEDED before code)
 
-1. **Band numbers.** `T_nom ± tol_T` and `eps` for the testbed: what does a real
-   10BASE-T1S receiver tolerate, scaled to our cycles-per-symbol? (User knows
-   802.3cg / has rs10base-t1s experience; the table above is a placeholder.)
-2. **Is `T` itself searchable?** If the spec oracle accepts any in-band period,
-   do we re-enable clkdiv genes immediately (re-run the config-gene experiment)
-   or keep clkdiv pinned for v1 and grant only phase/polarity/jitter freedom?
+1. ~~Band numbers~~ **RESOLVED 2026-07-04**: real numbers extracted from IEEE
+   802.3-2022 Table 147–2 + 147.5.4.3 (see `docs/802.3-clause147-dme-timing.md`
+   and the resolution reality-check above). The residual knob is the *search
+   metric's* `eps` (pure gradient shaping, certifier unaffected) — an
+   engineering choice to tune, not a spec question.
+2. **Is `T` itself searchable?** The spec pins the *rate* (±100 ppm) but not the
+   *realization* — any clkdiv×schedule product hitting 12.5 MBd nominal is
+   legal. Do we re-enable clkdiv genes immediately (re-run the config-gene
+   experiment, letting the search trade cycles-per-cell against schedule), or
+   keep clkdiv pinned for v1 and grant only phase/polarity freedom?
 3. **Scope of v1**: DME TX bit-cells only (current testbed), or include
    10BASE-T1S framing realities (SYNC/beacon, idle line state, BEACON/COMMIT)
    where phase freedom interacts with the protocol state machine?
