@@ -11,7 +11,8 @@ Status values: `open` · `in-progress` · `blocked` · `done` · `wontfix`
 | 002 | Meta-optimize search hyperparameters | in-progress (tuning transfers) | high |
 | 003 | Hash-based tabu list | open | low |
 | 004 | Eval hot-path performance | in-progress (3.4x) | high |
-| 005 | Spec-level oracle (tolerance-band metric + independent certifier) | open (design) | high |
+| 005 | Spec-level oracle (tolerance-band metric + independent certifier) | in-progress (certifier+plumbing+densify done; long run live) | high |
+| 006 | Runner / problem / engine restructure | in-progress (resumable runner landed) | high |
 
 Provenance: 001–003 distilled from a survey of `reference/mlx86` (a friend's
 x86-assembly superoptimizer) on 2026-06-22. The split of what transfers vs. what
