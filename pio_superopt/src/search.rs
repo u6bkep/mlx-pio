@@ -1064,6 +1064,40 @@ fn weighted_multidata_cost(p: &Program, dataset: &[(RunSpec, Target)], groups: &
     w * total + p.size() as f64
 }
 
+/// [`weighted_multidata_cost`] with a REJECT BOUND — the Metropolis hot-path
+/// variant. Rows accumulate non-negatively, so once the partial weighted sum
+/// alone exceeds `bound` the true cost is guaranteed above it and the caller
+/// will reject regardless of the remaining rows: return `(partial, false)`
+/// without evaluating them. A complete evaluation returns `(cost, true)` and
+/// is bit-identical to [`weighted_multidata_cost`] (same row order, same
+/// arithmetic). Invalid programs return `(INFINITY, false)` — the caller's
+/// non-exact path must reject AND consume the Metropolis draw, exactly as the
+/// exact path would for an infinite cost.
+fn weighted_multidata_cost_bounded(
+    p: &Program,
+    dataset: &[(RunSpec, Target)],
+    groups: &[usize],
+    weights: &[f64],
+    w: f64,
+    spurious_w: f64,
+    bound: f64,
+) -> (f64, bool) {
+    if p.validate().is_err() {
+        return (f64::INFINITY, false);
+    }
+    let mut total = 0.0;
+    for (i, (sp, target)) in dataset.iter().enumerate() {
+        let wt = weights[groups[i]];
+        if wt > 0.0 {
+            total += wt * target.search_cost(&run(p, sp), 0, spurious_w);
+            if w * total > bound {
+                return (w * total, false);
+            }
+        }
+    }
+    (w * total + p.size() as f64, true)
+}
+
 /// Unweighted raw edge-error total for a single length-`group` of a curriculum
 /// dataset (no size term, no cost weight) — the promotion gate's currency. A
 /// frontier rung is "solved" when this falls to (or below) `solve_eps`.
@@ -1612,8 +1646,23 @@ pub fn synthesize_curriculum_gated(
                                     }
                                 }
                                 let cand = mutate_lib(&cur, space, false, lib, &mut rng);
-                                let cc = weighted_multidata_cost(&cand, dataset, groups, &weights, hp.w, hp.densify_w);
-                                if cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / temp).exp() {
+                                // REJECT-BOUND EARLY EXIT: a candidate whose partial
+                                // cost already exceeds cur + 40*temp has acceptance
+                                // probability < e^-40 (~4e-18, below the RNG's 2^-53
+                                // resolution) — stop evaluating rows and reject. The
+                                // discarded draw keeps the RNG stream identical to
+                                // the exact path (which draws whenever cc > cur).
+                                let (cc, exact) = weighted_multidata_cost_bounded(
+                                    &cand, dataset, groups, &weights, hp.w, hp.densify_w,
+                                    cur_cost + 40.0 * temp,
+                                );
+                                let accepted = if exact {
+                                    cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / temp).exp()
+                                } else {
+                                    let _ = rng.unit();
+                                    false
+                                };
+                                if accepted {
                                     cur = cand;
                                     cur_cost = cc;
                                     // MISS FIX: the periodic sample above only checks the
