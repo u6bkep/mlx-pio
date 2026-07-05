@@ -2596,6 +2596,132 @@ mod tests {
         assert_eq!(run_once(), run_once(), "same seed must produce an identical champion");
     }
 
+    /// Classify a spec-ladder champion by INSPECTING its wrap (loop) region, not
+    /// its cost — the sweep needs to tell the data-independent exploit apart from
+    /// a real encoder even when both score near 0.
+    ///
+    /// * `TOGGLER` — the wrap region neither CONSUMES data (`out`, or `mov`-from-
+    ///   OSR) nor branches on the DATA VALUE. This is the half-cell toggler: it
+    ///   emits transitions on a fixed schedule regardless of the bits.
+    /// * `CONJUNCTION` — the region both consumes data AND branches on the value
+    ///   in X/Y (`jmp !X / x-- / !Y / y-- / x!=y`). That is read+branch+toggle:
+    ///   the data-driven encoder.
+    /// * `OTHER` — anything mixed (consumes but never branches on the value, or
+    ///   vice-versa).
+    ///
+    /// Value-branch conditions exclude `Always` (unconditional loop) and
+    /// `NotOsrEmpty` (a REFILL test on OSR occupancy, not the bit value) — both of
+    /// which a pure toggler legitimately uses.
+    fn spec_classify(champ: &Program) -> &'static str {
+        use crate::ir::{JmpCond, MovSrc, Op};
+        let (b, t) = (champ.wrap_bottom as usize, (champ.wrap_top as usize).min(31));
+        let mut consumes = false;
+        let mut value_branch = false;
+        for i in b..=t {
+            let Some(ins) = &champ.slots[i] else { continue };
+            match &ins.op {
+                Op::Out { .. } => consumes = true,
+                Op::Mov { src: MovSrc::Osr, .. } => consumes = true,
+                Op::Jmp { cond, .. } => {
+                    if matches!(
+                        cond,
+                        JmpCond::NotX | JmpCond::XPostDec | JmpCond::NotY | JmpCond::YPostDec | JmpCond::XneY
+                    ) {
+                        value_branch = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match (consumes, value_branch) {
+            (false, false) => "TOGGLER",
+            (true, true) => "CONJUNCTION",
+            _ => "OTHER",
+        }
+    }
+
+    /// DENSIFY SWEEP (spec oracle): find where raising `densify_w` (the spurious-
+    /// edge weight) prices the toggler exploit up enough that the read+branch
+    /// conjunction wins at a MODEST budget. The toggler's entire cost is the
+    /// discounted spurious mid-edge on each 0-bit, so `densify_w → 1.0` makes the
+    /// exploit more expensive — but may re-open the sparse-edge trap densify
+    /// exists to break. Axes: `densify_w ∈ {0.25,0.5,0.75,1.0}` × budget ∈
+    /// {16×1M, 24×2M}, lengths 2..=3, seed 0x5EED, default HP otherwise. One
+    /// streamed line per cell (solved-through, frontier error at the stall,
+    /// champion class, champion). If a densify cracks 2..=3 at 16×1M (where the
+    /// default 0.5 does not), a confirmation cell re-runs it at lengths 2..=5.
+    /// Heavy (a stalled cell runs the full budget × retries — minutes); run with
+    /// `cargo test --release -- --ignored dme_spec_densify_sweep --nocapture`.
+    ///
+    /// RESULTS (seed 0x5EED, filled from a real run — see below).
+    /// TABLE_PLACEHOLDER
+    #[test]
+    #[ignore = "densify_w sweep for the spec metric (heavy, several min); run with --release ... --nocapture"]
+    fn dme_spec_densify_sweep() {
+        use crate::program::Program;
+        use crate::search::{synthesize_curriculum_gated, CurriculumHp, Genes, Space};
+        let space = Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: Genes::default() };
+        let template = Program::empty(dme_cfg());
+        let seed = 0x5EEDu64;
+
+        // Run one gated-ladder cell; return (solved_through, stall_frontier_error,
+        // class, champion-brief). `stall_fe` is the final error on the frontier
+        // where the ladder stopped (0 if it solved every length).
+        let run_cell = |lengths: &[usize], dw: f64, restarts: usize, iters: u32| -> (usize, f64, &'static str, String) {
+            let (dataset, groups) = dme_spec_multilength_dataset(lengths, 32);
+            let hp = CurriculumHp { densify_w: dw, ..CurriculumHp::default() };
+            let rungs = std::sync::Mutex::new(Vec::<(usize, f64, bool)>::new());
+            let (champ, _cost, solved) = synthesize_curriculum_gated(
+                &template, &space, &dataset, &groups, lengths.len(), &hp, restarts, iters, 0.0, seed,
+                None,
+                |frontier, _rc, fe, ok| rungs.lock().unwrap().push((frontier, fe, ok)),
+            );
+            let rr = rungs.lock().unwrap();
+            let stall_fe = if solved == lengths.len() {
+                0.0
+            } else {
+                // The stalled frontier is index `solved` (the first unsolved);
+                // take its last-reported error.
+                rr.iter().filter(|(f, _, _)| *f == solved).last().map(|(_, fe, _)| *fe).unwrap_or(f64::NAN)
+            };
+            let parts: Vec<_> = (0..space.slots as usize)
+                .filter_map(|i| champ.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
+                .collect();
+            (solved, stall_fe, spec_classify(&champ), format!("wrap {}..{} [{}]", champ.wrap_bottom, champ.wrap_top, parts.join(" ")))
+        };
+
+        let lengths: Vec<usize> = (2..=3).collect();
+        let densities = [0.25f64, 0.5, 0.75, 1.0];
+        let budgets = [(16usize, 1_000_000u32), (24usize, 2_000_000u32)];
+        eprintln!("=== densify sweep (SPEC oracle) lengths {lengths:?} seed {seed:#x} ===");
+        eprintln!("{:<8} {:<10} {:<7} {:<9} {:<12} champion", "densify", "budget", "solved", "stall_fe", "class");
+        // Track which densify cracks fully at the CHEAP budget (16×1M).
+        let mut cheap_winner: Option<f64> = None;
+        for &dw in &densities {
+            for &(restarts, iters) in &budgets {
+                let (solved, stall_fe, class, champ) = run_cell(&lengths, dw, restarts, iters);
+                let budget = format!("{restarts}x{}", iters / 1_000_000);
+                eprintln!(
+                    "{dw:<8} {budget:<10} {solved}/{:<5} {stall_fe:<9.2} {class:<12} {champ}",
+                    lengths.len()
+                );
+                if restarts == 16 && solved == lengths.len() && cheap_winner.is_none() {
+                    cheap_winner = Some(dw);
+                }
+            }
+        }
+
+        match cheap_winner {
+            Some(dw) => {
+                let conf: Vec<usize> = (2..=5).collect();
+                eprintln!("\n--- confirmation: densify {dw} cracks 2..=3 at 16×1M; re-run at lengths {conf:?} (16×1M) ---");
+                let (solved, stall_fe, class, champ) = run_cell(&conf, dw, 16, 1_000_000);
+                eprintln!("CONFIRM densify {dw} 16x1  solved {solved}/{}  stall_fe {stall_fe:.2}  {class}  {champ}", conf.len());
+            }
+            None => eprintln!("\n--- no densify cracked 2..=3 at 16×1M; the default 0.5 has no cheap winner to confirm ---"),
+        }
+    }
+
     /// GATED CURRICULUM LADDER (the generality engine): the structural fix for the
     /// stalls in [`dme_curriculum_length`]/[`dme_curriculum_multilength`]. The
     /// trigger is now PERFORMANCE, not iteration — advance to the next length only
