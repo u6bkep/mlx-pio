@@ -1046,54 +1046,165 @@ fn multidata_cost(p: &Program, dataset: &[(RunSpec, Target)], w: f64, window: us
     w * total + p.size() as f64
 }
 
-/// Weighted multi-data cost: like [`multidata_cost`] but each entry's
-/// contribution is scaled by its length-group's `weights[group]`. Entries whose
-/// weight is 0 are skipped entirely (so early, long-length-zero iterations only
-/// run the short sequences — a real speedup). Strict window (0).
-fn weighted_multidata_cost(p: &Program, dataset: &[(RunSpec, Target)], groups: &[usize], weights: &[f64], w: f64, spurious_w: f64) -> f64 {
-    if p.validate().is_err() {
-        return f64::INFINITY;
-    }
-    let mut total = 0.0;
-    for (i, (sp, target)) in dataset.iter().enumerate() {
-        let wt = weights[groups[i]];
-        if wt > 0.0 {
-            total += wt * target.search_cost(&run(p, sp), 0, spurious_w);
-        }
-    }
-    w * total + p.size() as f64
+/// One eval-cache entry: an EXACT program key and the per-group raw
+/// (unweighted) edge-error sums it evaluated to. `mask` records which groups'
+/// sums are valid — an entry cached while a group's weight was 0 never ran
+/// that group's rows.
+struct EvalEntry {
+    words: [u16; 32],
+    wrap: (u8, u8),
+    config: Config,
+    mask: u32,
+    raw: Box<[f64]>,
 }
 
-/// [`weighted_multidata_cost`] with a REJECT BOUND — the Metropolis hot-path
-/// variant. Rows accumulate non-negatively, so once the partial weighted sum
-/// alone exceeds `bound` the true cost is guaranteed above it and the caller
-/// will reject regardless of the remaining rows: return `(partial, false)`
-/// without evaluating them. A complete evaluation returns `(cost, true)` and
-/// is bit-identical to [`weighted_multidata_cost`] (same row order, same
-/// arithmetic). Invalid programs return `(INFINITY, false)` — the caller's
-/// non-exact path must reject AND consume the Metropolis draw, exactly as the
-/// exact path would for an infinite cost.
-fn weighted_multidata_cost_bounded(
+/// Transposition cache for candidate evaluations (ticket 004). Duplicate
+/// candidates are ~32-39% of all evals across stall regimes (measured by
+/// key-stream replay, 2026-07-05), and repeats are temporally local — a
+/// direct-mapped table with replace-on-collision captures ~96% of the
+/// unbounded-cache ceiling; no associativity or admission policy needed.
+///
+/// Correctness contract (this is what keeps resume byte-identical):
+/// - Keys are EXACT — assembled words + wrap + full config. Two programs that
+///   key equal produce identical captures, so identical raw errors.
+/// - Values are per-group RAW sums; weights are applied at lookup. A hit
+///   therefore recomputes `Σ wt_g * raw_g` with the same f64 operands in the
+///   same order as a miss would, so hit-vs-miss is bit-identical and the
+///   cache never needs snapshotting — a resumed run starts cold and still
+///   reproduces the original byte-for-byte.
+///
+/// One cache per restart thread, dropped at attempt end (a stricter
+/// invalidation than the per-rung minimum the design requires).
+/// `SUPEROPT_EVAL_CACHE=0` disables it (A/B transparency checks).
+struct EvalCache {
+    slots: Vec<Option<Box<EvalEntry>>>,
+    /// Per-group contiguous `[start, end)` row ranges of the dataset.
+    ranges: Vec<(usize, usize)>,
+    enabled: bool,
+    lookups: u64,
+    hits: u64,
+}
+
+const EVAL_CACHE_BITS: u32 = 16;
+
+impl EvalCache {
+    fn new(groups: &[usize], n_groups: usize) -> Self {
+        assert!(n_groups <= 32, "group mask is a u32");
+        let mut ranges = vec![(0usize, 0usize); n_groups];
+        let mut prev = 0usize;
+        for (i, &g) in groups.iter().enumerate() {
+            assert!(g >= prev, "dataset groups must be contiguous ascending");
+            if g != prev || i == 0 {
+                ranges[g].0 = i;
+            }
+            ranges[g].1 = i + 1;
+            prev = g;
+        }
+        let enabled = std::env::var_os("SUPEROPT_EVAL_CACHE").map(|v| v != "0").unwrap_or(true);
+        EvalCache {
+            slots: if enabled { (0..1usize << EVAL_CACHE_BITS).map(|_| None).collect() } else { Vec::new() },
+            ranges,
+            enabled,
+            lookups: 0,
+            hits: 0,
+        }
+    }
+
+    fn slot_of(words: &[u16; 32], wrap: (u8, u8)) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (words, wrap).hash(&mut h);
+        (h.finish() & ((1u64 << EVAL_CACHE_BITS) - 1)) as usize
+    }
+
+    fn hit_rate(&self) -> f64 {
+        if self.lookups == 0 { 0.0 } else { self.hits as f64 / self.lookups as f64 }
+    }
+}
+
+/// Weighted multi-data cost through the eval cache, with an optional REJECT
+/// BOUND (pass `f64::INFINITY` for the plain checkpoint/init variant).
+///
+/// Each active group's rows (weight > 0) sum to a raw subtotal first; the
+/// weighted total accumulates `wt_g * raw_g` in group order. Groups whose
+/// raw sums are cached skip the emulator entirely; freshly evaluated groups
+/// merge into the entry, so a checkpoint re-score under new weights (or the
+/// selection metric's extra lookahead group) only pays for the groups it has
+/// never seen. Skipped-when-weight-0 semantics are preserved.
+///
+/// Bound behavior: totals accumulate non-negatively, so once the partial
+/// weighted sum exceeds `bound` the caller is guaranteed to reject — return
+/// `(partial, false)` without the remaining rows and without inserting. The
+/// miss path also checks per-row inside a group (cheaper bail); a hit checks
+/// at group boundaries only. The two agree on the `exact` flag: a per-row
+/// bail inside group g implies the group-g boundary partial exceeds the
+/// bound too (monotone accumulation), and both non-exact returns are
+/// rejected identically, so hit-vs-miss stays bit-identical. Invalid
+/// programs return `(INFINITY, false)` — the caller's non-exact path must
+/// reject AND consume the Metropolis draw.
+fn weighted_multidata_cost_cached(
     p: &Program,
     dataset: &[(RunSpec, Target)],
-    groups: &[usize],
     weights: &[f64],
     w: f64,
     spurious_w: f64,
     bound: f64,
+    cache: &mut EvalCache,
 ) -> (f64, bool) {
     if p.validate().is_err() {
         return (f64::INFINITY, false);
     }
-    let mut total = 0.0;
-    for (i, (sp, target)) in dataset.iter().enumerate() {
-        let wt = weights[groups[i]];
-        if wt > 0.0 {
-            total += wt * target.search_cost(&run(p, sp), 0, spurious_w);
-            if w * total > bound {
-                return (w * total, false);
+    let n_groups = cache.ranges.len();
+    let key = if cache.enabled { Some((p.assemble(), (p.wrap_bottom, p.wrap_top))) } else { None };
+    let slot = key.as_ref().map(|(words, wrap)| EvalCache::slot_of(words, *wrap));
+    // Pull any valid raw sums out of a key-matching entry.
+    let (mut raw, mut have): (Vec<f64>, u32) = match (&key, slot) {
+        (Some((words, wrap)), Some(s)) => match &cache.slots[s] {
+            Some(e) if e.words == *words && e.wrap == *wrap && e.config == p.config => {
+                (e.raw.to_vec(), e.mask)
             }
+            _ => (vec![0.0; n_groups], 0),
+        },
+        _ => (vec![0.0; n_groups], 0),
+    };
+    let needed: u32 = (0..n_groups).filter(|&g| weights[g] > 0.0).fold(0, |m, g| m | 1 << g);
+    if cache.enabled {
+        cache.lookups += 1;
+        if needed & !have == 0 {
+            cache.hits += 1;
         }
+    }
+    let mut total = 0.0;
+    for g in 0..n_groups {
+        let wt = weights[g];
+        if wt <= 0.0 {
+            continue;
+        }
+        if have & (1 << g) == 0 {
+            let (start, end) = cache.ranges[g];
+            let mut sub = 0.0;
+            for (sp, target) in &dataset[start..end] {
+                sub += target.search_cost(&run(p, sp), 0, spurious_w);
+                if w * (total + wt * sub) > bound {
+                    return (w * (total + wt * sub), false);
+                }
+            }
+            raw[g] = sub;
+            have |= 1 << g;
+        }
+        total += wt * raw[g];
+        if w * total > bound {
+            return (w * total, false);
+        }
+    }
+    if let (Some((words, wrap)), Some(s)) = (key, slot) {
+        cache.slots[s] = Some(Box::new(EvalEntry {
+            words,
+            wrap,
+            config: p.config,
+            mask: have,
+            raw: raw.into_boxed_slice(),
+        }));
     }
     (w * total + p.size() as f64, true)
 }
@@ -1519,12 +1630,17 @@ pub fn synthesize_curriculum_gated(
                                     None => random_program(template, space, &mut rng),
                                 },
                             };
+                            // Per-restart eval cache, dropped at attempt end.
+                            // Transparent (hit == miss bit-for-bit), so it is
+                            // NOT part of the snapshot: resume starts cold and
+                            // still reproduces the run byte-identically.
+                            let mut cache = EvalCache::new(groups, n_groups);
                             let mut weights = weights_at(0.0);
-                            let mut cur_cost = weighted_multidata_cost(&cur, dataset, groups, &weights, hp.w, hp.densify_w);
+                            let mut cur_cost = weighted_multidata_cost_cached(&cur, dataset, &weights, hp.w, hp.densify_w, f64::INFINITY, &mut cache).0;
                             // Track the best by the SELECTION metric (all active lengths).
                             let mut best = match mid_snap {
                                 Some(s) => (s.restarts[r].best.clone(), s.restarts[r].best_sel),
-                                None => (cur.clone(), weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w)),
+                                None => (cur.clone(), weighted_multidata_cost_cached(&cur, dataset, active_ones, hp.w, hp.densify_w, f64::INFINITY, &mut cache).0),
                             };
                             for i in start_iter..rung_iters {
                                 // Temp is computed here (unconditionally, unchanged) so
@@ -1539,8 +1655,8 @@ pub fn synthesize_curriculum_gated(
                                     // and continues byte-identically.
                                     let stash = (rng.state(), cur.clone(), best.0.clone(), best.1);
                                     weights = weights_at(i as f64 / rung_iters as f64);
-                                    cur_cost = weighted_multidata_cost(&cur, dataset, groups, &weights, hp.w, hp.densify_w);
-                                    let active = weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w);
+                                    cur_cost = weighted_multidata_cost_cached(&cur, dataset, &weights, hp.w, hp.densify_w, f64::INFINITY, &mut cache).0;
+                                    let active = weighted_multidata_cost_cached(&cur, dataset, active_ones, hp.w, hp.densify_w, f64::INFINITY, &mut cache).0;
                                     let improved = active < best.1;
                                     if improved {
                                         best = (cur.clone(), active);
@@ -1626,8 +1742,8 @@ pub fn synthesize_curriculum_gated(
                                     // (never in the hot path).
                                     if r == 0 && hb_checkpoint {
                                         eprintln!(
-                                            "  [hb] rung#{frontier} attempt {attempt} iter {i}/{rung_iters} best_sel={:.1} best_fe={bfe:.1}{}",
-                                            best.1, if done { "  (frontier solved)" } else { "" }
+                                            "  [hb] rung#{frontier} attempt {attempt} iter {i}/{rung_iters} best_sel={:.1} best_fe={bfe:.1} cache={:.0}%{}",
+                                            best.1, 100.0 * cache.hit_rate(), if done { "  (frontier solved)" } else { "" }
                                         );
                                     }
                                     // Early stop once ANY restart has solved the frontier.
@@ -1652,9 +1768,9 @@ pub fn synthesize_curriculum_gated(
                                 // resolution) — stop evaluating rows and reject. The
                                 // discarded draw keeps the RNG stream identical to
                                 // the exact path (which draws whenever cc > cur).
-                                let (cc, exact) = weighted_multidata_cost_bounded(
-                                    &cand, dataset, groups, &weights, hp.w, hp.densify_w,
-                                    cur_cost + 40.0 * temp,
+                                let (cc, exact) = weighted_multidata_cost_cached(
+                                    &cand, dataset, &weights, hp.w, hp.densify_w,
+                                    cur_cost + 40.0 * temp, &mut cache,
                                 );
                                 let accepted = if exact {
                                     cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / temp).exp()
@@ -1671,7 +1787,7 @@ pub fn synthesize_curriculum_gated(
                                     // (possibly zero) — a moment the sample can miss — so
                                     // check the selection metric immediately.
                                     if cur_cost < hp.w {
-                                        let active = weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w);
+                                        let active = weighted_multidata_cost_cached(&cur, dataset, active_ones, hp.w, hp.densify_w, f64::INFINITY, &mut cache).0;
                                         if active < best.1 {
                                             best = (cur.clone(), active);
                                             if let Some(tr) = on_trace {
@@ -1690,7 +1806,7 @@ pub fn synthesize_curriculum_gated(
                                     }
                                 }
                             }
-                            let active = weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w);
+                            let active = weighted_multidata_cost_cached(&cur, dataset, active_ones, hp.w, hp.densify_w, f64::INFINITY, &mut cache).0;
                             if active < best.1 {
                                 best = (cur, active);
                             }
