@@ -1,44 +1,47 @@
 # STATUS — current frontier
 
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
-> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-05.
+> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-05 (pm).
 
-## Where we are
+## Strategy pivot (agreed 2026-07-05)
 
-**The L=6 wall is ORACLE-INDEPENDENT.** The spec-oracle long run's fate is
-already known: a deterministic copy of its trace was resumed to completion
-during eval-cache measurements — attempt 2 of L=6 stalls, ladder breaks,
-**solved 4/13**, champion has the refill idiom two-thirds wired
-(`jmp NotOsrEmpty` + second `pull`), cert FAIL(3)/FAIL(6). Same wall as
-cycle-exact ⇒ basin topology around the OSR-refill conjunction, not the
-reference's timing artifacts. The live run (if still going) is only
-confirming this — safe to Ctrl-C.
+The 6th L=6 stall (autopull-gene run: champion had NO pull at all and still
+broke at the word seam, fe=8 vs 11) killed the refill-spine hypothesis and
+with it the from-scratch synthesis framing. New tracks:
 
-**Branch `runner-restructure`** (worktree ../pio_optimization-restructure,
-4 commits, all tests green) — READY TO MERGE:
-- Phase 1: 34 concluded experiments + superseded engines deleted (-2.8k
-  lines); 10 ignored keepers (6 canaries, 3 subcommand-candidates kept as
-  tests, crack_l2).
-- Phase 2: `Problem` trait (DmeSpec/DmeWave), `wave-ladder` + `diagnose`
-  subcommands, `<trace>.result.json`. spec-ladder header verified
-  byte-identical to the live run's (resume-safe across the merge).
-- Early-exit eval (d1d1396): reject-bound hot path, ~13% shallow-stall,
-  ~0% in hot phases; behaviorally transparent (verified via sorted-trace
-  byte-equality).
+1. **COMPRESSION (running)** — STOKE-style: seed a CERTIFIED encoder, anneal
+   for size, champion moves only through the certifier gate.
+   `superopt compress --seed 5EED --trace runs/compress-0x5eed.jsonl`
+   (32×200k/cycle, all 13 lengths, resumable; Ctrl-C snapshots).
+   Seed = `dme_spec_ref()`: hand-written spec-shaped autopull encoder,
+   8 insns, certifies clean. dme_ref can never certify (14-cy cell, +1/word
+   slip) — the seed is new, locked by tests.
+2. **ENUMERATION (designed, not built)** — structure/timing decomposition:
+   ~150-op structural alphabet, delays closed analytically (16-cycle budget
+   per cell), fleet-sharded (~100 cores ≈ 3×10¹² screens/day). Decisive to
+   body-length 5, borderline 6 with pruning; scaffolds needed at 7+.
+   Composes with compression: champion size bounds the sweep.
+3. **Real-firmware targets surveyed** (Raven-Firmware dme_pio.rs): TX block
+   31/32 (TX_A 4 + TX_B 17 + timestamp 10, cross-SM IRQ toggle handshake),
+   RX block 32/32 (unrolled jmp-pin sampler ladder = 11 insns). Flagship
+   compression target = RX (observational-equivalence oracle: original
+   program as golden). Harness has multi-SM (`from_shared`) and per-cycle
+   `set_pin` — input-waveform driving needs RunSpec wiring.
 
-## Next actions (agreed 2026-07-05)
+## Today's commits (master)
 
-1. Merge `runner-restructure` → master; remove worktree; stop the live run.
-2. **Eval cache** (user-approved; design settled by measurement, see ticket
-   004): thread-local direct-mapped table, 2^16 slots, EXACT keys
-   (assembled words + wrap + config genes), values = per-group raw error
-   vectors (weights applied at lookup). Measured: 32-39% duplicate rate
-   across stall regimes; 16k-slot direct-mapped already captures 96% of
-   the unbounded ceiling (no thrashing, no bloom admission needed).
-   Expected ~1.5x on stalled rungs, composes with early-exit.
-3. **Autopull as a config gene under the spec oracle** (ticket 005 step 4)
-   — the actual lever against the wall: the spec oracle doesn't mandate
-   dme_ref's +1-slip-per-word, so autopull-on may dissolve the refill
-   spine the way autopull+wrap dissolved the UART spine. Needs the padded
-   (FIFO-fed) dataset variant for autopull retries (`pad` flag exists).
-4. Then per ticket 005: 32-slot window, multi-SM.
+- 6f0ce2f eval cache (transparent, ~1.2×, 29-30% hits)
+- d777208 dme-spec-ap: autopull gene + per-candidate `RunSpec.autopull_pad`
+- 1ba9ff8 compression mode: `dme_spec_ref` seed, `synthesize_compress`
+  (reuses GatedSnapshot/stop protocol, resume locked by test), `compress`
+  subcommand. CERTIFIER FIX: no pad on cert corpora (pad inflated the
+  ap-run gates; re-cert FAIL(1)/FAIL(3), verdict unchanged).
+
+## Next actions
+
+1. Watch compression (monitor active; SHRUNK events stream). Read out via
+   `superopt diagnose --trace runs/compress-0x5eed.jsonl`.
+2. Design + build the enumerator (shard manifest, timing closure, fleet).
+3. RX testbed infra: RunSpec pin-stimulus track + RX FIFO capture +
+   golden-equivalence battery.
+4. Still flagged: `algorithm_word` worktree + `gene-v2-ir` branch.
