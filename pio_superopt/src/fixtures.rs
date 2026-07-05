@@ -261,3 +261,111 @@ pub fn fmt_cert(n: usize) -> String {
     if n == 0 { "PASS".into() } else { format!("FAIL({n})") }
 }
 
+// ============ cycle-exact (wave) testbed + champion classification ==========
+
+/// Bit-0 transition edges of a waveform: `(cycle, rising?)`.
+pub fn dme_edges01(wave: &[u32]) -> Vec<(usize, bool)> {
+    let mut out = Vec::new();
+    let mut prev = 0u32;
+    for (i, &s) in wave.iter().enumerate() {
+        let v = s & 1;
+        if v != prev {
+            out.push((i, v == 1));
+            prev = v;
+        }
+    }
+    out
+}
+
+/// Build a pooled multi-length DME curriculum dataset: exhaustive sequences
+/// (vary the first `len` bits) at each length in `lengths` while `2^len <=
+/// cap`, else `cap` sampled sequences, each windowed to its length's boundary
+/// grid +3. Returns `(dataset, group-tags)` where group `i` = `lengths[i]`.
+///
+/// `pad` appends two spare `0` symbols past the scored window to keep the FIFO
+/// FED. This is REQUIRED for any autopull retry (autopull's prefetch fetches the
+/// next word as the threshold-th bit shifts out and starves at a word boundary
+/// without spare symbols), but it BREAKS the autopull-off conjunction crack that
+/// the gated ladder relies on, so autopull-off callers must pass `false`.
+/// A/B (same seed 0x5EED, 32 restarts, 4M iters): padded stalls at L=2 (0/13,
+/// front_err=1.5) — can't even crack the conjunction; unpadded solves L=2..5 and
+/// stalls at L=6 (front_err=63). Why padding poisons the autopull-off crack is
+/// unexplained; keep the knob for future autopull experiments but default it off.
+pub fn dme_multilength_dataset(lengths: &[usize], cap: u64, pad: bool) -> (Vec<(RunSpec, crate::search::Target)>, Vec<usize>) {
+    let reff = dme_ref(DME_H).lower();
+    let gsp = RunSpec { inputs: vec![0, 0, 0, 0], cycles: 320, ..dme_spec(0) };
+    let grid: Vec<usize> = dme_edges01(&run(&reff, &gsp)).iter().map(|&(c, _)| c).collect();
+    let mut dataset: Vec<(RunSpec, crate::search::Target)> = Vec::new();
+    let mut groups: Vec<usize> = Vec::new();
+    for (gi, &len) in lengths.iter().enumerate() {
+        let win = (grid[len.min(grid.len() - 1)] + 3) as u64;
+        let exhaustive = (1u64 << len) <= cap;
+        let n = if exhaustive { 1u64 << len } else { cap };
+        let mut drng = Rng::new(0xDA7A_5EED ^ len as u64);
+        for s in 0..n {
+            let bits = if exhaustive { s } else { drng.below(1u32 << len) as u64 };
+            // Optionally keep the FIFO FED: append spare symbols past the `len`
+            // cells the window scores. The window (grid[len]+3) captures only
+            // the first `len` cells and the golden is generated on the SAME
+            // padded input, so padding never changes the score — it only feeds
+            // autopull's prefetch (which fetches the next word as the
+            // threshold-th bit shifts out and would otherwise starve at a word
+            // boundary). REQUIRED for autopull retries; breaks the autopull-off
+            // conjunction crack, so autopull-off callers pass `pad = false`.
+            let mut inputs = seq_words(bits, len);
+            if pad {
+                inputs.extend_from_slice(&[0, 0]);
+            }
+            let sp = RunSpec { inputs, cycles: win, ..dme_spec(0) };
+            let g = run(&reff, &sp);
+            let m = vec![u32::MAX; g.len()];
+            dataset.push((sp, crate::search::Target::Wave { golden: g, mask: m }));
+            groups.push(gi);
+        }
+    }
+    (dataset, groups)
+}
+
+/// Classify a spec-ladder champion by INSPECTING its wrap (loop) region, not
+/// its cost — the sweep needs to tell the data-independent exploit apart from
+/// a real encoder even when both score near 0.
+///
+/// * `TOGGLER` — the wrap region neither CONSUMES data (`out`, or `mov`-from-
+///   OSR) nor branches on the DATA VALUE. This is the half-cell toggler: it
+///   emits transitions on a fixed schedule regardless of the bits.
+/// * `CONJUNCTION` — the region both consumes data AND branches on the value
+///   in X/Y (`jmp !X / x-- / !Y / y-- / x!=y`). That is read+branch+toggle:
+///   the data-driven encoder.
+/// * `OTHER` — anything mixed (consumes but never branches on the value, or
+///   vice-versa).
+///
+/// Value-branch conditions exclude `Always` (unconditional loop) and
+/// `NotOsrEmpty` (a REFILL test on OSR occupancy, not the bit value) — both of
+/// which a pure toggler legitimately uses.
+pub fn spec_classify(champ: &Program) -> &'static str {
+    use crate::ir::{JmpCond, MovSrc, Op};
+    let (b, t) = (champ.wrap_bottom as usize, (champ.wrap_top as usize).min(31));
+    let mut consumes = false;
+    let mut value_branch = false;
+    for i in b..=t {
+        let Some(ins) = &champ.slots[i] else { continue };
+        match &ins.op {
+            Op::Out { .. } => consumes = true,
+            Op::Mov { src: MovSrc::Osr, .. } => consumes = true,
+            Op::Jmp { cond, .. } => {
+                if matches!(
+                    cond,
+                    JmpCond::NotX | JmpCond::XPostDec | JmpCond::NotY | JmpCond::YPostDec | JmpCond::XneY
+                ) {
+                    value_branch = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    match (consumes, value_branch) {
+        (false, false) => "TOGGLER",
+        (true, true) => "CONJUNCTION",
+        _ => "OTHER",
+    }
+}

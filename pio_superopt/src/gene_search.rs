@@ -947,7 +947,8 @@ pub fn synthesize_gene(
 mod tests {
     use super::*;
     use crate::fixtures::{dme_cfg, dme_corpus, dme_golden, dme_ref, dme_spec, DME_CYCLES, DME_H};
-    use crate::fixtures::{dme_spec_multilength_dataset, fmt_cert, seq_words, spec_certify_corpus, SPEC_H, SPEC_PHI_MAX};
+    use crate::fixtures::{dme_edges01, dme_multilength_dataset, dme_spec_multilength_dataset, fmt_cert, seq_words,
+        spec_certify_corpus, spec_classify, SPEC_H, SPEC_PHI_MAX};
     use crate::ir::{Insn, Op, OutDst, SetDst, SideCfg};
     use crate::program::*;
     use crate::run::run;
@@ -1013,19 +1014,6 @@ mod tests {
     // `crate::fixtures` so the benches measure the same workload; imported above
     // via `use super::*`. `dme_reference_scores_zero` pins them.
 
-    /// Bit-0 transition edges of a waveform: `(cycle, rising?)`.
-    fn dme_edges01(wave: &[u32]) -> Vec<(usize, bool)> {
-        let mut out = Vec::new();
-        let mut prev = 0u32;
-        for (i, &s) in wave.iter().enumerate() {
-            let v = s & 1;
-            if v != prev {
-                out.push((i, v == 1));
-                prev = v;
-            }
-        }
-        out
-    }
 
     /// LOCK GUARD (runs in the normal suite): the reference is legal and scores
     /// 0 against its own locked golden, and the golden carries the expected
@@ -1153,112 +1141,6 @@ mod tests {
     }
 
 
-    /// Build a pooled multi-length DME curriculum dataset: exhaustive sequences
-    /// (vary the first `len` bits) at each length in `lengths` while `2^len <=
-    /// cap`, else `cap` sampled sequences, each windowed to its length's boundary
-    /// grid +3. Returns `(dataset, group-tags)` where group `i` = `lengths[i]`.
-    ///
-    /// `pad` appends two spare `0` symbols past the scored window to keep the FIFO
-    /// FED. This is REQUIRED for any autopull retry (autopull's prefetch fetches the
-    /// next word as the threshold-th bit shifts out and starves at a word boundary
-    /// without spare symbols), but it BREAKS the autopull-off conjunction crack that
-    /// the gated ladder relies on, so autopull-off callers must pass `false`.
-    /// A/B (same seed 0x5EED, 32 restarts, 4M iters): padded stalls at L=2 (0/13,
-    /// front_err=1.5) — can't even crack the conjunction; unpadded solves L=2..5 and
-    /// stalls at L=6 (front_err=63). Why padding poisons the autopull-off crack is
-    /// unexplained; keep the knob for future autopull experiments but default it off.
-    fn dme_multilength_dataset(lengths: &[usize], cap: u64, pad: bool) -> (Vec<(RunSpec, crate::search::Target)>, Vec<usize>) {
-        let reff = dme_ref(DME_H).lower();
-        let gsp = RunSpec { inputs: vec![0, 0, 0, 0], cycles: 320, ..dme_spec(0) };
-        let grid: Vec<usize> = dme_edges01(&run(&reff, &gsp)).iter().map(|&(c, _)| c).collect();
-        let mut dataset: Vec<(RunSpec, crate::search::Target)> = Vec::new();
-        let mut groups: Vec<usize> = Vec::new();
-        for (gi, &len) in lengths.iter().enumerate() {
-            let win = (grid[len.min(grid.len() - 1)] + 3) as u64;
-            let exhaustive = (1u64 << len) <= cap;
-            let n = if exhaustive { 1u64 << len } else { cap };
-            let mut drng = Rng::new(0xDA7A_5EED ^ len as u64);
-            for s in 0..n {
-                let bits = if exhaustive { s } else { drng.below(1u32 << len) as u64 };
-                // Optionally keep the FIFO FED: append spare symbols past the `len`
-                // cells the window scores. The window (grid[len]+3) captures only
-                // the first `len` cells and the golden is generated on the SAME
-                // padded input, so padding never changes the score — it only feeds
-                // autopull's prefetch (which fetches the next word as the
-                // threshold-th bit shifts out and would otherwise starve at a word
-                // boundary). REQUIRED for autopull retries; breaks the autopull-off
-                // conjunction crack, so autopull-off callers pass `pad = false`.
-                let mut inputs = seq_words(bits, len);
-                if pad {
-                    inputs.extend_from_slice(&[0, 0]);
-                }
-                let sp = RunSpec { inputs, cycles: win, ..dme_spec(0) };
-                let g = run(&reff, &sp);
-                let m = vec![u32::MAX; g.len()];
-                dataset.push((sp, crate::search::Target::Wave { golden: g, mask: m }));
-                groups.push(gi);
-            }
-        }
-        (dataset, groups)
-    }
-
-    /// Run one gated-ladder phase with FIXED config (`genes` off): build the
-    /// multi-length dataset, climb, stream a labeled `RUNG` marker per rung, and
-    /// print the held-out gate on the final champion. Shared by the gated test's
-    /// phases (autopull-on confirmation, in-loop-pull discovery).
-    fn run_gated_ladder(label: &str, template: &Program, lengths: &[usize], hp: &crate::search::CurriculumHp) {
-        use crate::search::{synthesize_curriculum_gated, Genes, Space};
-        let space = Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: Genes::default() };
-        let (dataset, groups) = dme_multilength_dataset(lengths, 32, false);
-        eprintln!(
-            "\n=== {label} === lengths {lengths:?} ({} seqs), config autopull={} threshold={}",
-            dataset.len(), template.config.shift.autopull, template.config.shift.pull_threshold
-        );
-        let lens = lengths.to_vec();
-        let lbl = label;
-
-        // Structured JSONL trace sink: one line per event, written under `runs/`
-        // at the workspace root (git-ignored). The name has no wall-clock, so a
-        // rerun overwrites and diffs cleanly. A `Mutex<BufWriter>` serializes the
-        // 32 restart threads' events; keys (rung/attempt/r/iter) let the
-        // interleaved lines be regrouped in analysis.
-        let seed = 0x5EEDu64;
-        std::fs::create_dir_all("runs").expect("create runs/ dir");
-        let trace_path = format!("runs/{label}-{seed:#x}.jsonl");
-        let sink = std::sync::Mutex::new(std::io::BufWriter::new(
-            std::fs::File::create(&trace_path).expect("create trace file"),
-        ));
-        eprintln!("trace -> {trace_path}");
-        let trace = |ev: &crate::search::TraceEvent| {
-            use std::io::Write;
-            let line = crate::trace::trace_json(ev);
-            let mut w = sink.lock().unwrap();
-            let _ = writeln!(w, "{line}");
-        };
-
-        let (champ, cost, solved) = synthesize_curriculum_gated(
-            template, &space, &dataset, &groups, lengths.len(), hp, 32, 4_000_000, 0.0, seed,
-            Some(&trace),
-            None, None,
-            |frontier, rc, front_err, ok| {
-                let parts: Vec<_> = (0..space.slots as usize)
-                    .filter_map(|i| rc.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
-                    .collect();
-                eprintln!(
-                    "{lbl} RUNG L={:<2} {} front_err={front_err:6.1} size={} wrap {}..{}: [{}]",
-                    lens[frontier], if ok { "SOLVED" } else { "STALL " }, rc.size(), rc.wrap_bottom, rc.wrap_top, parts.join("  ")
-                );
-            },
-        );
-        let parts: Vec<_> = (0..space.slots as usize)
-            .filter_map(|i| champ.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
-            .collect();
-        let (vt, vh) = crate::fixtures::dme_validate(&champ);
-        eprintln!(
-            "{label} DONE solved {solved}/{} cost={cost:.1} size={} [gate train={vt} held-out={vh}] wrap {}..{}: [{}]",
-            lengths.len(), champ.size(), champ.wrap_bottom, champ.wrap_top, parts.join("  ")
-        );
-    }
 
 
     // ===================== SPEC-ORACLE TESTBED (ticket 005) =====================
@@ -1399,49 +1281,6 @@ mod tests {
         assert_eq!(resumed, full, "resumed champion must be byte-identical to the uninterrupted run's");
     }
 
-    /// Classify a spec-ladder champion by INSPECTING its wrap (loop) region, not
-    /// its cost — the sweep needs to tell the data-independent exploit apart from
-    /// a real encoder even when both score near 0.
-    ///
-    /// * `TOGGLER` — the wrap region neither CONSUMES data (`out`, or `mov`-from-
-    ///   OSR) nor branches on the DATA VALUE. This is the half-cell toggler: it
-    ///   emits transitions on a fixed schedule regardless of the bits.
-    /// * `CONJUNCTION` — the region both consumes data AND branches on the value
-    ///   in X/Y (`jmp !X / x-- / !Y / y-- / x!=y`). That is read+branch+toggle:
-    ///   the data-driven encoder.
-    /// * `OTHER` — anything mixed (consumes but never branches on the value, or
-    ///   vice-versa).
-    ///
-    /// Value-branch conditions exclude `Always` (unconditional loop) and
-    /// `NotOsrEmpty` (a REFILL test on OSR occupancy, not the bit value) — both of
-    /// which a pure toggler legitimately uses.
-    fn spec_classify(champ: &Program) -> &'static str {
-        use crate::ir::{JmpCond, MovSrc, Op};
-        let (b, t) = (champ.wrap_bottom as usize, (champ.wrap_top as usize).min(31));
-        let mut consumes = false;
-        let mut value_branch = false;
-        for i in b..=t {
-            let Some(ins) = &champ.slots[i] else { continue };
-            match &ins.op {
-                Op::Out { .. } => consumes = true,
-                Op::Mov { src: MovSrc::Osr, .. } => consumes = true,
-                Op::Jmp { cond, .. } => {
-                    if matches!(
-                        cond,
-                        JmpCond::NotX | JmpCond::XPostDec | JmpCond::NotY | JmpCond::YPostDec | JmpCond::XneY
-                    ) {
-                        value_branch = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        match (consumes, value_branch) {
-            (false, false) => "TOGGLER",
-            (true, true) => "CONJUNCTION",
-            _ => "OTHER",
-        }
-    }
 
     /// DENSIFY SWEEP (spec oracle): find where raising `densify_w` (the spurious-
     /// edge weight) prices the toggler exploit up enough that the read+branch
@@ -1545,121 +1384,6 @@ mod tests {
             }
             None => eprintln!("\n--- no densify cracked 2..=3 at 16×1M; the default 0.5 has no cheap winner to confirm ---"),
         }
-    }
-
-    /// GATED CURRICULUM LADDER (the generality engine): the structural fix for the
-    /// stalls in [`dme_curriculum_length`]/[`dme_curriculum_multilength`]. The
-    /// trigger is now PERFORMANCE, not iteration — advance to the next length only
-    /// once the current frontier is solved (raw edge-errors == 0), warm-starting
-    /// each rung from the prior champion with a PARTIAL reheat so it extends the
-    /// loop without jumping basins. This is one run of the engine with default
-    /// [`CurriculumHp`]; the schedule shape is then tuned in
-    /// [`dme_curriculum_meta_tune`]. Climbing all lengths with held-out gate 0/0 is
-    /// a general data-driven DME loop. Run: `cargo test --release -- --ignored
-    /// dme_curriculum_gated --nocapture`.
-    ///
-    /// FINDING (the wall is broken): with default HP the ladder climbs **past the
-    /// L=3 stall that defeated every prior approach**. The generality-filter
-    /// lookahead is decisive: at L=2 it promotes the conjunction restart (toggle +
-    /// conditional branch + loop) over the equally-zero-cost level-driving fit that
-    /// used to win and carry nothing upward. L=2 ✓, L=3 ✓, and crucially **L=4 ✓**
-    /// — a 4-cell window can't be unrolled in 10 slots, so a zero-error L=4
-    /// solution is a genuine data-driven LOOP (`out`-a-bit + `mov Pins,InvertPins`
-    /// toggle + `jmp Pin`/`jmp XneY` branch, wrap-looped). So the gated trigger +
-    /// per-rung partial reheat + lookahead selection is the combination that
-    /// carries the L=2 conjunction up to a general loop. Champions are general but
-    /// not yet minimal (stray `mov Pins,InvertOsr`, `out Pins`) — shape tuning
-    /// ([`dme_curriculum_meta_tune`]) is for squeezing size and robustness.
-    ///
-    /// UPDATE (the real ceiling is a WORD BOUNDARY, not the schedule): the ladder
-    /// reliably solves L=2..5 but **stalls at L=6**, and the cause is the testbed,
-    /// not tuning. `dme_cfg` has `pull_threshold=5, autopull=false`, and champions
-    /// place a single `pull` OUTSIDE the loop — so the loop drives bits from ONE
-    /// 5-bit OSR word, and after 5 shifts the empty OSR yields zeros. Lengths 2..5
-    /// all fit in that one word, so the curriculum never exercises a refill; L=6 is
-    /// the first length crossing into a 2nd word, needing an in-loop pull the
-    /// search was never pressured to find. So the champions are "single-word
-    /// general", and the held-out gate (4 codes = 20 bits = 4 words) needs full
-    /// multi-word generality. Fixing this is a testbed-design choice (enable
-    /// autopull so `out` refills in hardware, vs. extend the curriculum past word
-    /// boundaries so the loop must learn its own refill), not a schedule knob.
-    ///
-    /// CONFIG-GENE EXPERIMENT (negative result): opening SM config as search genes
-    /// — to let the optimizer DISCOVER the refill instead of hard-coding it —
-    /// degrades the search monotonically with the number of genes opened. Fixed
-    /// config solves L=2..5 (stalls L=6); +autopull+pull_threshold STALLS at L=5
-    /// (3/7, converging to the misaligned `ap=true pt=4` that drops a data bit);
-    /// +clkdiv STALLS at L=2 (0/7, `div=2` can't even crack the conjunction). The
-    /// cause: config genes add search dimensions with NO fitness gradient at the
-    /// curriculum's dominant short (single-word) lengths, where the hard work
-    /// (conjunction crack, single-word loop) happens — and the only correct values
-    /// are needles (`pull_threshold=5` of 32, `clkdiv=1`) surrounded by bad values
-    /// the search wanders into. The pressure that would SELECT the right config
-    /// (multi-word) only appears at L>=6, too late. So broad config search is the
-    /// wrong tool here. Productive alternatives: (a) pin threshold=5, search ONLY
-    /// the autopull BIT (a 1-bit flip the L=6 anneal can make under pressure); (b)
-    /// FIX autopull=true and confirm the loop logic reaches held-out 0/0; (c) fix
-    /// config, extend the curriculum past several word boundaries so the search
-    /// discovers an in-loop pull in the PROGRAM (mechanism, not config crutch).
-    ///
-    /// AUTOPULL EXPERIMENTS (autopull fights the search, even fixed): tried fixing
-    /// autopull=true (instruction-minimal: it drops the explicit `pull` + the
-    /// OSR-empty check). Three outcomes: (1) fixed autopull, exact-length data —
-    /// solves L=2..4 but STALLS at L=5, because autopull eagerly prefetches the next
-    /// word as the 5th bit shifts out and the dataset only pushed ceil(L/5) words,
-    /// so the prefetch starves at the word boundary. (2) Fixed autopull + the FIFO
-    /// kept fed (dataset padded with spare symbols past the window) — STALLED at L=2
-    /// (0/13). (3) [earlier] autopull as a search gene — monotone worse. The old
-    /// DOUBLE-CONSUME hypothesis (autopull's automatic consume races the search's
-    /// explicit `pull`/`out X,1` reads and desyncs the stream) rested on outcome (2).
-    ///
-    /// CORRECTION (2026-07-03): outcome (2) is CONFOUNDED and the double-consume
-    /// hypothesis is UNSUPPORTED. The FIFO-fed padding was itself a regression: an
-    /// A/B on the AUTOPULL-OFF ladder (same seed 0x5EED, 32 restarts, 4M iters)
-    /// showed padding ALONE stalls L=2 at 0/13 (front_err=1.5), while removing only
-    /// the padding solves L=2..5 and stalls at L=6 (front_err=63). So the L=2 stall
-    /// in outcome (2) is the padding signature, not an autopull effect — autopull
-    /// WITH a fed FIFO was never cleanly tested, and its result is UNKNOWN, not
-    /// negative. autopull-off (unpadded) remains the reliable search config on the
-    /// evidence, but the reason is no longer "autopull races the reads"; that story
-    /// is retracted. A clean autopull retry needs the padding (see
-    /// `dme_multilength_dataset`'s `pad` flag) AND a way to crack the conjunction
-    /// that padding otherwise blocks — an open question. Resolution (planned): SEARCH
-    /// with autopull off, then a deterministic END config-polish — flip autopull on
-    /// and delete the now-redundant pull/OSR-empty instructions, re-validating each
-    /// removal against the gate — to capture the instruction saving without the
-    /// search fighting autopull.
-    ///
-    /// ANALYZING THE TRACE: each ladder phase writes a JSONL trace to
-    /// `runs/<label>-<seed>.jsonl` (one event per line: `checkpoint`, `new_best`,
-    /// `restart_end`, `attempt_end`; keys `rung`/`attempt`/`r`/`iter` let the
-    /// thread-interleaved lines be regrouped). Useful jq one-liners:
-    /// - Minima distribution for a (stalled) rung — how many distinct basins the
-    ///   restarts fell into, and their multiplicity:
-    ///   `jq -rc 'select(.kind=="restart_end" and .rung==0)|.prog' F | sort | uniq -c | sort -rn`
-    /// - best-frontier-error time-series for one restart (does it descend or flatline):
-    ///   `jq -rc 'select(.kind=="checkpoint" and .rung==0 and .r==0)|[.iter,.best_fe]|@tsv' F`
-    /// - when early-stop fired per rung (null = ran full budget, i.e. the rung stalled):
-    ///   `jq -rc 'select(.kind=="attempt_end")|[.rung,.attempt,.early_stop]|@tsv' F`
-    #[test]
-    #[ignore = "gated curriculum ladder (several min); run with --release ... --nocapture"]
-    fn dme_curriculum_gated() {
-        use crate::program::Program;
-        use crate::search::CurriculumHp;
-        let hp = CurriculumHp::default();
-
-        // autopull OFF — the config the SEARCH handles reliably on current
-        // evidence (see the autopull findings in this test's doc-comment; note
-        // the CORRECTION: the old "autopull races the reads" explanation is
-        // retracted, and a clean autopull retry is untested). Extend the curriculum past both
-        // word boundaries (L=6 at bit 5, L=11 at bit 10) so the search must
-        // DISCOVER an in-loop pull. The instruction-saving autopull form is a
-        // separate END-of-search config-polish, not a search the conjunction
-        // has to survive.
-        // Label bump: "xpoll-mined" = the cross-pollination + self-mined-macro
-        // retry engine (2026-07-04), so its trace doesn't overwrite the
-        // monoculture-stall baseline in runs/inloop-pull-0x5eed.jsonl.
-        run_gated_ladder("xpoll-mined", &Program::empty(dme_cfg()), &(2..=14).collect::<Vec<_>>(), &hp);
     }
 
     /// META-TUNE the gated ladder's SCHEDULE SHAPE. The trigger is fixed

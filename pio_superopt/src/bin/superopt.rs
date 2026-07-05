@@ -1,93 +1,124 @@
-//! Search runner. First subcommand: the spec-oracle gated curriculum ladder
-//! (the long-run workload), with inline-JSONL resumability.
+//! Search runner: resumable gated-curriculum ladders over [`Problem`]s, plus
+//! trace inspection.
 //!
-//!     superopt spec-ladder [--seed 0x5EED] [--lengths 2..14] [--restarts 32]
-//!                          [--iters 4000000] [--densify 1.0] [--trace PATH]
-//!                          [--fresh]
+//!     superopt spec-ladder [opts]   # DME under the spec oracle (ticket 005)
+//!     superopt wave-ladder [opts]   # DME under the cycle-exact oracle
+//!     superopt diagnose --trace PATH
 //!
-//! The trace (default `runs/spec-ladder-<seed>.jsonl`) doubles as the resume
-//! state: a header row pins the run identity, and the engine appends a full
-//! [`GatedSnapshot`] row at heartbeat cadence, at every attempt start, and at
-//! the checkpoint where a stop lands. Starting the same command again scans
-//! the trace and resumes from the last snapshot — byte-identical to never
-//! having stopped (locked by `gene_search::tests::dme_spec_ladder_resume_*`).
-//! Ctrl-C sets a stop flag; every restart quits at its next checkpoint
-//! barrier right after that checkpoint's snapshot is written.
+//! Ladder options: `--seed 0x5EED  --lengths 2..14  --restarts 32
+//! --iters 4000000  --densify F  --trace PATH  --fresh`.
+//!
+//! The trace (default `runs/<cmd>-<seed>.jsonl`) doubles as the resume state:
+//! a header row pins the run identity, and the engine appends a full
+//! `GatedSnapshot` row at ~1/8-rung cadence, at attempt starts, and at the
+//! checkpoint where a stop lands. Rerunning the same command resumes from the
+//! last snapshot — byte-identical to never having stopped (locked by
+//! `gene_search::tests::dme_spec_ladder_resume_is_byte_identical`). Ctrl-C
+//! sets a stop flag; every restart quits at its next checkpoint barrier right
+//! after that checkpoint's snapshot is written. On completion a
+//! `<trace>.result.json` summary (champion, gates, git rev) is written next
+//! to the trace.
+//!
+//! `diagnose` reads a trace's LAST snapshot mid-run or post-run: ladder
+//! position, the best restart's champion, its structural class
+//! (TOGGLER/CONJUNCTION/OTHER), and the problem's gates on it.
 
-use pio_superopt::fixtures::{
-    dme_cfg, dme_corpus, dme_spec_multilength_dataset, dme_validation_corpus, fmt_cert,
-    spec_certify_corpus, SPEC_H, SPEC_PHI_MAX,
-};
-use pio_superopt::search::{synthesize_curriculum_gated, CurriculumHp, Genes, Space, TraceEvent};
+use pio_superopt::fixtures::spec_classify;
+use pio_superopt::problems::{by_id, DmeSpec, DmeWave, Problem};
+use pio_superopt::search::{synthesize_curriculum_gated, TraceEvent};
 use pio_superopt::trace::{header_json, scan_for_resume, trace_json, RunHeader};
-use pio_superopt::{Program, SideCfg};
+use pio_superopt::Program;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: superopt spec-ladder [--seed HEX] [--lengths A..B] [--restarts N] \
-         [--iters N] [--densify F] [--trace PATH] [--fresh]\n\
+        "usage: superopt <spec-ladder|wave-ladder> [--seed HEX] [--lengths A..B] \
+         [--restarts N] [--iters N] [--densify F] [--trace PATH] [--fresh]\n\
+       superopt diagnose --trace PATH\n\
          \n\
-         Runs the spec-oracle gated curriculum ladder. If the trace file already\n\
-         exists (same parameters), the run RESUMES from its last snapshot; pass\n\
-         --fresh to discard it and start over."
+         Ladders resume automatically from an existing trace (same parameters);\n\
+         pass --fresh to discard it and start over. Ctrl-C saves a snapshot and\n\
+         exits; rerun the same command to resume."
     );
     std::process::exit(2);
 }
 
-fn parse_args() -> (u64, Vec<usize>, usize, u32, f64, Option<String>, bool) {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) != Some("spec-ladder") {
-        usage();
-    }
-    let (mut seed, mut lo, mut hi, mut restarts, mut iters, mut densify) =
-        (0x5EEDu64, 2usize, 14usize, 32usize, 4_000_000u32, 1.0f64);
-    let mut trace_path: Option<String> = None;
-    let mut fresh = false;
-    let mut it = args[1..].iter();
+struct LadderOpts {
+    seed: u64,
+    lengths: Vec<usize>,
+    restarts: usize,
+    iters: u32,
+    densify: Option<f64>,
+    trace: Option<String>,
+    fresh: bool,
+}
+
+fn parse_ladder_opts(args: &[String]) -> LadderOpts {
+    let mut o = LadderOpts {
+        seed: 0x5EED,
+        lengths: (2..=14).collect(),
+        restarts: 32,
+        iters: 4_000_000,
+        densify: None,
+        trace: None,
+        fresh: false,
+    };
+    let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| usage()).clone();
         match a.as_str() {
             "--seed" => {
-                let v = val();
-                seed = u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap_or_else(|_| usage());
+                o.seed = u64::from_str_radix(val().trim_start_matches("0x"), 16).unwrap_or_else(|_| usage())
             }
             "--lengths" => {
                 let v = val();
                 let (a, b) = v.split_once("..").unwrap_or_else(|| usage());
-                lo = a.parse().unwrap_or_else(|_| usage());
-                hi = b.trim_start_matches('=').parse().unwrap_or_else(|_| usage());
+                let lo: usize = a.parse().unwrap_or_else(|_| usage());
+                let hi: usize = b.trim_start_matches('=').parse().unwrap_or_else(|_| usage());
+                o.lengths = (lo..=hi).collect();
             }
-            "--restarts" => restarts = val().parse().unwrap_or_else(|_| usage()),
-            "--iters" => iters = val().parse().unwrap_or_else(|_| usage()),
-            "--densify" => densify = val().parse().unwrap_or_else(|_| usage()),
-            "--trace" => trace_path = Some(val()),
-            "--fresh" => fresh = true,
+            "--restarts" => o.restarts = val().parse().unwrap_or_else(|_| usage()),
+            "--iters" => o.iters = val().parse().unwrap_or_else(|_| usage()),
+            "--densify" => o.densify = Some(val().parse().unwrap_or_else(|_| usage())),
+            "--trace" => o.trace = Some(val()),
+            "--fresh" => o.fresh = true,
             _ => usage(),
         }
     }
-    ((seed), (lo..=hi).collect(), restarts, iters, densify, trace_path, fresh)
+    o
 }
 
 fn main() {
-    let (seed, lengths, restarts, rung_iters, densify_w, trace_path, fresh) = parse_args();
-    let hp = CurriculumHp { densify_w, ..CurriculumHp::default() };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("spec-ladder") => run_ladder(&DmeSpec, "spec-ladder", parse_ladder_opts(&args[1..])),
+        Some("wave-ladder") => run_ladder(&DmeWave, "wave-ladder", parse_ladder_opts(&args[1..])),
+        Some("diagnose") => diagnose(&args[1..]),
+        _ => usage(),
+    }
+}
+
+fn run_ladder(problem: &dyn Problem, cmd: &str, o: LadderOpts) {
+    let mut hp = problem.default_hp();
+    if let Some(d) = o.densify {
+        hp.densify_w = d;
+    }
     let header = RunHeader {
-        problem: "dme-spec".into(),
-        seed,
-        lengths: lengths.clone(),
-        restarts,
-        rung_iters,
+        problem: problem.id().into(),
+        seed: o.seed,
+        lengths: o.lengths.clone(),
+        restarts: o.restarts,
+        rung_iters: o.iters,
         hp,
     };
     let path = std::path::PathBuf::from(
-        trace_path.unwrap_or_else(|| format!("runs/spec-ladder-{seed:#x}.jsonl")),
+        o.trace.unwrap_or_else(|| format!("runs/{cmd}-{:#x}.jsonl", o.seed)),
     );
     std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new("."))).expect("create trace dir");
 
     // Resolve fresh-vs-resume BEFORE opening the file for append.
-    let resume = if path.exists() && !fresh {
+    let resume = if path.exists() && !o.fresh {
         let scan = scan_for_resume(&path).unwrap_or_else(|e| {
             eprintln!("cannot resume from {}: {e}\n(pass --fresh to discard it)", path.display());
             std::process::exit(1);
@@ -152,18 +183,20 @@ fn main() {
     })
     .expect("install Ctrl-C handler");
 
-    let (dataset, groups) = dme_spec_multilength_dataset(&lengths, 32);
+    let (dataset, groups) = problem.dataset(&o.lengths);
     eprintln!(
-        "=== spec-ladder (SPEC oracle) === lengths {lengths:?} ({} seqs), cell={} data@+{SPEC_H} \
-         phi_max={SPEC_PHI_MAX} densify={densify_w} seed={seed:#x}",
+        "=== {cmd} === {} | lengths {:?} ({} seqs) densify={} seed={:#x}",
+        problem.describe(),
+        o.lengths,
         dataset.len(),
-        2 * SPEC_H
+        hp.densify_w,
+        o.seed
     );
     eprintln!("trace -> {}", path.display());
 
-    let space = Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: Genes::default() };
-    let template = Program::empty(dme_cfg());
-    let lens = lengths.clone();
+    let space = problem.space();
+    let template = problem.template();
+    let lens = o.lengths.clone();
     let on_trace = |ev: &TraceEvent| {
         let line = trace_json(ev);
         let mut w = sink.lock().unwrap();
@@ -179,18 +212,18 @@ fn main() {
         &space,
         &dataset,
         &groups,
-        lengths.len(),
+        o.lengths.len(),
         &hp,
-        restarts,
-        rung_iters,
+        o.restarts,
+        o.iters,
         0.0,
-        seed,
+        o.seed,
         Some(&on_trace),
         resume,
         Some(&STOP),
         |frontier, rc, front_err, ok| {
             eprintln!(
-                "spec-ladder RUNG L={:<2} {} front_err={front_err:6.1} size={} {}",
+                "{cmd} RUNG L={:<2} {} front_err={front_err:6.1} size={} {}",
                 lens[frontier],
                 if ok { "SOLVED" } else { "STALL " },
                 rc.size(),
@@ -208,14 +241,100 @@ fn main() {
         std::process::exit(130);
     }
 
-    let ct = spec_certify_corpus(&champ, &dme_corpus());
-    let cv = spec_certify_corpus(&champ, &dme_validation_corpus());
+    let gates = problem.gates(&champ);
+    let gates_str: Vec<String> = gates.iter().map(|g| format!("{}={}", g.label, g.verdict)).collect();
     eprintln!(
-        "spec-ladder DONE solved {solved}/{} cost={cost:.1} size={} [cert train={} held-out={}] {}",
-        lengths.len(),
+        "{cmd} DONE solved {solved}/{} cost={cost:.1} size={} [{}] {}",
+        o.lengths.len(),
         champ.size(),
-        fmt_cert(ct),
-        fmt_cert(cv),
+        gates_str.join(" "),
         champ.brief()
     );
+
+    // Self-describing result summary next to the trace.
+    let git_rev = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let result = serde_json::json!({
+        "run": header,
+        "solved": solved,
+        "n_groups": o.lengths.len(),
+        "full_cost": cost,
+        "champion": {
+            "brief": champ.brief(),
+            "size": champ.size(),
+            "class": spec_classify(&champ),
+            "words": champ.assemble().iter().map(|w| format!("{w:#06x}")).collect::<Vec<_>>(),
+            "wrap": [champ.wrap_bottom, champ.wrap_top],
+        },
+        "gates": gates.iter().map(|g| serde_json::json!({
+            "label": g.label, "verdict": g.verdict, "pass": g.pass,
+        })).collect::<Vec<_>>(),
+        "git_rev": git_rev,
+    });
+    let result_path = path.with_extension("result.json");
+    std::fs::write(&result_path, serde_json::to_string_pretty(&result).unwrap()).expect("write result");
+    eprintln!("result -> {}", result_path.display());
+}
+
+/// Inspect a trace's LAST snapshot: where the ladder is, and how good the best
+/// restart's champion currently is (structural class + the problem's gates).
+/// Works mid-run (the engine flushes every snapshot) and post-run.
+fn diagnose(args: &[String]) {
+    let mut trace: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--trace" => trace = it.next().cloned(),
+            _ => usage(),
+        }
+    }
+    let path = std::path::PathBuf::from(trace.unwrap_or_else(|| usage()));
+    let scan = scan_for_resume(&path).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+    let problem = by_id(&scan.header.problem).unwrap_or_else(|| {
+        eprintln!("unknown problem id {:?} in header", scan.header.problem);
+        std::process::exit(1);
+    });
+    let Some(snap) = scan.snapshot else {
+        eprintln!("{}: no snapshot yet", path.display());
+        std::process::exit(1);
+    };
+    println!(
+        "run: {} seed={:#x} lengths {:?} ({}x{} iters)",
+        scan.header.problem, scan.header.seed, scan.header.lengths, scan.header.restarts, scan.header.rung_iters
+    );
+    println!(
+        "position: rung#{} (L={}) attempt {} iter {}/{}  solved_through={}",
+        snap.frontier,
+        scan.header.lengths.get(snap.frontier).copied().unwrap_or(0),
+        snap.attempt,
+        snap.iter,
+        scan.header.rung_iters,
+        snap.solved_through
+    );
+    if let Some(c) = &snap.champ {
+        println!("rung warm base (last promoted champion): size={} {}", c.size(), c.brief());
+    }
+    println!("warm pool {} | macro lib {} | minima {}", snap.pool.len(), snap.lib.len(), snap.minima.len());
+
+    let report = |tag: &str, p: &Program| {
+        println!("{tag}: size={} class={} {}", p.size(), spec_classify(p), p.brief());
+        for g in problem.gates(p) {
+            println!("  {} = {}{}", g.label, g.verdict, if g.pass { "" } else { "  (failing)" });
+        }
+    };
+    match snap.restarts.iter().min_by(|a, b| a.best_sel.partial_cmp(&b.best_sel).unwrap()) {
+        Some(best) => report(&format!("best restart (sel={:.1})", best.best_sel), &best.best),
+        None => {
+            if let Some(c) = &snap.champ {
+                report("champion", c);
+            }
+        }
+    }
 }
