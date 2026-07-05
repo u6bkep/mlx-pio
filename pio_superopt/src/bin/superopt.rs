@@ -6,6 +6,8 @@
 //!     superopt wave-ladder [opts]   # DME under the cycle-exact oracle
 //!     superopt compress [opts]      # STOKE-style: shrink a certified seed (dme_spec_ref)
 //!     superopt enumerate --len N    # exhaustive loop-body sweep (sharded, resumable)
+//!     superopt serve --len N        # shard-lease coordinator for a worker fleet
+//!     superopt work --server URL    # pull shards from a coordinator until drained
 //!     superopt diagnose --trace PATH
 //!
 //! Ladder options: `--seed 0x5EED  --lengths 2..14  --restarts 32
@@ -39,6 +41,8 @@ fn usage() -> ! {
         "usage: superopt <spec-ladder|spec-ap-ladder|wave-ladder|compress> [--seed HEX] [--lengths A..B] \
          [--restarts N] [--iters N] [--densify F] [--trace PATH] [--fresh]\n\
        superopt enumerate --len N [--shard-mod M --shard-rem R] [--threads T] [--out DIR]\n\
+       superopt serve --len N [--out DIR] [--listen ADDR:PORT] [--lease-secs S]\n\
+       superopt work --server URL [--threads T]\n\
        superopt diagnose --trace PATH\n\
          \n\
          Ladders resume automatically from an existing trace (same parameters);\n\
@@ -112,6 +116,8 @@ fn main() {
             run_compress(&DmeSpecCompress, "compress", o)
         }
         Some("enumerate") => enumerate_cmd(&args[1..]),
+        Some("serve") => serve_cmd(&args[1..]),
+        Some("work") => work_cmd(&args[1..]),
         Some("diagnose") => diagnose(&args[1..]),
         _ => usage(),
     }
@@ -565,6 +571,182 @@ fn enumerate_cmd(args: &[String]) {
     eprintln!(
         "enumerate len={len}: {shards}/{} shards present | {st} structures, {sc} screened, {pp} pattern-pass, {te} timing evals, {sv} survivors",
         ops.len()
+    );
+}
+
+/// Shard-lease coordinator for a worker fleet (see `coord.rs` module doc and
+/// `docs/fleet.md`). Run this on the box that should end up holding all the
+/// shard files; point any number of `superopt work` hosts at it. All durable
+/// state is the shard files in --out — Ctrl-C just exits, restart rescans.
+fn serve_cmd(args: &[String]) {
+    use pio_superopt::coord::{serve, Coordinator, ServeCfg};
+    use pio_superopt::enumerate::alphabet;
+    let (mut len, mut out, mut listen): (usize, Option<String>, String) =
+        (4, None, "0.0.0.0:7787".into());
+    let mut lease_secs: u64 = 43_200;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().unwrap_or_else(|| usage()).clone();
+        match a.as_str() {
+            "--len" => len = val().parse().unwrap_or_else(|_| usage()),
+            "--out" => out = Some(val()),
+            "--listen" => listen = val(),
+            "--lease-secs" => lease_secs = val().parse().unwrap_or_else(|_| usage()),
+            _ => usage(),
+        }
+    }
+    assert!(len >= 2 && len <= 8, "--len must be in 2..=8");
+    let dir = std::path::PathBuf::from(out.unwrap_or_else(|| format!("runs/enum-len{len}")));
+    std::fs::create_dir_all(&dir).expect("create out dir");
+
+    let ops = alphabet(len);
+    let mut coord = Coordinator::new(ops.len(), std::time::Duration::from_secs(lease_secs));
+    // Startup rescan: existing shard files are the durable state.
+    let mut existing = 0usize;
+    for e in std::fs::read_dir(&dir).expect("read out dir") {
+        let path = e.expect("dir entry").path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if let Some(num) = name.strip_prefix("shard-").and_then(|s| s.strip_suffix(".json")) {
+            if let Ok(shard) = num.parse::<usize>() {
+                if shard < ops.len() {
+                    coord.mark_done(shard);
+                    existing += 1;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "=== serve === len={len} alphabet={} | {existing}/{} shards already done | lease {lease_secs}s | out -> {}",
+        ops.len(),
+        ops.len(),
+        dir.display()
+    );
+    let server = tiny_http::Server::http(&listen)
+        .unwrap_or_else(|e| panic!("cannot listen on {listen}: {e}"));
+    eprintln!(
+        "listening on {listen} (durable state = shard files; Ctrl-C any time, restart rescans)"
+    );
+    serve(&server, &mut coord, &ServeCfg { len, alphabet: ops.len(), out_dir: dir });
+}
+
+/// ureq call with exponential backoff on TRANSPORT errors (server down /
+/// restarting), forever — a worker holding a finished result must be able to
+/// outwait a server restart. HTTP status errors are returned to the caller.
+fn retry_transport<T>(
+    what: &str,
+    mut f: impl FnMut() -> Result<T, ureq::Error>,
+) -> Result<T, u16> {
+    let mut delay = std::time::Duration::from_secs(1);
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(ureq::Error::Status(code, resp)) => {
+                eprintln!("{what}: HTTP {code}: {}", resp.into_string().unwrap_or_default());
+                return Err(code);
+            }
+            Err(ureq::Error::Transport(t)) => {
+                eprintln!("{what}: {t}; retrying in {}s", delay.as_secs());
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_secs(120));
+            }
+        }
+    }
+}
+
+/// Worker: pull shard leases from a `superopt serve` coordinator, run them,
+/// post results back. Exits 0 once the server reports nothing left to lease.
+/// Join/leave freely — an abandoned lease expires server-side and requeues.
+fn work_cmd(args: &[String]) {
+    use pio_superopt::enumerate::{alphabet, run_shard};
+    let mut server: Option<String> = None;
+    let mut threads: usize = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().unwrap_or_else(|| usage()).clone();
+        match a.as_str() {
+            "--server" => server = Some(val()),
+            "--threads" => threads = val().parse().unwrap_or_else(|_| usage()),
+            _ => usage(),
+        }
+    }
+    let base = server.unwrap_or_else(|| usage()).trim_end_matches('/').to_string();
+
+    // Learn len + alphabet size from the server, then check the contract:
+    // our alphabet(len) must be the same size (same-commit invariant; the
+    // ORDER can't be checked cheaply, so ship one binary — see fleet.md).
+    let status = retry_transport("GET /status", || {
+        ureq::get(&format!("{base}/status")).call()
+    })
+    .unwrap_or_else(|code| {
+        eprintln!("cannot fetch {base}/status (HTTP {code})");
+        std::process::exit(1);
+    });
+    let v: serde_json::Value =
+        serde_json::from_str(&status.into_string().expect("status body")).expect("status JSON");
+    let len = v["len"].as_u64().expect("status.len") as usize;
+    let srv_alpha = v["alphabet"].as_u64().expect("status.alphabet") as usize;
+    let ops = alphabet(len);
+    if ops.len() != srv_alpha {
+        eprintln!(
+            "contract mismatch: server len={len} alphabet={srv_alpha}, this binary's alphabet({len}) = {} \
+             — mixed revisions silently mislabel shards; run the same commit/binary everywhere.",
+            ops.len()
+        );
+        std::process::exit(1);
+    }
+    eprintln!(
+        "=== work === server {base} | len={len} alphabet={srv_alpha} | done {} leased {} remaining {} | threads={threads}",
+        v["done"], v["leased"], v["remaining"]
+    );
+
+    let lease_body = format!("{{\"len\":{len},\"alphabet\":{}}}", ops.len());
+    let done_count = std::sync::atomic::AtomicUsize::new(0);
+    let t0 = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..threads.max(1) {
+            scope.spawn(|| loop {
+                let resp = match retry_transport("POST /lease", || {
+                    ureq::post(&format!("{base}/lease")).send_string(&lease_body)
+                }) {
+                    Ok(r) => r,
+                    Err(409) => std::process::exit(1), // contract refused mid-run
+                    Err(_) => {
+                        // Unexpected status; don't spin hot against a broken server.
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        continue;
+                    }
+                };
+                if resp.status() == 204 {
+                    return; // drained — nothing leasable right now or ever
+                }
+                let v: serde_json::Value =
+                    serde_json::from_str(&resp.into_string().expect("lease body"))
+                        .expect("lease JSON");
+                let shard = v["shard"].as_u64().expect("lease.shard") as usize;
+                let res = run_shard(shard, len, &ops);
+                let body = serde_json::to_string_pretty(&res).unwrap();
+                if let Err(code) = retry_transport(&format!("POST /done?shard={shard}"), || {
+                    ureq::post(&format!("{base}/done?shard={shard}")).send_string(&body)
+                }) {
+                    eprintln!("[shard {shard:04}] server refused result (HTTP {code}) — dropping; the lease will expire and requeue");
+                    continue;
+                }
+                let d = done_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                eprintln!(
+                    "[shard {shard:04}] {} structures, {} screened, {} pattern-pass, {} timing evals, {} SURVIVORS  ({d} shards done, {:.0}s elapsed)",
+                    res.structures, res.screened, res.pattern_pass, res.timing_evals, res.survivors.len(),
+                    t0.elapsed().as_secs_f64()
+                );
+                for sv in &res.survivors {
+                    eprintln!("  SURVIVOR size={} delays={:?} {}", sv.size, sv.delays, sv.brief);
+                }
+            });
+        }
+    });
+    eprintln!(
+        "work drained: {} shards completed by this host in {:.0}s",
+        done_count.load(std::sync::atomic::Ordering::SeqCst),
+        t0.elapsed().as_secs_f64()
     );
 }
 
