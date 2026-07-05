@@ -77,6 +77,58 @@ details (words, wrap, delays) are inside the shard JSONs.
 3. Every machine must use the same `--len`; `--shard-mod/rem` are the only
    flags that may differ.
 
+### Coordinator mode (`superopt serve` + `superopt work`)
+
+The static mod/rem split above needs the shard space partitioned up front
+and repartitioned by hand when a machine joins, leaves, or dies. Coordinator
+mode replaces that with dynamic pull: one lease server on the box that
+should end up holding the results, any number of workers anywhere.
+
+On the box holding the out dir:
+
+```sh
+./target/release/superopt serve --len 5 --out runs/enum-len5
+# defaults: --listen 0.0.0.0:7787  --lease-secs 43200 (12h)
+```
+
+On every worker host (including the server box itself, if it has cores to
+spare):
+
+```sh
+./target/release/superopt work --server http://serverbox:7787
+# default --threads = all cores
+```
+
+Properties:
+
+- **Hosts join and leave freely.** Each worker thread loops
+  lease -> run -> post result; a new host just starts pulling from wherever
+  the frontier is. Killing a worker abandons its in-flight leases; after
+  `--lease-secs` the server hands those shards to someone else. Size the
+  TTL above the slowest expected shard (len 5 shards are ~4–5 core-hours,
+  so the 12h default is comfortable; a too-short TTL wastes work but never
+  loses or corrupts results — a late finisher's result is still accepted if
+  the shard isn't done yet, and discarded idempotently if it is).
+- **All durable state is the shard files** in `--out`, same format and
+  names as the no-server driver. Ctrl-C the server any time; on restart it
+  rescans the dir and resumes. Workers outwait a server restart (they retry
+  with backoff, including a worker holding a finished result).
+- **Contract check.** The worker verifies its `alphabet(len)` size against
+  the server's at startup, and sends it with every lease; a mismatch is
+  refused with 409. This catches mixed *sizes* only — the alphabet ORDER is
+  still unchecked (invariant 1 above), so ship one binary to every host.
+- **Workers exit when the server reports nothing leasable** (everything
+  done or in flight elsewhere). If a straggler's lease later expires, just
+  start `work` again on any host to mop up.
+- **Aggregate/readout is unchanged:** all shard files land on the server
+  box, so after completion run the plain no-server command there —
+  `./target/release/superopt enumerate --len 5 --out runs/enum-len5` —
+  which finds nothing to do and prints the aggregate. No rsync step.
+
+The static `--shard-mod/--shard-rem` split remains as the zero-dependency
+fallback (air-gapped hosts, no reachable port); the two compose — residues
+done statically are just pre-existing shard files the server rescans.
+
 ### Budget cheat-sheet (measured at len 4, extrapolated)
 
 | len | structures | est. cost | verdict |
