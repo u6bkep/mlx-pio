@@ -16,6 +16,7 @@
 //!     bit patterns are unrepresentable.
 
 pub mod certify;
+pub mod coord;
 pub mod cost;
 pub mod decode;
 pub mod encode;
