@@ -19,6 +19,7 @@ pub mod certify;
 pub mod cost;
 pub mod decode;
 pub mod encode;
+pub mod enumerate;
 pub mod fixtures;
 pub mod gene;
 pub mod gene_search;

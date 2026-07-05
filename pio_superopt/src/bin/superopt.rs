@@ -5,6 +5,7 @@
 //!     superopt spec-ap-ladder [opts]# spec oracle + autopull gene (ticket 005 step 4)
 //!     superopt wave-ladder [opts]   # DME under the cycle-exact oracle
 //!     superopt compress [opts]      # STOKE-style: shrink a certified seed (dme_spec_ref)
+//!     superopt enumerate --len N    # exhaustive loop-body sweep (sharded, resumable)
 //!     superopt diagnose --trace PATH
 //!
 //! Ladder options: `--seed 0x5EED  --lengths 2..14  --restarts 32
@@ -37,6 +38,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: superopt <spec-ladder|spec-ap-ladder|wave-ladder|compress> [--seed HEX] [--lengths A..B] \
          [--restarts N] [--iters N] [--densify F] [--trace PATH] [--fresh]\n\
+       superopt enumerate --len N [--shard-mod M --shard-rem R] [--threads T] [--out DIR]\n\
        superopt diagnose --trace PATH\n\
          \n\
          Ladders resume automatically from an existing trace (same parameters);\n\
@@ -109,6 +111,7 @@ fn main() {
             }
             run_compress(&DmeSpecCompress, "compress", o)
         }
+        Some("enumerate") => enumerate_cmd(&args[1..]),
         Some("diagnose") => diagnose(&args[1..]),
         _ => usage(),
     }
@@ -475,6 +478,94 @@ fn run_compress(problem: &dyn Problem, cmd: &str, o: LadderOpts) {
     let result_path = path.with_extension("result.json");
     std::fs::write(&result_path, serde_json::to_string_pretty(&result).unwrap()).expect("write result");
     eprintln!("result -> {}", result_path.display());
+}
+
+/// Exhaustive loop-body sweep (see `enumerate.rs` module doc). Sharded by
+/// first-slot op; one JSON per completed shard in --out, existing shards are
+/// skipped (resume), --shard-mod/--shard-rem split shards across machines.
+fn enumerate_cmd(args: &[String]) {
+    use pio_superopt::enumerate::{alphabet, run_shard};
+    let (mut len, mut shard_mod, mut shard_rem, mut out): (usize, usize, usize, Option<String>) =
+        (4, 1, 0, None);
+    let mut threads: usize = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().unwrap_or_else(|| usage()).clone();
+        match a.as_str() {
+            "--len" => len = val().parse().unwrap_or_else(|_| usage()),
+            "--shard-mod" => shard_mod = val().parse().unwrap_or_else(|_| usage()),
+            "--shard-rem" => shard_rem = val().parse().unwrap_or_else(|_| usage()),
+            "--threads" => threads = val().parse().unwrap_or_else(|_| usage()),
+            "--out" => out = Some(val()),
+            _ => usage(),
+        }
+    }
+    assert!(len >= 2 && len <= 8, "--len must be in 2..=8");
+    assert!(shard_rem < shard_mod, "--shard-rem must be < --shard-mod");
+    let dir = std::path::PathBuf::from(out.unwrap_or_else(|| format!("runs/enum-len{len}")));
+    std::fs::create_dir_all(&dir).expect("create out dir");
+
+    let ops = alphabet(len);
+    let todo: Vec<usize> = (0..ops.len())
+        .filter(|s| s % shard_mod == shard_rem)
+        .filter(|s| !dir.join(format!("shard-{s:04}.json")).exists())
+        .collect();
+    let total_mine = (0..ops.len()).filter(|s| s % shard_mod == shard_rem).count();
+    eprintln!(
+        "=== enumerate === len={len} alphabet={} shards {}/{} to do (mod {shard_mod} rem {shard_rem}) threads={threads}",
+        ops.len(),
+        todo.len(),
+        total_mine
+    );
+    eprintln!("out -> {}  (one JSON per shard; rerun to resume; Ctrl-C safe between shards)", dir.display());
+
+    let queue = std::sync::Mutex::new(todo.into_iter().collect::<std::collections::VecDeque<usize>>());
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let t0 = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..threads.max(1) {
+            scope.spawn(|| loop {
+                let shard = match queue.lock().unwrap().pop_front() {
+                    Some(s) => s,
+                    None => return,
+                };
+                let res = run_shard(shard, len, &ops);
+                let path = dir.join(format!("shard-{shard:04}.json"));
+                let tmp = dir.join(format!("shard-{shard:04}.json.tmp"));
+                std::fs::write(&tmp, serde_json::to_string_pretty(&res).unwrap()).expect("write shard");
+                std::fs::rename(&tmp, &path).expect("finalize shard");
+                let d = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                eprintln!(
+                    "[shard {shard:04}] {} structures, {} screened, {} pattern-pass, {} timing evals, {} SURVIVORS  ({d} shards done, {:.0}s elapsed)",
+                    res.structures, res.screened, res.pattern_pass, res.timing_evals, res.survivors.len(),
+                    t0.elapsed().as_secs_f64()
+                );
+                for sv in &res.survivors {
+                    eprintln!("  SURVIVOR size={} delays={:?} {}", sv.size, sv.delays, sv.brief);
+                }
+            });
+        }
+    });
+
+    // Aggregate every shard file present (this machine's and any copied in).
+    let (mut st, mut sc, mut pp, mut te, mut sv, mut shards) = (0u64, 0u64, 0u64, 0u64, 0usize, 0usize);
+    for e in std::fs::read_dir(&dir).expect("read out dir") {
+        let path = e.expect("dir entry").path();
+        if path.extension().and_then(|x| x.to_str()) == Some("json") {
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            shards += 1;
+            st += v["structures"].as_u64().unwrap_or(0);
+            sc += v["screened"].as_u64().unwrap_or(0);
+            pp += v["pattern_pass"].as_u64().unwrap_or(0);
+            te += v["timing_evals"].as_u64().unwrap_or(0);
+            sv += v["survivors"].as_array().map(|a| a.len()).unwrap_or(0);
+        }
+    }
+    eprintln!(
+        "enumerate len={len}: {shards}/{} shards present | {st} structures, {sc} screened, {pp} pattern-pass, {te} timing evals, {sv} survivors",
+        ops.len()
+    );
 }
 
 /// Inspect a trace's LAST snapshot: where the ladder is, and how good the best
