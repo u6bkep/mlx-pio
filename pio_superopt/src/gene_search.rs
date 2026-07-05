@@ -2521,12 +2521,16 @@ mod tests {
     /// gated by the independent certifier. This is the user's next long run; DO
     /// NOT expect it to finish in the fast suite. Run: `cargo test --release --
     /// --ignored dme_spec_curriculum_gated --nocapture`.
+    ///
+    /// `densify_w = 1.0` (not the 0.5 default) per the [`dme_spec_densify_sweep`]
+    /// verdict: full-price spurious edges kill the half-cell toggler exploit and
+    /// crack 2..=3 at a 5.3x smaller budget.
     #[test]
     #[ignore = "spec-oracle gated curriculum ladder (several min); run with --release ... --nocapture"]
     fn dme_spec_curriculum_gated() {
         use crate::program::Program;
         use crate::search::CurriculumHp;
-        let hp = CurriculumHp::default();
+        let hp = CurriculumHp { densify_w: 1.0, ..CurriculumHp::default() };
         run_spec_gated_ladder("spec-oracle", &Program::empty(dme_cfg()), &(2..=14).collect::<Vec<_>>(), &hp);
     }
 
@@ -2653,8 +2657,29 @@ mod tests {
     /// Heavy (a stalled cell runs the full budget × retries — minutes); run with
     /// `cargo test --release -- --ignored dme_spec_densify_sweep --nocapture`.
     ///
-    /// RESULTS (seed 0x5EED, filled from a real run — see below).
-    /// TABLE_PLACEHOLDER
+    /// RESULTS (seed 0x5EED, run 2026-07-04, ~7min total):
+    ///
+    /// | densify | budget | solved | stall_fe | class       |
+    /// |---------|--------|--------|----------|-------------|
+    /// | 0.25    | 16x1M  | 0/2    | 0.50     | TOGGLER     |
+    /// | 0.25    | 24x2M  | 0/2    | 0.25     | TOGGLER     |
+    /// | 0.5     | 16x1M  | 0/2    | 1.00     | TOGGLER     |
+    /// | 0.5     | 24x2M  | 0/2    | 0.50     | OTHER       |
+    /// | 0.75    | 16x1M  | 1/2    | 2.00     | OTHER       |
+    /// | 0.75    | 24x2M  | 0/2    | 0.75     | OTHER       |
+    /// | 1.0     | 16x1M  | 0/2    | 1.00     | CONJUNCTION |
+    /// | 1.0     | 24x2M  | **2/2**| 0.00     | CONJUNCTION |
+    ///
+    /// VERDICT: monotone in densify_w — the champion CLASS climbs
+    /// TOGGLER -> OTHER -> CONJUNCTION as the spurious-edge discount shrinks,
+    /// and full-price spurious edges (densify_w=1.0) both kill the toggler
+    /// exploit (CONJUNCTION even at the cheap budget) and crack 2..=3 at
+    /// 24x2M — a 5.3x smaller budget than the 32x4M the default 0.5 needed.
+    /// No cell cracked at 16x1M, so the cheap-budget confirmation never ran.
+    /// => use densify_w = 1.0 for spec-oracle runs. Note this inverts the
+    /// cycle-exact-era lesson (densify < 1 broke the sparse-edge hiding trap):
+    /// under the tolerance-band oracle the discount is what FUNDS the toggler,
+    /// so the spec metric wants spurious edges at full price.
     #[test]
     #[ignore = "densify_w sweep for the spec metric (heavy, several min); run with --release ... --nocapture"]
     fn dme_spec_densify_sweep() {
