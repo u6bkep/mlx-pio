@@ -80,6 +80,13 @@ impl Coordinator {
         self.done.insert(shard)
     }
 
+    /// Is this shard already done? (Duplicate-result check — kept separate
+    /// from [`complete`] so the HTTP layer can write the shard file before
+    /// committing the done-mark.)
+    pub fn is_done(&self, shard: usize) -> bool {
+        self.done.contains(&shard)
+    }
+
     /// `(done, leased_active, remaining)` at `now`. `leased_active` counts
     /// only unexpired leases on not-done shards; `remaining` is what neither
     /// of the other buckets holds (free to lease right now).
@@ -227,11 +234,14 @@ fn handle(mut req: tiny_http::Request, coord: &mut Coordinator, cfg: &ServeCfg, 
                 );
                 return;
             }
-            if !coord.complete(shard) {
+            if coord.is_done(shard) {
                 // Already done (duplicate from a late host) — idempotent.
                 respond_json(req, 200, "{\"status\":\"duplicate, discarded\"}".into());
                 return;
             }
+            // Write the file BEFORE marking done: a failed write must leave
+            // the shard leasable (a done-without-file shard would otherwise
+            // be lost until a server restart rescan).
             let path = cfg.out_dir.join(format!("shard-{shard:04}.json"));
             let tmp = cfg.out_dir.join(format!("shard-{shard:04}.json.tmp"));
             if let Err(e) = std::fs::write(&tmp, &body).and_then(|_| std::fs::rename(&tmp, &path)) {
@@ -239,6 +249,7 @@ fn handle(mut req: tiny_http::Request, coord: &mut Coordinator, cfg: &ServeCfg, 
                 respond_json(req, 500, format!("{{\"error\":\"write failed: {e}\"}}"));
                 return;
             }
+            coord.complete(shard);
             let (done, leased, remaining) = coord.counts(now);
             eprintln!(
                 "[shard {shard:04}] done    ({done} done, {leased} leased, {remaining} remaining, {:.0}s elapsed)",
