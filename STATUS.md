@@ -1,57 +1,44 @@
 # STATUS — current frontier
 
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
-> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-04.
+> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-05.
 
 ## Where we are
 
-**Oracle pivot (ticket 005) in progress.** The cycle-exact testbed is retired:
-the gated ladder solves DME L=2..5 but stalled at L=6 four times (warm-start
-lock-in; cross-pollination + mined macros didn't cross the moat — search-side
-levers exhausted). Verdict: the wall is basin topology under the cycle-exact
-oracle, and `dme_ref` itself is not spec-shaped (14-cycle cell, off-center
-data, +1 slip/word), so every champion was forced to copy those artifacts.
+**The L=6 wall is ORACLE-INDEPENDENT.** The spec-oracle long run's fate is
+already known: a deterministic copy of its trace was resumed to completion
+during eval-cache measurements — attempt 2 of L=6 stalls, ladder breaks,
+**solved 4/13**, champion has the refill idiom two-thirds wired
+(`jmp NotOsrEmpty` + second `pull`), cert FAIL(3)/FAIL(6). Same wall as
+cycle-exact ⇒ basin topology around the OSR-refill conjunction, not the
+reference's timing artifacts. The live run (if still going) is only
+confirming this — safe to Ctrl-C.
 
-**Spec oracle state** (migration plan in `tickets/005`):
+**Branch `runner-restructure`** (worktree ../pio_optimization-restructure,
+4 commits, all tests green) — READY TO MERGE:
+- Phase 1: 34 concluded experiments + superseded engines deleted (-2.8k
+  lines); 10 ignored keepers (6 canaries, 3 subcommand-candidates kept as
+  tests, crack_l2).
+- Phase 2: `Problem` trait (DmeSpec/DmeWave), `wave-ladder` + `diagnose`
+  subcommands, `<trace>.result.json`. spec-ladder header verified
+  byte-identical to the live run's (resume-safe across the merge).
+- Early-exit eval (d1d1396): reject-bound hot path, ~13% shallow-stall,
+  ~0% in hot phases; behaviorally transparent (verified via sorted-trace
+  byte-equality).
 
-1. Certifier — DONE, on master (`src/certify.rs`, mutant-tested, independent).
-2. Oracle plumbing — DONE, on branch `spec-oracle`: dataset rows are
-   `(RunSpec, Target)`, `Target::Wave` (cycle-exact, unchanged behaviour) or
-   `Target::SpecBits` (nominal cell = 16 cycles, data at +8). Spec testbed +
-   certifier-gated ladder mirror exist; fast tests green (50 pass).
-3. Densify re-tune — DONE (`dme_spec_densify_sweep`, results in its doc
-   comment + `runs/densify_sweep.log`): champion class is monotone in
-   densify_w (TOGGLER → OTHER → CONJUNCTION); **densify_w=1.0 kills the
-   toggler exploit** and cracks 2..=3 at 24×2M (5.3× cheaper than default
-   0.5's 32×4M). Inverts the cycle-exact-era densify lesson. The long-run
-   test now uses 1.0.
+## Next actions (agreed 2026-07-05)
 
-**`spec-oracle` is MERGED to master** (all tests green).
-
-## Active branches / worktrees
-
-- `spec-oracle` @ `../pio_optimization-spec-oracle` — merged; worktree +
-  branch can be removed.
-- `algorithm_word`, `gene-v2-ir` — stale, review-or-delete.
-
-**Resumable runner landed** (first slice of the restructure): the gated
-ladder snapshots full state (per-restart programs + RNG + rung pool/lib/
-minima) inline into the JSONL trace at ~1/8-rung cadence and on Ctrl-C;
-`superopt spec-ladder` auto-resumes from the last snapshot (header-verified),
-byte-identical to an uninterrupted run (locked by test). Kill/resume the
-long run freely.
-
-## Next actions
-
-1. Long run via the runner: `pio_superopt/target/release/superopt
-   spec-ladder` (defaults: lengths 2..=14, 32×4M, densify 1.0, seed 0x5EED)
-   — does the ladder climb past L=6 once refill artifacts aren't mandated?
-   Ctrl-C to reclaim CPU; rerun the same command to resume.
-2. Restructure (ticket 006): DONE on branch `runner-restructure`
-   (worktree ../pio_optimization-restructure) — 34 concluded experiments +
-   superseded engines deleted (-3.1k lines), Problem trait (DmeSpec/
-   DmeWave), wave-ladder + diagnose subcommands, result.json. spec-ladder
-   header verified byte-identical to the live run's (resume-safe). Merge
-   to master when convenient.
-3. Then per ticket 005: re-test config genes (clkdiv/autopull), 32-slot
-   window, multi-SM.
+1. Merge `runner-restructure` → master; remove worktree; stop the live run.
+2. **Eval cache** (user-approved; design settled by measurement, see ticket
+   004): thread-local direct-mapped table, 2^16 slots, EXACT keys
+   (assembled words + wrap + config genes), values = per-group raw error
+   vectors (weights applied at lookup). Measured: 32-39% duplicate rate
+   across stall regimes; 16k-slot direct-mapped already captures 96% of
+   the unbounded ceiling (no thrashing, no bloom admission needed).
+   Expected ~1.5x on stalled rungs, composes with early-exit.
+3. **Autopull as a config gene under the spec oracle** (ticket 005 step 4)
+   — the actual lever against the wall: the spec oracle doesn't mandate
+   dme_ref's +1-slip-per-word, so autopull-on may dissolve the refill
+   spine the way autopull+wrap dissolved the UART spine. Needs the padded
+   (FIFO-fed) dataset variant for autopull retries (`pad` flag exists).
+4. Then per ticket 005: 32-slot window, multi-SM.

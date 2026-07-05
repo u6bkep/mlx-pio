@@ -118,3 +118,22 @@ substantial headroom.
 
 Verify any optimization preserves the reset-reuse invariant (pio_harness
 `tests/reset_reuse.rs`: reset must equal a fresh build).
+
+
+## 2026-07-05 — next lever: eval cache (approved; measured; not yet built)
+
+Duplicate-candidate rate in the gated ladder is ~32-39% across stall
+regimes (12M shallow + 34M deep-stall evals measured; warm ≈ random
+restarts — it is a property of the mutation kernel's local density, not of
+being pinned). Key-stream replay against simulated caches shows NO
+thrashing: direct-mapped 16k slots = 37.2% hits vs 38.8% unbounded ceiling;
+LRU/2-way/admission policies buy nothing (repeats are temporally local).
+
+Design (settled): thread-local direct-mapped table, 2^16 slots,
+replace-on-collision; EXACT keys (assembled [u16;32] + wrap + config genes
+— exactness is mandatory for the byte-identical-resume guarantee); values =
+per-group RAW error vectors, weights applied at lookup (survives the
+per-checkpoint weight ramp, and makes the checkpoint re-score + miss-fix
+second eval free). Invalidate per rung. Expected ~1.5x on stalled rungs;
+composes with the reject-bound early exit (d1d1396), which measured ~13%
+on full schedules and ~0% in reheated hot phases.

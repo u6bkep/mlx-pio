@@ -4,6 +4,55 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-05 — resumable runner, restructure, eval optimizations; L=6 wall is oracle-independent
+
+- **Densify verdict + merge** (late 07-04): sweep table filled — champion
+  class monotone in densify_w (TOGGLER→OTHER→CONJUNCTION); densify_w=1.0
+  kills the toggler and cracks 2..=3 at 24×2M (5.3× cheaper than default
+  0.5's 32×4M). INVERTS the cycle-exact densify lesson: under the tolerance
+  band the spurious discount is what funds the toggler. spec-oracle branch
+  merged to master; worktree/branch deleted.
+- **Resumable runner** (c97055d on master): gated ladder snapshots full
+  state (per-restart cur/best programs + RNG u64 + rung pool/lib/minima)
+  inline into the JSONL trace at ~1/8-rung cadence and on Ctrl-C (stop flag
+  latched by r0, all restarts quit in lockstep post-snapshot). `superopt
+  spec-ladder` auto-resumes from the last snapshot, header-verified;
+  byte-identical to an uninterrupted run (locked by test). Also fixed a
+  latent heartbeat cadence bug (i%hb only fired when hb was a multiple of
+  the checkpoint step — true only at the 4M budget).
+- **Long spec run started** (user, own shell): lengths 2..=14, 32×4M,
+  densify 1.0, seed 0x5EED.
+- **Restructure** (branch `runner-restructure`, ticket 006): phase 1
+  deleted 34 concluded experiments + orphaned engines (flat/PT, rainbow,
+  novelty, ramp/stage, portfolio, meta_anneal) −2.8k lines; phase 2 added
+  the `Problem` trait (DmeSpec/DmeWave), `wave-ladder` + `diagnose`
+  subcommands, `result.json`. Engine-split dropped by agreement (deletion
+  already halved the files). spec-ladder header byte-identical to the live
+  trace's → resume-safe across the merge.
+- **Early-exit eval** (d1d1396): reject when the partial row-sum exceeds
+  cur+40·temp (acceptance < e^-40 < RNG resolution), consuming the
+  Metropolis draw to keep the stream identical. Verified transparent
+  (sorted traces byte-identical vs baseline binary). ~13% on a full
+  shallow-stall schedule; ~0% in reheated hot phases — savings live in the
+  cold half of each attempt.
+- **Eval-cache measurements** (user's idea): duplicate-candidate rate is
+  ~32% (shallow stall, 12M evals) and ~33-39% (deep stall, live-trace
+  copy, 34M evals) — stable across regimes, warm≈random restarts; NOT the
+  >90% a pinned-champ model predicted (cur wanders at stall temps).
+  Key-stream replay vs simulated caches: **no thrashing** — a 16k-slot
+  direct-mapped table hits 37.2% vs the 38.8% unbounded ceiling (96%);
+  LRU/2-way/bloom-admission buy nothing. Design settled: thread-local
+  direct-mapped 2^16, exact keys, per-group error vectors. ~1.5× on
+  stalls. Approved, to implement next session (ticket 004).
+- **FINDING — the L=6 wall is oracle-independent**: the deep-stall probe
+  (deterministic copy of the live trace, resumed to completion) ended
+  attempt 2 STALLED → solved 4/13, champion carrying the partial refill
+  idiom (`jmp NotOsrEmpty` + second pull), cert FAIL(3)/FAIL(6). The live
+  run will deterministically reach the same verdict. The wall is basin
+  topology around the OSR-refill conjunction, not dme_ref's timing
+  artifacts. Next lever: autopull as a config gene under the spec oracle
+  (ticket 005 step 4).
+
 ## 2026-07-04 — L=6 verdict: STALL (4x), testbed retired; oracle pivot underway
 
 - Overnight 2..=14 run (old engine): L=2..5 solved, L=6 stalled fe=80. Trace
