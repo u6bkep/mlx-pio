@@ -466,7 +466,7 @@ fn pick_occupied(p: &Program, slots: u8, rng: &mut Rng) -> Option<usize> {
 /// are stored RELATIVE to the run start with the matching `rel` flag set, so a
 /// splice rebases them to wherever the macro lands; targets pointing elsewhere
 /// stay absolute (they were context-specific — point edits can retune them).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MinedMacro {
     pub insns: Vec<Insn>,
     /// Per-insn: is this a jmp whose target is stored run-relative?
@@ -1586,7 +1586,7 @@ fn group_edge_errors(p: &Program, dataset: &[(RunSpec, Target)], groups: &[usize
 /// these are the continuous knobs the meta-tuner anneals *around* that fixed
 /// trigger. Compute scale (restarts, per-rung iters) is passed separately: it's
 /// budget, not shape.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CurriculumHp {
     /// Cost weight on edge-errors vs the (once-counted) size term.
     pub w: f64,
@@ -1640,6 +1640,48 @@ impl CurriculumHp {
         }
         h
     }
+}
+
+/// One restart's mid-anneal state as captured at a checkpoint barrier: the
+/// state at the TOP of the checkpoint iteration (before the checkpoint block's
+/// best-update runs), so a resumed run re-enters the loop at that iteration,
+/// re-runs the (RNG-free, idempotent) checkpoint block, and continues the exact
+/// draw sequence — byte-identical to the uninterrupted run.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RestartSnap {
+    /// Full RNG state ([`Rng::state`]).
+    pub rng: u64,
+    pub cur: Program,
+    pub best: Program,
+    pub best_sel: f64,
+}
+
+/// A resumable snapshot of [`synthesize_curriculum_gated`]: everything the
+/// engine needs to re-enter the ladder at (`frontier`, `attempt`, `iter`).
+/// Emitted inline into the trace as [`TraceEvent::Snapshot`] — periodically at
+/// heartbeat checkpoints, at attempt/rung boundaries, and on a stop request —
+/// so resuming is "parse the last snapshot line of the trace".
+///
+/// `restarts` empty means the attempt has not started (a boundary snapshot):
+/// resume initializes the restart pool exactly as a fresh attempt would.
+/// Non-empty, it holds one [`RestartSnap`] per restart index and `iter` is the
+/// checkpoint iteration to re-enter at.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GatedSnapshot {
+    pub frontier: usize,
+    pub attempt: usize,
+    pub iter: u32,
+    /// The rung's incoming warm base (previous rung's champion).
+    pub champ: Option<Program>,
+    pub solved_through: usize,
+    /// Reheat in effect for this attempt (pre-escalation).
+    pub reheat: f64,
+    pub pool: Vec<Program>,
+    pub lib: Vec<MinedMacro>,
+    /// Restart minima accumulated across this rung's earlier attempts:
+    /// `(best program, selection cost, frontier error)`.
+    pub minima: Vec<(Program, f64, f64)>,
+    pub restarts: Vec<RestartSnap>,
 }
 
 /// Structured trace event emitted by [`synthesize_curriculum_gated`] when a trace
@@ -1698,6 +1740,10 @@ pub enum TraceEvent<'a> {
         /// attempt ran to full budget without any restart clearing the frontier.
         early_stop_checkpoint: Option<u32>,
     },
+    /// A resumable state snapshot (see [`GatedSnapshot`]). The sink should
+    /// persist it machine-readably; the LAST snapshot in a trace is the
+    /// resume point.
+    Snapshot { snap: &'a GatedSnapshot },
 }
 
 /// **Performance-gated curriculum ladder** — the generality engine. The trigger
@@ -1751,11 +1797,21 @@ pub fn synthesize_curriculum_gated(
     solve_eps: f64,
     seed: u64,
     on_trace: Option<&(dyn Fn(&TraceEvent) + Sync)>,
+    // RESUMABILITY: `resume` re-enters the ladder at a prior run's
+    // [`GatedSnapshot`]; `stop` is a cooperative interrupt — when it goes
+    // true (e.g. from a Ctrl-C handler) every restart snapshots at its next
+    // checkpoint barrier and the engine returns early (the caller detects
+    // the interruption by re-reading the flag). Both `None` = the historical
+    // behavior, RNG-stream-identical.
+    resume: Option<GatedSnapshot>,
+    stop: Option<&std::sync::atomic::AtomicBool>,
     mut on_rung: impl FnMut(usize, &Program, f64, bool),
 ) -> (Program, f64, usize) {
-    let mut champ: Option<Program> = None;
-    let mut solved_through = 0usize; // groups [0, solved_through) are solved
-    for frontier in 0..n_groups {
+    let mut champ: Option<Program> = resume.as_ref().and_then(|s| s.champ.clone());
+    let mut solved_through = resume.as_ref().map(|s| s.solved_through).unwrap_or(0);
+    let start_frontier = resume.as_ref().map(|s| s.frontier).unwrap_or(0);
+    let stopped = || stop.map(|s| s.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false);
+    for frontier in start_frontier..n_groups {
         // Selection metric (the GENERALITY FILTER): unweighted cost over every
         // active length PLUS one length beyond the frontier. A length L admits
         // two zero-cost basins — the general conjunction (a loop) and a memoryless
@@ -1807,16 +1863,35 @@ pub fn synthesize_curriculum_gated(
         // library (RNG stream unchanged vs the pre-mining engine).
         const POOL_MAX: usize = 8;
         const LIB_MAX: usize = 8;
-        let mut pool: Vec<Program> = warm_base.iter().cloned().collect();
-        let mut lib: Vec<MinedMacro> = Vec::new();
+        // On the resumed rung, the rung-level state (pool/lib/minima/reheat and
+        // the attempt to enter at) comes from the snapshot; every later rung
+        // initializes fresh, exactly as before.
+        let rs = resume.as_ref().filter(|s| s.frontier == frontier);
+        let mut pool: Vec<Program> = match rs {
+            Some(s) => s.pool.clone(),
+            None => warm_base.iter().cloned().collect(),
+        };
+        let mut lib: Vec<MinedMacro> = rs.map(|s| s.lib.clone()).unwrap_or_default();
         // Restart minima accumulated across ALL attempts of this rung. Attempt 0
         // is all-warm and typically ends as a monoculture (one distinct basin),
         // so mining only the latest attempt would leave the first retry with
         // nothing; the union keeps every basin any attempt ever reached.
-        let mut minima: Vec<(Program, f64, f64)> = Vec::new();
-        let mut reheat = hp.reheat;
+        let mut minima: Vec<(Program, f64, f64)> = rs.map(|s| s.minima.clone()).unwrap_or_default();
+        let mut reheat = rs.map(|s| s.reheat).unwrap_or(hp.reheat);
+        let start_attempt = rs.map(|s| s.attempt).unwrap_or(0);
         let mut chosen: Option<(Program, f64)> = None; // (rung champion, its frontier error)
-        for attempt in 0..=MAX_RETRIES {
+        for attempt in start_attempt..=MAX_RETRIES {
+            // Mid-anneal restore applies only to the exact resumed attempt.
+            let mid: Option<&GatedSnapshot> =
+                rs.filter(|s| s.attempt == attempt && !s.restarts.is_empty());
+            if let Some(s) = mid {
+                assert_eq!(
+                    s.restarts.len(),
+                    restarts.max(1),
+                    "snapshot restart count must match the run's `restarts`"
+                );
+            }
+            let start_iter = mid.map(|s| s.iter).unwrap_or(0);
             // Promoted rungs reheat only partway; the scratch rung always starts
             // hot (reheat does not apply). Each retry bumps reheat toward 1.0.
             let t_start = if scratch { hp.t0 } else { hp.t_end + reheat * (hp.t0 - hp.t_end) };
@@ -1837,6 +1912,15 @@ pub fn synthesize_curriculum_gated(
             // checkpoint — it is only ever written at that one checkpoint.
             let early_stop_iter = std::sync::atomic::AtomicU32::new(u32::MAX);
             let barrier = std::sync::Barrier::new(restarts.max(1));
+            // SNAPSHOT/STOP shared state. `stop_latch` is restart 0's sample of
+            // the external `stop` flag, published before the checkpoint barrier
+            // so every restart sees the SAME value after it (reading the
+            // external flag directly would race: restarts could disagree
+            // mid-checkpoint and desynchronize the barrier protocol).
+            // `snap_slots` is the per-restart deposit box for snapshot gathers.
+            let stop_latch = std::sync::atomic::AtomicBool::new(false);
+            let snap_slots: std::sync::Mutex<Vec<Option<RestartSnap>>> =
+                std::sync::Mutex::new(vec![None; restarts.max(1)]);
 
             // Each restart returns (best program, its SELECTION cost, its frontier
             // edge-error) — the frontier error is returned so rung selection needn't
@@ -1860,10 +1944,24 @@ pub fn synthesize_curriculum_gated(
                         let solved_flag = &solved_flag;
                         let early_stop_iter = &early_stop_iter;
                         let barrier = &barrier;
+                        let stop_latch = &stop_latch;
+                        let snap_slots = &snap_slots;
+                        // Read-only refs for restart 0's snapshot assembly.
+                        let pool = &pool;
+                        let warm_base = &warm_base;
+                        let minima = &minima;
+                        let mid_snap = mid;
                         s.spawn(move || {
-                            let mut rng = Rng::new(cs);
+                            let mut rng = match mid_snap {
+                                Some(s) => Rng::from_state(s.restarts[r].rng),
+                                None => Rng::new(cs),
+                            };
                             let step = (rung_iters / 256).max(1);
-                            let hb = (rung_iters / 8).max(1); // heartbeat cadence (~1/8 rung)
+                            // Heartbeat/snapshot cadence: every 32nd CHECKPOINT (~1/8
+                            // rung). Counted in checkpoints, not raw iters — `i % hb`
+                            // only fires when hb happens to be a multiple of `step`,
+                            // which held for the 4M default budget and silently never
+                            // fired for most other budgets.
                             // Weights for the frontier rung at within-rung fraction `f`.
                             // The handoff ramp only applies to PROMOTED rungs (easing a
                             // new length in alongside existing structure); the scratch
@@ -1876,19 +1974,35 @@ pub fn synthesize_curriculum_gated(
                                     .map(|g| if g < frontier { hp.anchor } else if g == frontier { front } else { 0.0 })
                                     .collect::<Vec<f64>>()
                             };
-                            let mut cur = match &warm {
-                                Some(w) => w.clone(),
-                                None => random_program(template, space, &mut rng),
+                            // Mid-anneal resume restores cur/best/RNG verbatim; the
+                            // restored RNG must not be advanced by init (so no
+                            // random_program call on this path).
+                            let mut cur = match mid_snap {
+                                Some(s) => s.restarts[r].cur.clone(),
+                                None => match &warm {
+                                    Some(w) => w.clone(),
+                                    None => random_program(template, space, &mut rng),
+                                },
                             };
                             let mut weights = weights_at(0.0);
                             let mut cur_cost = weighted_multidata_cost(&cur, dataset, groups, &weights, hp.w, hp.densify_w);
                             // Track the best by the SELECTION metric (all active lengths).
-                            let mut best = (cur.clone(), weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w));
-                            for i in 0..rung_iters {
+                            let mut best = match mid_snap {
+                                Some(s) => (s.restarts[r].best.clone(), s.restarts[r].best_sel),
+                                None => (cur.clone(), weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w)),
+                            };
+                            for i in start_iter..rung_iters {
                                 // Temp is computed here (unconditionally, unchanged) so
                                 // the checkpoint trace can report it without recomputing.
                                 let temp = t_start * (hp.t_end / t_start).powf(i as f64 / rung_iters.max(1) as f64);
                                 if i % step == 0 {
+                                    // Pre-block state stash (rng, cur, best, best_sel):
+                                    // if this checkpoint takes a snapshot, it captures
+                                    // the state ENTERING iteration `i` — the checkpoint
+                                    // block below is RNG-free and idempotent, so a
+                                    // resumed run re-enters at `i`, re-runs the block,
+                                    // and continues byte-identically.
+                                    let stash = (rng.state(), cur.clone(), best.0.clone(), best.1);
                                     weights = weights_at(i as f64 / rung_iters as f64);
                                     cur_cost = weighted_multidata_cost(&cur, dataset, groups, &weights, hp.w, hp.densify_w);
                                     let active = weighted_multidata_cost(&cur, dataset, groups, active_ones, hp.w, hp.densify_w);
@@ -1917,6 +2031,15 @@ pub fn synthesize_curriculum_gated(
                                             cur_cost, best_sel_cost: best.1, best_frontier_err: bfe, best_size: best.0.size(),
                                         });
                                     }
+                                    // STOP LATCH: only restart 0 samples the external
+                                    // stop flag, pre-barrier; everyone reads the latch
+                                    // post-barrier. All restarts therefore agree on
+                                    // whether this checkpoint is stopping, keeping the
+                                    // barrier protocol below in lockstep.
+                                    if r == 0 {
+                                        let ext = stop.map(|s| s.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false);
+                                        stop_latch.store(ext, std::sync::atomic::Ordering::SeqCst);
+                                    }
                                     // Lockstep barrier: every restart is at the same
                                     // checkpoint here, so the store above (from any
                                     // restart) is visible to the load below on all of
@@ -1924,9 +2047,49 @@ pub fn synthesize_curriculum_gated(
                                     // function of the seeds, independent of thread timing.
                                     barrier.wait();
                                     let done = solved_flag.load(std::sync::atomic::Ordering::SeqCst);
+                                    let stopping = stop_latch.load(std::sync::atomic::Ordering::SeqCst);
+                                    // SNAPSHOT GATHER: at heartbeat cadence, and always
+                                    // when stopping. Deposit, barrier (all deposited),
+                                    // restart 0 assembles + emits, barrier (emit done
+                                    // before anyone can re-deposit). The predicate is
+                                    // uniform across restarts, so barrier counts match.
+                                    let hb_checkpoint = (i / step) % 32 == 0;
+                                    if on_trace.is_some() && (stopping || hb_checkpoint) {
+                                        snap_slots.lock().unwrap()[r] = Some(RestartSnap {
+                                            rng: stash.0,
+                                            cur: stash.1,
+                                            best: stash.2,
+                                            best_sel: stash.3,
+                                        });
+                                        barrier.wait();
+                                        if r == 0 {
+                                            let snaps: Vec<RestartSnap> = snap_slots
+                                                .lock()
+                                                .unwrap()
+                                                .iter_mut()
+                                                .map(|s| s.take().expect("all restarts deposited at the barrier"))
+                                                .collect();
+                                            let gs = GatedSnapshot {
+                                                frontier,
+                                                attempt,
+                                                iter: i,
+                                                champ: warm_base.clone(),
+                                                solved_through,
+                                                reheat,
+                                                pool: pool.clone(),
+                                                lib: lib.clone(),
+                                                minima: minima.clone(),
+                                                restarts: snaps,
+                                            };
+                                            if let Some(tr) = on_trace {
+                                                tr(&TraceEvent::Snapshot { snap: &gs });
+                                            }
+                                        }
+                                        barrier.wait();
+                                    }
                                     // Heartbeat: restart 0 only, ~1/8 rung, at a checkpoint
                                     // (never in the hot path).
-                                    if r == 0 && i % hb == 0 {
+                                    if r == 0 && hb_checkpoint {
                                         eprintln!(
                                             "  [hb] rung#{frontier} attempt {attempt} iter {i}/{rung_iters} best_sel={:.1} best_fe={bfe:.1}{}",
                                             best.1, if done { "  (frontier solved)" } else { "" }
@@ -1938,6 +2101,12 @@ pub fn synthesize_curriculum_gated(
                                     // waiting on a barrier that a broken peer will never
                                     // reach, and the break checkpoint is identical for all.
                                     if done {
+                                        break;
+                                    }
+                                    // Cooperative interrupt: the snapshot for this
+                                    // checkpoint is already in the trace (above), so
+                                    // every restart can just quit here in lockstep.
+                                    if stopping {
                                         break;
                                     }
                                 }
@@ -1989,6 +2158,19 @@ pub fn synthesize_curriculum_gated(
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             });
+
+            // INTERRUPTED: the restarts broke at a stop checkpoint and its
+            // snapshot is already in the trace — return without attempt-end
+            // processing (selection/mining would advance state past the
+            // snapshot). The caller distinguishes this from completion by
+            // re-reading its stop flag. (RestartEnd rows from the cut-short
+            // attempt do land in the trace; resume ignores them — it reads
+            // only the last Snapshot.)
+            if stopped() {
+                let c = champ.clone().unwrap_or_else(|| template.clone());
+                let full = multidata_cost(&c, dataset, hp.w, 0, hp.densify_w);
+                return (c, full, solved_through);
+            }
 
             // LEXICOGRAPHIC RUNG SELECTION: prefer restarts that SOLVED the frontier
             // (edge-errors <= solve_eps), ranking those by the selection metric (the

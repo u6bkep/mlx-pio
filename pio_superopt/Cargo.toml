@@ -7,6 +7,12 @@ description = "Simulated-annealing superoptimizer for RP2350 PIO programs: symbo
 [dependencies]
 # The runner drives real programs through the emulator harness.
 pio_harness = { path = "../pio_harness" }
+# Snapshot/resume serialization (trace JSONL rows). serde derives sit on the
+# IR/Program types so a search snapshot round-trips byte-identically.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Ctrl-C -> stop flag -> snapshot-and-exit in the runner binary.
+ctrlc = "3"
 
 [dev-dependencies]
 # Ground-truth decoder, used to prove the encoder round-trips

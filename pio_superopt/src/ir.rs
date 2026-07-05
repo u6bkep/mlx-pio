@@ -11,7 +11,7 @@
 /// instruction performs no side-set) or `Some(value)`. How these pack
 /// into the shared 5-bit field is decided at encode time — see
 /// [`crate::encode::encode_insn`] and [`SideCfg`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Insn {
     pub op: Op,
     pub delay: u8,
@@ -65,7 +65,7 @@ impl Insn {
 
 /// PIO opcode with its operands. Variants mirror the 8 opcode groups
 /// (PUSH and PULL share opcode `0b100`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Op {
     /// `JMP <cond> <target>` — `target` is a slot index (0..=31).
     Jmp { cond: JmpCond, target: u8 },
@@ -89,7 +89,7 @@ pub enum Op {
 }
 
 /// JMP condition (operand bits [7:5]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum JmpCond {
     Always = 0,
@@ -103,7 +103,7 @@ pub enum JmpCond {
 }
 
 /// WAIT source (operand bits [6:5]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum WaitSrc {
     GpioAbs = 0, // absolute GPIO index
@@ -116,7 +116,7 @@ pub enum WaitSrc {
 }
 
 /// IN source (operand bits [7:5]); codes 4,5 reserved and omitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum InSrc {
     Pins = 0,
@@ -128,7 +128,7 @@ pub enum InSrc {
 }
 
 /// OUT destination (operand bits [7:5]); all 8 codes legal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum OutDst {
     Pins = 0,
@@ -142,7 +142,7 @@ pub enum OutDst {
 }
 
 /// MOV destination (operand bits [7:5]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum MovDst {
     Pins = 0,
@@ -156,7 +156,7 @@ pub enum MovDst {
 }
 
 /// MOV operation (operand bits [4:3]); code 3 reserved and omitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum MovOp {
     None = 0,
@@ -165,7 +165,7 @@ pub enum MovOp {
 }
 
 /// MOV source (operand bits [2:0]); code 4 reserved and omitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum MovSrc {
     Pins = 0,
@@ -178,7 +178,7 @@ pub enum MovSrc {
 }
 
 /// SET destination (operand bits [7:5]); codes 3,5,6,7 reserved/omitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum SetDst {
     Pins = 0,
@@ -190,7 +190,7 @@ pub enum SetDst {
 /// The SM-global side-set configuration that determines how the 5-bit
 /// delay/side-set field is split. Mirrors PINCTRL_SIDESET_COUNT and
 /// EXECCTRL_SIDE_EN.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SideCfg {
     /// Number of MSBs of the 5-bit field used for side-set, **including
     /// the enable bit** when `en` is set. 0..=5.

@@ -10,7 +10,7 @@ use crate::encode::encode_insn;
 use crate::ir::{Insn, SideCfg};
 
 /// ISR/OSR shift direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShiftDir {
     Left,
     Right,
@@ -18,7 +18,7 @@ pub enum ShiftDir {
 
 /// SHIFTCTRL genes: autopush/pull, their thresholds (1..=32), shift
 /// directions, and FIFO join.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShiftCfg {
     pub autopush: bool,
     pub autopull: bool,
@@ -48,7 +48,7 @@ impl Default for ShiftCfg {
 /// PINCTRL pin bases/counts. Treated as part of the fixed per-target
 /// contract (board wiring), not search genes, but carried here so a
 /// `Program` is self-describing.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PinMap {
     pub out_base: u8,
     pub out_count: u8,
@@ -61,7 +61,7 @@ pub struct PinMap {
 /// The full SM configuration. Which fields are mutated (genes) vs held
 /// fixed (contract) is the mutation operator's concern; the type carries
 /// all of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub side: SideCfg,
     pub side_pindir: bool,
@@ -89,7 +89,7 @@ impl Default for Config {
 }
 
 /// A 32-slot program with wrap bounds and config.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Program {
     pub slots: [Option<Insn>; 32],
     /// Wrap target/source as slot indices (EXECCTRL WRAP_BOTTOM/TOP).

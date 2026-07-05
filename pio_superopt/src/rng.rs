@@ -8,6 +8,17 @@ impl Rng {
         Rng(seed)
     }
 
+    /// The full internal state (splitmix64 is just its counter). Together
+    /// with [`Rng::from_state`] this makes a search resumable mid-stream:
+    /// restoring the state continues the exact draw sequence.
+    pub fn state(&self) -> u64 {
+        self.0
+    }
+
+    pub fn from_state(state: u64) -> Self {
+        Rng(state)
+    }
+
     pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;

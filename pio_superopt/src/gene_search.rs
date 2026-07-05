@@ -983,6 +983,7 @@ pub fn synthesize_gene(
 mod tests {
     use super::*;
     use crate::fixtures::{dme_cfg, dme_corpus, dme_golden, dme_ref, dme_spec, DME_CYCLES, DME_H};
+    use crate::fixtures::{dme_spec_multilength_dataset, fmt_cert, seq_words, spec_certify_corpus, SPEC_H, SPEC_PHI_MAX};
     use crate::ir::{Insn, Op, OutDst, SetDst, SideCfg};
     use crate::program::*;
     use crate::run::run;
@@ -2063,12 +2064,6 @@ mod tests {
         }
     }
 
-    /// Pack `n_bits` (bit i = the i-th emitted line bit, LSB-first) into 5-bit
-    /// DME words for the TX FIFO.
-    fn seq_words(bits: u64, n_bits: usize) -> Vec<u32> {
-        let words = (n_bits + 4) / 5;
-        (0..words.max(1)).map(|w| ((bits >> (5 * w)) & 0x1F) as u32).collect()
-    }
 
     /// LENGTH-PROGRESSIVE CURRICULUM (the testbed redesign): grow the problem one
     /// cell at a time. At length L the candidate must reproduce the reference over
@@ -2309,7 +2304,7 @@ mod tests {
         eprintln!("trace -> {trace_path}");
         let trace = |ev: &crate::search::TraceEvent| {
             use std::io::Write;
-            let line = trace_json(ev);
+            let line = crate::trace::trace_json(ev);
             let mut w = sink.lock().unwrap();
             let _ = writeln!(w, "{line}");
         };
@@ -2317,6 +2312,7 @@ mod tests {
         let (champ, cost, solved) = synthesize_curriculum_gated(
             template, &space, &dataset, &groups, lengths.len(), hp, 32, 4_000_000, 0.0, seed,
             Some(&trace),
+            None, None,
             |frontier, rc, front_err, ok| {
                 let parts: Vec<_> = (0..space.slots as usize)
                     .filter_map(|i| rc.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
@@ -2337,51 +2333,6 @@ mod tests {
         );
     }
 
-    /// Serialize one [`crate::search::TraceEvent`] as a single JSON object (one
-    /// JSONL record). Hand-formatted — the crate has no serde dependency. Numbers
-    /// are emitted bare (non-finite -> `null` to stay valid JSON); the program
-    /// disassembly is the only string field and is minimally escaped.
-    fn trace_json(ev: &crate::search::TraceEvent) -> String {
-        use crate::search::TraceEvent::*;
-        // Bare finite number, or `null` (JSON has no inf/nan).
-        fn jf(x: f64) -> String {
-            if x.is_finite() { format!("{x}") } else { "null".into() }
-        }
-        fn esc(s: &str) -> String {
-            let mut o = String::with_capacity(s.len() + 2);
-            for c in s.chars() {
-                match c {
-                    '"' => o.push_str("\\\""),
-                    '\\' => o.push_str("\\\\"),
-                    '\n' => o.push_str("\\n"),
-                    '\t' => o.push_str("\\t"),
-                    c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-                    c => o.push(c),
-                }
-            }
-            o
-        }
-        match ev {
-            Checkpoint { frontier, attempt, r, iter, temp, cur_cost, best_sel_cost, best_frontier_err, best_size } => format!(
-                "{{\"kind\":\"checkpoint\",\"rung\":{frontier},\"attempt\":{attempt},\"r\":{r},\"iter\":{iter},\"temp\":{},\"cur_cost\":{},\"best_sel\":{},\"best_fe\":{},\"best_size\":{best_size}}}",
-                jf(*temp), jf(*cur_cost), jf(*best_sel_cost), jf(*best_frontier_err)
-            ),
-            NewBest { frontier, attempt, r, iter, program, sel_cost, frontier_err, size } => format!(
-                "{{\"kind\":\"new_best\",\"rung\":{frontier},\"attempt\":{attempt},\"r\":{r},\"iter\":{iter},\"sel\":{},\"fe\":{},\"size\":{size},\"prog\":\"{}\"}}",
-                jf(*sel_cost), jf(*frontier_err), esc(&program.brief())
-            ),
-            RestartEnd { frontier, attempt, r, program, sel_cost, frontier_err, size } => format!(
-                "{{\"kind\":\"restart_end\",\"rung\":{frontier},\"attempt\":{attempt},\"r\":{r},\"sel\":{},\"fe\":{},\"size\":{size},\"prog\":\"{}\"}}",
-                jf(*sel_cost), jf(*frontier_err), esc(&program.brief())
-            ),
-            AttemptEnd { frontier, attempt, program, solved, reheat, early_stop_checkpoint } => format!(
-                "{{\"kind\":\"attempt_end\",\"rung\":{frontier},\"attempt\":{attempt},\"solved\":{solved},\"reheat\":{},\"early_stop\":{},\"prog\":\"{}\"}}",
-                jf(*reheat),
-                match early_stop_checkpoint { Some(v) => v.to_string(), None => "null".into() },
-                esc(&program.brief())
-            ),
-        }
-    }
 
     // ===================== SPEC-ORACLE TESTBED (ticket 005) =====================
     //
@@ -2395,71 +2346,6 @@ mod tests {
     // is a target `dme_ref` does not meet, and the certifier — not `dme_ref` —
     // is the only gate.
 
-    /// Half-cell for the spec testbed (`DME_H` analogue): nominal cell = `2*8`
-    /// cycles, mid-bit data transition at `+8`.
-    const SPEC_H: usize = 8;
-    /// Startup-phase bound: the first boundary edge may land anywhere in
-    /// `[1, SPEC_PHI_MAX]`. Generous, so the search keeps phase freedom.
-    const SPEC_PHI_MAX: usize = 32;
-
-    /// Build a pooled multi-length SPEC curriculum dataset: exhaustive length-L
-    /// bit sequences (vary the first `len` bits) while `2^len <= cap`, else `cap`
-    /// sampled — the SAME enumeration and RNG discipline as
-    /// [`dme_multilength_dataset`] (seed `0xDA7A_5EED ^ len`), so determinism is
-    /// identical. Rows carry the expected BITS directly (not a golden waveform):
-    /// `Target::SpecBits { bits, h = SPEC_H, phi_max = SPEC_PHI_MAX }`. The
-    /// RunSpec packs those bits LSB-first into 5-bit words exactly like
-    /// `seq_words` (config `dme_cfg`: pull_threshold 5, autopull off, clkdiv
-    /// pinned). Capture window = `phi_max` slack + `len * cell` frame + a
-    /// half-cell tail, so a compliant frame at any admissible phase fits and a
-    /// runaway loop's post-frame toggles show up as spurious edges.
-    fn dme_spec_multilength_dataset(lengths: &[usize], cap: u64) -> (Vec<(RunSpec, crate::search::Target)>, Vec<usize>) {
-        use crate::search::Target;
-        let cell = 2 * SPEC_H;
-        let mut dataset: Vec<(RunSpec, Target)> = Vec::new();
-        let mut groups: Vec<usize> = Vec::new();
-        for (gi, &len) in lengths.iter().enumerate() {
-            let win = (SPEC_PHI_MAX + len * cell + SPEC_H) as u64;
-            let exhaustive = (1u64 << len) <= cap;
-            let n = if exhaustive { 1u64 << len } else { cap };
-            let mut drng = Rng::new(0xDA7A_5EED ^ len as u64);
-            for s in 0..n {
-                let bitval = if exhaustive { s } else { drng.below(1u32 << len) as u64 };
-                let bits: Vec<bool> = (0..len).map(|i| (bitval >> i) & 1 == 1).collect();
-                let sp = RunSpec { inputs: seq_words(bitval, len), cycles: win, ..dme_spec(0) };
-                dataset.push((sp, Target::SpecBits { bits, h: SPEC_H, phi_max: SPEC_PHI_MAX }));
-                groups.push(gi);
-            }
-        }
-        (dataset, groups)
-    }
-
-    /// Certify `champ` against the spec at the testbed's 16-cycle cell on one
-    /// data corpus. Returns the certifier's violation count (0 = PASS). The
-    /// capture is sized `phi_max + n_bits*cell + cell` so `strict_tail` catches a
-    /// loop that keeps clocking after the data ends. Expected bits are the 5-bit
-    /// line codes LSB-first (clause 147.4.2 / `dme_cfg`'s pull_threshold 5).
-    fn spec_certify_corpus(champ: &Program, corpus: &[u32]) -> usize {
-        use crate::certify::{certify_dme, channel_levels, DmeParams};
-        let cell = 2 * SPEC_H;
-        let mut expected: Vec<bool> = Vec::new();
-        for &w in corpus {
-            for i in 0..5 {
-                expected.push((w >> i) & 1 == 1);
-            }
-        }
-        let cycles = (SPEC_PHI_MAX + expected.len() * cell + cell) as u64;
-        let sp = RunSpec { inputs: corpus.to_vec(), cycles, ..dme_spec(0) };
-        let wave = run(champ, &sp);
-        let levels = channel_levels(&wave, 0, cycles as usize);
-        let p = DmeParams { half_cell: SPEC_H, phi_max: SPEC_PHI_MAX, strict_tail: true };
-        certify_dme(&levels, &expected, &p).violations.len()
-    }
-
-    /// `PASS` or `FAIL(n)` for a certifier violation count.
-    fn fmt_cert(n: usize) -> String {
-        if n == 0 { "PASS".into() } else { format!("FAIL({n})") }
-    }
 
     /// Run one SPEC gated-ladder phase: build the spec dataset, climb the gated
     /// curriculum ([`crate::search::synthesize_curriculum_gated`] — the SAME
@@ -2487,7 +2373,7 @@ mod tests {
         eprintln!("trace -> {trace_path}");
         let trace = |ev: &crate::search::TraceEvent| {
             use std::io::Write;
-            let line = trace_json(ev);
+            let line = crate::trace::trace_json(ev);
             let mut w = sink.lock().unwrap();
             let _ = writeln!(w, "{line}");
         };
@@ -2495,6 +2381,7 @@ mod tests {
         let (champ, cost, solved) = synthesize_curriculum_gated(
             template, &space, &dataset, &groups, lengths.len(), hp, 32, 4_000_000, 0.0, seed,
             Some(&trace),
+            None, None,
             |frontier, rc, front_err, ok| {
                 let parts: Vec<_> = (0..space.slots as usize)
                     .filter_map(|i| rc.slots[i].as_ref().map(|ins| format!("{i}:{}", brief_insn(ins))))
@@ -2569,6 +2456,7 @@ mod tests {
         let (champ, _cost, solved) = synthesize_curriculum_gated(
             &template, &space, &dataset, &groups, 1, &hp, 32, 4_000_000, 0.0, 0x5EED,
             None,
+            None, None,
             |_, _, _, _| {},
         );
         let parts: Vec<_> = (0..space.slots as usize)
@@ -2593,11 +2481,69 @@ mod tests {
             let (c, _, _) = synthesize_curriculum_gated(
                 &template, &space, &dataset, &groups, 1, &hp, 4, 50_000, 0.0, 0xD37,
                 None,
+                None, None,
                 |_, _, _, _| {},
             );
             c.brief()
         };
         assert_eq!(run_once(), run_once(), "same seed must produce an identical champion");
+    }
+
+    /// RESUME IS BYTE-IDENTICAL: interrupt a spec ladder mid-attempt via the
+    /// stop flag, resume from the snapshot the trace captured at the stop
+    /// checkpoint, and the final champion must equal the uninterrupted run's —
+    /// the whole point of the snapshot design (pre-block state at a checkpoint
+    /// barrier + full RNG state + rung-level pool/lib/minima).
+    #[test]
+    fn dme_spec_ladder_resume_is_byte_identical() {
+        use crate::program::Program;
+        use crate::search::{synthesize_curriculum_gated, CurriculumHp, GatedSnapshot, Genes, Space, TraceEvent};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let space = Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: Genes::default() };
+        let template = Program::empty(dme_cfg());
+        let (dataset, groups) = dme_spec_multilength_dataset(&[2], 32);
+        let hp = CurriculumHp::default();
+
+        // 1. Uninterrupted reference run.
+        let (full, _, _) = synthesize_curriculum_gated(
+            &template, &space, &dataset, &groups, 1, &hp, 4, 50_000, 0.0, 0xD37,
+            None,
+            None, None,
+            |_, _, _, _| {},
+        );
+
+        // 2. Same run, stop flag tripped after a prefix of checkpoint events —
+        // an arbitrary mid-attempt cut, like a Ctrl-C landing mid-anneal.
+        let stop = AtomicBool::new(false);
+        let checkpoints = AtomicUsize::new(0);
+        let snapshots = std::sync::Mutex::new(Vec::<GatedSnapshot>::new());
+        let sink = |ev: &TraceEvent| match ev {
+            TraceEvent::Checkpoint { .. } => {
+                if checkpoints.fetch_add(1, Ordering::SeqCst) + 1 == 250 {
+                    stop.store(true, Ordering::SeqCst);
+                }
+            }
+            TraceEvent::Snapshot { snap } => snapshots.lock().unwrap().push((*snap).clone()),
+            _ => {}
+        };
+        let (_partial, _, _) = synthesize_curriculum_gated(
+            &template, &space, &dataset, &groups, 1, &hp, 4, 50_000, 0.0, 0xD37,
+            Some(&sink),
+            None, Some(&stop),
+            |_, _, _, _| {},
+        );
+        assert!(stop.load(Ordering::SeqCst), "test must actually interrupt the run");
+        let last = snapshots.lock().unwrap().last().cloned().expect("stop checkpoint wrote a snapshot");
+        assert!(last.iter > 0, "the cut must land mid-attempt, not at the start");
+
+        // 3. Resume from the captured snapshot.
+        let (resumed, _, _) = synthesize_curriculum_gated(
+            &template, &space, &dataset, &groups, 1, &hp, 4, 50_000, 0.0, 0xD37,
+            None,
+            Some(last), None,
+            |_, _, _, _| {},
+        );
+        assert_eq!(resumed, full, "resumed champion must be byte-identical to the uninterrupted run's");
     }
 
     /// Classify a spec-ladder champion by INSPECTING its wrap (loop) region, not
@@ -2699,6 +2645,7 @@ mod tests {
             let (champ, _cost, solved) = synthesize_curriculum_gated(
                 &template, &space, &dataset, &groups, lengths.len(), &hp, restarts, iters, 0.0, seed,
                 None,
+                None, None,
                 |frontier, _rc, fe, ok| rungs.lock().unwrap().push((frontier, fe, ok)),
             );
             let rr = rungs.lock().unwrap();
@@ -2892,6 +2839,7 @@ mod tests {
                 let (champ, _cost, _solved) = synthesize_curriculum_gated(
                     &template, &space, &ds_mini, &grp_mini, mini_lengths.len(), hp, mini_restarts, mini_iters, 0.0, 0xACE_5EED ^ sd,
                     None,
+                    None, None,
                     |_, _, _, _| {},
                 );
                 let (_vt, vh) = crate::fixtures::dme_validate(&champ);
@@ -2911,6 +2859,7 @@ mod tests {
         let (champ, cost, solved) = synthesize_curriculum_gated(
             &template, &space, &dataset, &groups, lengths.len(), &best, 32, 4_000_000, 0.0, 0x5EED,
             None,
+            None, None,
             |frontier, rc, front_err, ok| {
                 eprintln!("RUNG L={:<2} {} front_err={front_err:6.1} size={}", lens[frontier], if ok { "SOLVED" } else { "STALL " }, rc.size());
             },

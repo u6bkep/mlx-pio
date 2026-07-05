@@ -23,9 +23,12 @@
 
 ## Operational notes
 
-- Experiments currently run as `#[ignore]` tests:
-  `cargo test --release -- --ignored <name> --nocapture` in `pio_superopt/`.
-  (A proper runner binary is planned — see STATUS.md next actions.)
+- Long runs go through the runner binary: `cargo run --release --bin
+  superopt -- spec-ladder ...` in `pio_superopt/`. It writes a resumable
+  JSONL trace under `runs/`; Ctrl-C snapshots and exits, rerunning the same
+  command resumes byte-identically. Older experiments still run as
+  `#[ignore]` tests: `cargo test --release -- --ignored <name> --nocapture`
+  (migrating them into the runner is planned — see STATUS.md).
 - Long runs must follow the observability directive in
   `docs/architecture.md` (stderr heartbeat + JSONL trace), and should write
   logs/traces under `pio_superopt/runs/`, not the crate root.

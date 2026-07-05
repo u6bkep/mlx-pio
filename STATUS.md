@@ -34,13 +34,21 @@ data, +1 slip/word), so every champion was forced to copy those artifacts.
   branch can be removed.
 - `algorithm_word`, `gene-v2-ir` — stale, review-or-delete.
 
+**Resumable runner landed** (first slice of the restructure): the gated
+ladder snapshots full state (per-restart programs + RNG + rung pool/lib/
+minima) inline into the JSONL trace at ~1/8-rung cadence and on Ctrl-C;
+`superopt spec-ladder` auto-resumes from the last snapshot (header-verified),
+byte-identical to an uninterrupted run (locked by test). Kill/resume the
+long run freely.
+
 ## Next actions
 
-1. Long run: `dme_spec_curriculum_gated` (lengths 2..=14) under the spec
-   oracle — does the ladder climb past L=6 once refill artifacts aren't
-   mandated?
-2. Repo restructure (discussed 2026-07-04): runner binary replacing
-   `#[ignore]` experiment tests; `Problem` trait; engine module split;
-   per-run `runs/<date>-<name>/` artifact dirs. Needs a ticket.
+1. Long run via the runner: `pio_superopt/target/release/superopt
+   spec-ladder` (defaults: lengths 2..=14, 32×4M, densify 1.0, seed 0x5EED)
+   — does the ladder climb past L=6 once refill artifacts aren't mandated?
+   Ctrl-C to reclaim CPU; rerun the same command to resume.
+2. Rest of the repo restructure (discussed 2026-07-04): retire the
+   `#[ignore]` experiment tests into runner subcommands; `Problem` trait;
+   engine module split; per-run artifact dirs. Needs a ticket.
 3. Then per ticket 005: re-test config genes (clkdiv/autopull), 32-slot
    window, multi-SM.

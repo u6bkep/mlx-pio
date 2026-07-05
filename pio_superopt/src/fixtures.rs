@@ -9,6 +9,7 @@
 use crate::gene::{CondKind, Gene, LoopCond, Node};
 use crate::ir::{Insn, MovDst, MovOp, MovSrc, Op, OutDst};
 use crate::program::{Config, PinMap, Program, ShiftCfg, ShiftDir};
+use crate::rng::Rng;
 use crate::run::{run, RunSpec};
 use crate::ir::SideCfg;
 
@@ -178,3 +179,84 @@ pub fn dme_plateau_gene() -> Gene {
         ],
     }
 }
+
+// ===================== SPEC-ORACLE TESTBED (ticket 005) =====================
+//
+// Spec-oracle counterparts of the cycle-exact fixtures above: the decided v1
+// cell shape (16 cycles, data at +8), the pooled multi-length SpecBits
+// dataset, and certifier gating. Promoted from the gene_search test module
+// so the runner binary drives the same testbed the experiments did.
+
+/// Pack `n_bits` (bit i = the i-th emitted line bit, LSB-first) into 5-bit
+/// DME words for the TX FIFO.
+pub fn seq_words(bits: u64, n_bits: usize) -> Vec<u32> {
+    let words = (n_bits + 4) / 5;
+    (0..words.max(1)).map(|w| ((bits >> (5 * w)) & 0x1F) as u32).collect()
+}
+
+/// Half-cell for the spec testbed (`DME_H` analogue): nominal cell = `2*8`
+/// cycles, mid-bit data transition at `+8`.
+pub const SPEC_H: usize = 8;
+/// Startup-phase bound: the first boundary edge may land anywhere in
+/// `[1, SPEC_PHI_MAX]`. Generous, so the search keeps phase freedom.
+pub const SPEC_PHI_MAX: usize = 32;
+
+/// Build a pooled multi-length SPEC curriculum dataset: exhaustive length-L
+/// bit sequences (vary the first `len` bits) while `2^len <= cap`, else `cap`
+/// sampled — the SAME enumeration and RNG discipline as
+/// [`dme_multilength_dataset`] (seed `0xDA7A_5EED ^ len`), so determinism is
+/// identical. Rows carry the expected BITS directly (not a golden waveform):
+/// `Target::SpecBits { bits, h = SPEC_H, phi_max = SPEC_PHI_MAX }`. The
+/// RunSpec packs those bits LSB-first into 5-bit words exactly like
+/// `seq_words` (config `dme_cfg`: pull_threshold 5, autopull off, clkdiv
+/// pinned). Capture window = `phi_max` slack + `len * cell` frame + a
+/// half-cell tail, so a compliant frame at any admissible phase fits and a
+/// runaway loop's post-frame toggles show up as spurious edges.
+pub fn dme_spec_multilength_dataset(lengths: &[usize], cap: u64) -> (Vec<(RunSpec, crate::search::Target)>, Vec<usize>) {
+    use crate::search::Target;
+    let cell = 2 * SPEC_H;
+    let mut dataset: Vec<(RunSpec, Target)> = Vec::new();
+    let mut groups: Vec<usize> = Vec::new();
+    for (gi, &len) in lengths.iter().enumerate() {
+        let win = (SPEC_PHI_MAX + len * cell + SPEC_H) as u64;
+        let exhaustive = (1u64 << len) <= cap;
+        let n = if exhaustive { 1u64 << len } else { cap };
+        let mut drng = Rng::new(0xDA7A_5EED ^ len as u64);
+        for s in 0..n {
+            let bitval = if exhaustive { s } else { drng.below(1u32 << len) as u64 };
+            let bits: Vec<bool> = (0..len).map(|i| (bitval >> i) & 1 == 1).collect();
+            let sp = RunSpec { inputs: seq_words(bitval, len), cycles: win, ..dme_spec(0) };
+            dataset.push((sp, Target::SpecBits { bits, h: SPEC_H, phi_max: SPEC_PHI_MAX }));
+            groups.push(gi);
+        }
+    }
+    (dataset, groups)
+}
+
+/// Certify `champ` against the spec at the testbed's 16-cycle cell on one
+/// data corpus. Returns the certifier's violation count (0 = PASS). The
+/// capture is sized `phi_max + n_bits*cell + cell` so `strict_tail` catches a
+/// loop that keeps clocking after the data ends. Expected bits are the 5-bit
+/// line codes LSB-first (clause 147.4.2 / `dme_cfg`'s pull_threshold 5).
+pub fn spec_certify_corpus(champ: &Program, corpus: &[u32]) -> usize {
+    use crate::certify::{certify_dme, channel_levels, DmeParams};
+    let cell = 2 * SPEC_H;
+    let mut expected: Vec<bool> = Vec::new();
+    for &w in corpus {
+        for i in 0..5 {
+            expected.push((w >> i) & 1 == 1);
+        }
+    }
+    let cycles = (SPEC_PHI_MAX + expected.len() * cell + cell) as u64;
+    let sp = RunSpec { inputs: corpus.to_vec(), cycles, ..dme_spec(0) };
+    let wave = run(champ, &sp);
+    let levels = channel_levels(&wave, 0, cycles as usize);
+    let p = DmeParams { half_cell: SPEC_H, phi_max: SPEC_PHI_MAX, strict_tail: true };
+    certify_dme(&levels, &expected, &p).violations.len()
+}
+
+/// `PASS` or `FAIL(n)` for a certifier violation count.
+pub fn fmt_cert(n: usize) -> String {
+    if n == 0 { "PASS".into() } else { format!("FAIL({n})") }
+}
+
