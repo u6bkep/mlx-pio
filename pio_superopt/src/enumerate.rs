@@ -114,6 +114,15 @@ pub fn alphabet(len: usize) -> Vec<Op> {
             ops.push(Op::Set { dst, data });
         }
     }
+    // Canonical NOP (identity mov — what empty slots assemble to). A real
+    // instruction-memory word whose only effect is +1 cycle ON ITS PATH: as
+    // a branch-target landing pad it pads one branch outcome asymmetrically,
+    // which no delay field can (delays apply to taken AND fall-through).
+    // The 6-word compression champion's slot-5 trick (2026-07-05) — its
+    // omission was an exhaustiveness hole in alphabet v1. Appended LAST so
+    // v1 shard prefixes keep their meaning, but suffix spaces change: any
+    // alphabet edit still requires a fresh --out dir.
+    ops.push(Op::Mov { dst: MovDst::Y, op: MovOp::None, src: MovSrc::Y });
     ops
 }
 
@@ -369,8 +378,8 @@ mod tests {
     /// resumable enumeration.
     #[test]
     fn alphabet_size_is_pinned() {
-        assert_eq!(alphabet(4).len(), 160);
-        assert_eq!(alphabet(5).len(), 168);
-        assert_eq!(alphabet(6).len(), 176);
+        assert_eq!(alphabet(4).len(), 161);
+        assert_eq!(alphabet(5).len(), 169);
+        assert_eq!(alphabet(6).len(), 177);
     }
 }
