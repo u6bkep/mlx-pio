@@ -4,6 +4,75 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-05 (evening) — strategy pivot: compression + enumeration; certified 6-word encoder; len<=4 proven impossible
+
+Morning queue executed: runner-restructure merged (090d423), eval cache
+landed (6f0ce2f: per-restart direct-mapped 2^16, exact keys incl config,
+per-group raw sums, hit==miss bit-identical; 29-30% hits, 1.2x; NOTE:
+per-group summation changed float order — pre-6f0ce2f traces unresumable).
+
+**Autopull experiment (d777208, spec-ap-ladder 0x5EED 32x4M): SIXTH L=6
+stall.** RunSpec.autopull_pad applies FIFO padding per-candidate. The gene
+WON (champion autopull-on with NO pull; 56/64 minima) and L=6 still stalled
+all attempts at fe=8 (vs 11-12 plain spec, 63-80 cycle-exact); solved 4/13.
+Refill-spine hypothesis dead: the wall is the word seam, not the idiom.
+
+**Pivot (user-agreed): stop synthesizing, compress + enumerate.**
+- Compression (1ba9ff8): dme_spec_ref() hand-written spec-shaped autopull
+  seed (8 insns, certifies clean; dme_ref CANNOT certify — 14cy cell,
+  data@+6, +1/word slip). synthesize_compress: cycles of reheat-and-cool
+  from the champion, wandering cost W*err+size, champion moves only through
+  the certifier (train; held-out reported). Reuses GatedSnapshot protocol;
+  resume locked by test. CERTIFIER FIX: autopull_pad removed from cert
+  corpora (pad = data an autopull champ transmits -> guaranteed strict-tail
+  FAILs; yesterday's ap gates were inflated: re-cert FAIL(1)/FAIL(3)).
+- Enumeration (e674016): exhaustive len-N bodies, alphabet jmp/out/mov/set
+  (+NOP in v2), structure/timing decomposition — no alphabet op stalls
+  mid-frame so the edge SEQUENCE is delay-independent: screen structures
+  once at delay 0 (exact, no false negatives; zero-delay seed passes,
+  pinned), brute-force delay tuples (sum<=15) only for pattern survivors,
+  then full dataset + certifier. Sharded (first-slot op), file-per-shard
+  manifest, --shard-mod/rem fleet split.
+
+**Results:**
+- compress run 1: certified 6 at cycle 47 — pin-as-state (mov Pins,!Pins,
+  no Y reg), interior NOP as asymmetric branch pad (delays can't pad one
+  branch outcome). That NOP trick exposed an enumeration alphabet hole ->
+  alphabet v2 (+canonical NOP, 4688e18).
+- **METRIC GAMING (cycle 49): "size 5" champion used wrap 0..5 + jmp->5
+  with slot 5 EMPTY** — executes a real NOP at address 5, 6 words on
+  hardware, reported 5; cost steered INTO the exploit. Fix (6b41592):
+  size() = footprint (occupied ∪ wrap bounds ∪ jmp targets), locked by
+  test. Poisoned run stopped (trace kept); compress2 restarted fresh and
+  independently re-found an equivalent certified 6 (cycle 35, jmp NotY
+  variant) — the 6-word design replicates across metric versions.
+- **len-4 v1: 655M structures, 0 survivors; len-4 v2 (NOP alphabet): 672M
+  structures, 12.3B timing evals, 0 survivors** => no 4-word encoder,
+  unconditional over the v2 scope. Minimum is 5 or 6; len-5 decides.
+
+**Fleet infra:** shard coordinator built by subagent in worktree, reviewed
+(one fix: write shard file BEFORE marking done), merged (3d31ab1):
+superopt serve/work, lease TTL requeue, 409 contract check, all state =
+shard files. Graceful two-stage worker shutdown (d5f9c3d): drain ->
+abort+release (no TTL stranding); ctrlc termination feature (SIGTERM ==
+Ctrl-C everywhere). docs/fleet.md covers static split, coordinator mode,
+compression migration. Live-smoke-tested with real signals.
+
+**Corrections:** side-set emulator bug was already FIXED (368e499,
+2026-06-21) — earlier session docs cited the stale memory headline;
+enumeration excludes side-set for COST (~3^len), not fidelity (f7b5ce8).
+
+**Firmware survey** (Raven-Firmware dme_pio.rs): TX block 31/32 = TX_A 4
+(IRQ-toggle slave) + TX_B 17 (encoder, side-set DE, silence codepoint) +
+timestamp 10; RX block 32/32 (unrolled 6-way jmp-pin ladder = 11 insns of
+position-encoded cycle counting). Interfaces mostly SOFT (IRQ handshake,
+sentinels, exec preloads) — per-SM compression with observational-
+equivalence oracles (original program = golden). Flagship: RX. Harness
+has multi-SM (from_shared) + per-cycle set_pin; RunSpec wiring needed.
+
+Paused for user-driven runs: compress2 (snapshot at ~cycle 50, champ 6)
+and the len-5 fleet sweep. Commits: 090d423..f7b5ce8 (13).
+
 ## 2026-07-05 — resumable runner, restructure, eval optimizations; L=6 wall is oracle-independent
 
 - **Densify verdict + merge** (late 07-04): sweep table filled — champion
