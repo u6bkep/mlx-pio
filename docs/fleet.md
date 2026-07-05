@@ -103,12 +103,27 @@ Properties:
 
 - **Hosts join and leave freely.** Each worker thread loops
   lease -> run -> post result; a new host just starts pulling from wherever
-  the frontier is. Killing a worker abandons its in-flight leases; after
-  `--lease-secs` the server hands those shards to someone else. Size the
-  TTL above the slowest expected shard (len 5 shards are ~4–5 core-hours,
-  so the 12h default is comfortable; a too-short TTL wastes work but never
-  loses or corrupts results — a late finisher's result is still accepted if
-  the shard isn't done yet, and discarded idempotently if it is).
+  the frontier is. Hard-killing a worker (SIGKILL, power loss) abandons its
+  in-flight leases; after `--lease-secs` the server hands those shards to
+  someone else. Size the TTL above the slowest expected shard (len 5 shards
+  are ~4–5 core-hours, so the 12h default is comfortable; a too-short TTL
+  wastes work but never loses or corrupts results — a late finisher's
+  result is still accepted if the shard isn't done yet, and discarded
+  idempotently if it is).
+- **Graceful shutdown** (SIGINT/SIGTERM/SIGHUP — Ctrl-C or `kill` or a
+  systemd stop), for temporarily reclaiming a box's CPU:
+  - **1st signal — drain:** no new leases; in-flight shards finish and
+    upload, then the worker exits 0. Zero work lost, but you wait out the
+    current shards (up to a shard's runtime).
+  - **2nd signal — abort:** in-flight shards stop within ~20 ms and their
+    leases are RELEASED back to the server, so they are immediately
+    leasable elsewhere — no shard sits blocked for the TTL. Only the
+    aborted shards' partial work is lost.
+  - **3rd signal:** hard exit (leases left to the TTL).
+  Restarting later is just running the same `work` command again. The
+  local no-server `enumerate` driver has the same behavior minus the
+  release step (1st signal aborts in-flight, completed shard files are
+  durable, rerun resumes).
 - **All durable state is the shard files** in `--out`, same format and
   names as the no-server driver. Ctrl-C the server any time; on restart it
   rescans the dir and resumes. Workers outwait a server restart (they retry

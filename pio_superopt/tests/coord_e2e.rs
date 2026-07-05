@@ -82,7 +82,7 @@ fn coordinator_end_to_end() {
         let shard = v["shard"].as_u64().unwrap() as usize;
         leased.push(shard);
         let body = if shard < 2 {
-            let res = run_shard(shard, len, &ops);
+            let res = run_shard(shard, len, &ops, None).expect("not aborted");
             assert!(res.structures > 0, "real shard ran zero structures");
             let s = serde_json::to_string_pretty(&res).unwrap();
             if shard == 0 {

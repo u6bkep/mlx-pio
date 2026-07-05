@@ -80,6 +80,15 @@ impl Coordinator {
         self.done.insert(shard)
     }
 
+    /// Voluntarily give a leased shard back (graceful worker shutdown):
+    /// clears the lease so the next `lease()` can hand it out immediately
+    /// instead of waiting out the TTL. No-op if done or not leased.
+    pub fn release(&mut self, shard: usize) {
+        if !self.done.contains(&shard) {
+            self.leases.remove(&shard);
+        }
+    }
+
     /// Is this shard already done? (Duplicate-result check — kept separate
     /// from [`complete`] so the HTTP layer can write the shard file before
     /// committing the done-mark.)
@@ -257,6 +266,26 @@ fn handle(mut req: tiny_http::Request, coord: &mut Coordinator, cfg: &ServeCfg, 
             );
             respond_json(req, 200, "{\"status\":\"ok\"}".into());
         }
+        (Method::Post, "/release") => {
+            let shard: usize = match query
+                .as_deref()
+                .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("shard=")))
+                .and_then(|s| s.parse().ok())
+            {
+                Some(s) => s,
+                None => {
+                    respond_json(req, 400, "{\"error\":\"missing/bad ?shard=\"}".into());
+                    return;
+                }
+            };
+            coord.release(shard);
+            let (done, leased, remaining) = coord.counts(now);
+            eprintln!(
+                "[shard {shard:04}] released ({done} done, {leased} leased, {remaining} remaining, {:.0}s elapsed)",
+                t0.elapsed().as_secs_f64()
+            );
+            respond_json(req, 200, "{\"status\":\"released\"}".into());
+        }
         _ => respond_json(req, 404, "{\"error\":\"no such endpoint\"}".into()),
     }
 }
@@ -266,6 +295,22 @@ mod tests {
     use super::*;
 
     const TTL: Duration = Duration::from_secs(100);
+
+    #[test]
+    fn release_requeues_immediately() {
+        let mut c = Coordinator::new(3, TTL);
+        let now = Instant::now();
+        assert_eq!(c.lease(now), Some(0));
+        assert_eq!(c.lease(now), Some(1));
+        c.release(0);
+        // 0 is leasable again right away, well inside the TTL.
+        assert_eq!(c.lease(now), Some(0));
+        // Releasing a done shard must not resurrect it.
+        c.complete(1);
+        c.release(1);
+        assert_eq!(c.lease(now), Some(2));
+        assert_eq!(c.lease(now), None);
+    }
 
     #[test]
     fn leases_in_ascending_order() {

@@ -525,17 +525,34 @@ fn enumerate_cmd(args: &[String]) {
     );
     eprintln!("out -> {}  (one JSON per shard; rerun to resume; Ctrl-C safe between shards)", dir.display());
 
+    // Graceful shutdown: first signal aborts in-flight shards (their work is
+    // discarded; completed shard files are durable), second exits hard.
+    static ESTOP: AtomicBool = AtomicBool::new(false);
+    ctrlc::set_handler(|| {
+        if ESTOP.swap(true, Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+        eprintln!("\nsignal — aborting in-flight shards (completed shards are saved; rerun to resume)...");
+    })
+    .expect("install signal handler");
+
     let queue = std::sync::Mutex::new(todo.into_iter().collect::<std::collections::VecDeque<usize>>());
     let done = std::sync::atomic::AtomicUsize::new(0);
     let t0 = std::time::Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..threads.max(1) {
             scope.spawn(|| loop {
+                if ESTOP.load(Ordering::SeqCst) {
+                    return;
+                }
                 let shard = match queue.lock().unwrap().pop_front() {
                     Some(s) => s,
                     None => return,
                 };
-                let res = run_shard(shard, len, &ops);
+                let res = match run_shard(shard, len, &ops, Some(&ESTOP)) {
+                    Some(r) => r,
+                    None => return, // aborted mid-shard — nothing written
+                };
                 let path = dir.join(format!("shard-{shard:04}.json"));
                 let tmp = dir.join(format!("shard-{shard:04}.json.tmp"));
                 std::fs::write(&tmp, serde_json::to_string_pretty(&res).unwrap()).expect("write shard");
@@ -699,12 +716,36 @@ fn work_cmd(args: &[String]) {
         v["done"], v["leased"], v["remaining"]
     );
 
+    // GRACEFUL SHUTDOWN (SIGINT/SIGTERM/SIGHUP):
+    //   1st signal -> DRAIN: stop leasing; in-flight shards finish and post.
+    //   2nd signal -> ABORT: in-flight shards stop (~20ms), their leases are
+    //                 RELEASED back to the server so no shard sits blocked
+    //                 for the lease TTL.
+    //   3rd signal -> hard exit.
+    static DRAIN: AtomicBool = AtomicBool::new(false);
+    static ABORT: AtomicBool = AtomicBool::new(false);
+    ctrlc::set_handler(|| {
+        if ABORT.load(Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+        if DRAIN.swap(true, Ordering::SeqCst) {
+            ABORT.store(true, Ordering::SeqCst);
+            eprintln!("\nsignal #2 — aborting in-flight shards and releasing their leases...");
+        } else {
+            eprintln!("\nsignal — draining: no new leases; in-flight shards will finish and upload (signal again to abort them)");
+        }
+    })
+    .expect("install signal handler");
+
     let lease_body = format!("{{\"len\":{len},\"alphabet\":{}}}", ops.len());
     let done_count = std::sync::atomic::AtomicUsize::new(0);
     let t0 = std::time::Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..threads.max(1) {
             scope.spawn(|| loop {
+                if DRAIN.load(Ordering::SeqCst) {
+                    return;
+                }
                 let resp = match retry_transport("POST /lease", || {
                     ureq::post(&format!("{base}/lease")).send_string(&lease_body)
                 }) {
@@ -723,7 +764,17 @@ fn work_cmd(args: &[String]) {
                     serde_json::from_str(&resp.into_string().expect("lease body"))
                         .expect("lease JSON");
                 let shard = v["shard"].as_u64().expect("lease.shard") as usize;
-                let res = run_shard(shard, len, &ops);
+                let res = match run_shard(shard, len, &ops, Some(&ABORT)) {
+                    Some(r) => r,
+                    None => {
+                        // Aborted: hand the lease back so the shard is
+                        // immediately leasable elsewhere (best-effort — if
+                        // the server is unreachable the TTL still covers it).
+                        let _ = ureq::post(&format!("{base}/release?shard={shard}")).send_string("");
+                        eprintln!("[shard {shard:04}] aborted, lease released");
+                        return;
+                    }
+                };
                 let body = serde_json::to_string_pretty(&res).unwrap();
                 if let Err(code) = retry_transport(&format!("POST /done?shard={shard}"), || {
                     ureq::post(&format!("{base}/done?shard={shard}")).send_string(&body)

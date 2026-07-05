@@ -12,7 +12,7 @@ pio_harness = { path = "../pio_harness" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Ctrl-C -> stop flag -> snapshot-and-exit in the runner binary.
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 # Shard-coordination server/worker (`superopt serve` / `superopt work`):
 # tiny_http serves the lease protocol, ureq is the worker-side client.
 # JSON bodies go through serde_json strings — no json features needed.

@@ -290,7 +290,10 @@ fn timing_stage(
 }
 
 /// Run one shard: all structures whose FIRST slot is `alphabet[shard]`.
-pub fn run_shard(shard: usize, len: usize, ops: &[Op]) -> ShardResult {
+/// `stop` is a cooperative abort (checked once per structure, ~20ms max
+/// latency): on trip the partial work is DISCARDED and `None` returned —
+/// shard results are all-or-nothing, the ledger has no partial entries.
+pub fn run_shard(shard: usize, len: usize, ops: &[Op], stop: Option<&std::sync::atomic::AtomicBool>) -> Option<ShardResult> {
     let probes = pattern_probes();
     let quick_lengths: Vec<usize> = vec![2, 3, 4];
     let (quick, _) = dme_spec_multilength_dataset(&quick_lengths, 32);
@@ -311,6 +314,11 @@ pub fn run_shard(shard: usize, len: usize, ops: &[Op]) -> ShardResult {
     let mut idx = vec![0usize; len - 1];
     let mut body: Vec<Op> = Vec::with_capacity(len);
     loop {
+        if let Some(f) = stop {
+            if f.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+        }
         body.clear();
         body.push(ops[shard].clone());
         for &j in &idx {
@@ -329,7 +337,7 @@ pub fn run_shard(shard: usize, len: usize, ops: &[Op]) -> ShardResult {
         let mut i = 0;
         loop {
             if i == idx.len() {
-                return res;
+                return Some(res);
             }
             idx[i] += 1;
             if idx[i] < ops.len() {
