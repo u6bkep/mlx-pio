@@ -19,9 +19,12 @@
 //! external events that never fire single-SM), `pull`/`push` (autopull covers
 //! refill; blocking-pull semantics add timing coupling), `in` (no RX path in
 //! a TX encoder), `mov`/`out` to `Exec`/`Pc` (self-modifying / computed jumps
-//! — a later tier), `MovOp::BitReverse`, side-set (emulator opt-side-set
-//! overlay bug — see memory `optsideset-overlay-bug`), configs other than
-//! the seed's. "Exhaustive" claims are relative to THIS alphabet.
+//! — a later tier), `MovOp::BitReverse`, side-set (a COST exclusion, not
+//! fidelity — the emulator's opt-side-set bug was fixed in 368e499; but
+//! side-set multiplies the per-slot alphabet ~3x, i.e. ~3^len ~ 243x at
+//! len 5 — side-set variants need a scaffolded tier, or len <= 4), configs
+//! other than the seed's. "Exhaustive" claims are relative to THIS
+//! alphabet.
 //!
 //! ## Why delays factor out (the key cost collapse)
 //!
