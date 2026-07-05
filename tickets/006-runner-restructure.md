@@ -1,4 +1,4 @@
-status: in-progress
+status: mostly-done (engine-split dropped by agreement; sweep/meta stay as tests)
 priority: high
 
 # Runner / problem / engine restructure
@@ -11,23 +11,23 @@ resumable-runner slice that landed as commit c97055d):
 
 ## Target shape
 
-1. **Runner binary** (`src/bin/superopt.rs`, exists): all long-running work
-   moves behind subcommands. Landed: `spec-ladder` (resumable, Ctrl-C-safe).
-   Planned: `wave-ladder` (cycle-exact gated ladder, for spec-vs-wave A/Bs),
-   `diagnose` (edge classification of a champion vs golden — from
-   `dme_diagnose`), `sweep` variants as needed.
-2. **`Problem` trait**: template/space, dataset builder, `RunSpec`,
-   curriculum lengths, certifier hook; `problems/{dme_spec,dme_wave,uart,
-   spi}.rs`. `fixtures.rs` already holds most of the DME material.
-3. **Engine module split**: `search.rs`/`gene_search.rs` split into
-   `engines/{anneal,breed,gated,meta}.rs` + shared `moves`/`mining` core.
-   Superseded engines (flat_pt, rainbow, novelty, curriculum ramp/stage —
-   verdicts in docs/journal.md) are DELETED, not moved; git history keeps
-   them.
-4. **Run artifacts**: every runner invocation already writes a resumable
-   JSONL trace; add a `result.json` summary (per-rung verdicts, champion,
-   certifier output, git rev) so runs are self-describing. Loose logs at
-   crate root are gone (now under `runs/`).
+1. **Runner binary** (`src/bin/superopt.rs`): DONE — `spec-ladder`,
+   `wave-ladder` (both resumable over the shared Problem-generic
+   run_ladder), `diagnose` (last-snapshot inspection: position, champion
+   class, gates; works mid-run). One-shot experiments (densify sweep,
+   schedule meta-tune) deliberately stay as #[ignore] tests — they are
+   experiments with recorded verdicts, not production runs.
+2. **`Problem` trait**: DONE for the ladder problems (`problems.rs`:
+   DmeSpec, DmeWave; template/space/dataset/default-hp/gates). UART/SPI use
+   different engines and were left as test-local fixtures — abstract them
+   only when an engine actually runs them again.
+3. **Engine module split**: DROPPED (agreed 2026-07-05). Phase-1 deletion
+   of the superseded engines (flat_pt, rainbow, novelty, ramp/stage,
+   portfolio, meta_anneal) shrank search.rs 3347->2223 and gene_search.rs
+   3009->1838; everything left is live, so a further split is churn.
+4. **Run artifacts**: DONE — resumable JSONL trace + `<trace>.result.json`
+   on completion (run identity, champion words/class, gate verdicts, git
+   rev).
 
 ## Ignored-test triage (the 44)
 

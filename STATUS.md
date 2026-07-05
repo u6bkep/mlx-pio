@@ -47,8 +47,11 @@ long run freely.
    spec-ladder` (defaults: lengths 2..=14, 32×4M, densify 1.0, seed 0x5EED)
    — does the ladder climb past L=6 once refill artifacts aren't mandated?
    Ctrl-C to reclaim CPU; rerun the same command to resume.
-2. Rest of the repo restructure (discussed 2026-07-04): retire the
-   `#[ignore]` experiment tests into runner subcommands; `Problem` trait;
-   engine module split; per-run artifact dirs. Needs a ticket.
+2. Restructure (ticket 006): DONE on branch `runner-restructure`
+   (worktree ../pio_optimization-restructure) — 34 concluded experiments +
+   superseded engines deleted (-3.1k lines), Problem trait (DmeSpec/
+   DmeWave), wave-ladder + diagnose subcommands, result.json. spec-ladder
+   header verified byte-identical to the live run's (resume-safe). Merge
+   to master when convenient.
 3. Then per ticket 005: re-test config genes (clkdiv/autopull), 32-slot
    window, multi-SM.
