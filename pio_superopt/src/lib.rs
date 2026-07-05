@@ -27,6 +27,7 @@ pub mod program;
 pub mod rng;
 pub mod run;
 pub mod search;
+pub mod spec_cost;
 
 pub use cost::{hamming, hamming_masked, hamming_tolerant, score, score_masked, Score};
 pub use decode::{decode_insn, DecodeError};
