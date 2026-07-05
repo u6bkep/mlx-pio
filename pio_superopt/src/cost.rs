@@ -302,6 +302,7 @@ mod tests {
             output_pins: vec![DATA, CLK],
             capture_pins: vec![DATA, CLK], // bit0 = data, bit1 = clock
             cycles: 24,
+            autopull_pad: 0,
         }
     }
 

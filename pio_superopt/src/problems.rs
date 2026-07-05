@@ -45,8 +45,43 @@ pub trait Problem {
 pub fn by_id(id: &str) -> Option<Box<dyn Problem>> {
     match id {
         "dme-spec" => Some(Box::new(DmeSpec)),
+        "dme-spec-ap" => Some(Box::new(DmeSpecAutopull)),
         "dme-wave" => Some(Box::new(DmeWave)),
         _ => None,
+    }
+}
+
+/// [`DmeSpec`] with **autopull as a search gene** (ticket 005 step 4) — the
+/// lever against the oracle-independent L=6 wall: the spec oracle doesn't
+/// mandate `dme_ref`'s +1-cycle-per-word slip, so an autopull-on candidate can
+/// drop the OSR-refill conjunction (`jmp NotOsrEmpty` + second `pull`) whose
+/// basin the ladder can't finish wiring. The shared spec dataset/certifier
+/// carry `autopull_pad = 2`, applied per-candidate (autopull-off candidates
+/// see the same rows as `DmeSpec` byte-for-byte). Separate id so its traces
+/// can never cross-resume with plain `dme-spec` runs.
+pub struct DmeSpecAutopull;
+
+impl Problem for DmeSpecAutopull {
+    fn id(&self) -> &'static str {
+        "dme-spec-ap"
+    }
+    fn describe(&self) -> String {
+        format!("{} + autopull gene (pad 2)", DmeSpec.describe())
+    }
+    fn template(&self) -> Program {
+        DmeSpec.template()
+    }
+    fn space(&self) -> Space {
+        Space { genes: Genes { autopull: true, ..Genes::default() }, ..DmeSpec.space() }
+    }
+    fn default_hp(&self) -> CurriculumHp {
+        DmeSpec.default_hp()
+    }
+    fn dataset(&self, lengths: &[usize]) -> (Vec<(RunSpec, Target)>, Vec<usize>) {
+        DmeSpec.dataset(lengths)
+    }
+    fn gates(&self, champ: &Program) -> Vec<Gate> {
+        DmeSpec.gates(champ)
     }
 }
 

@@ -89,6 +89,7 @@ pub fn dme_spec(cycles: u64) -> RunSpec {
         output_pins: vec![TX],
         capture_pins: vec![TX],
         cycles,
+        autopull_pad: 0,
     }
 }
 
@@ -226,7 +227,10 @@ pub fn dme_spec_multilength_dataset(lengths: &[usize], cap: u64) -> (Vec<(RunSpe
         for s in 0..n {
             let bitval = if exhaustive { s } else { drng.below(1u32 << len) as u64 };
             let bits: Vec<bool> = (0..len).map(|i| (bitval >> i) & 1 == 1).collect();
-            let sp = RunSpec { inputs: seq_words(bitval, len), cycles: win, ..dme_spec(0) };
+            // autopull_pad keeps autopull-ON candidates' prefetch fed at word
+            // boundaries; autopull-off programs never see the pad (per-config,
+            // see `RunSpec::autopull_pad`).
+            let sp = RunSpec { inputs: seq_words(bitval, len), cycles: win, autopull_pad: 2, ..dme_spec(0) };
             dataset.push((sp, Target::SpecBits { bits, h: SPEC_H, phi_max: SPEC_PHI_MAX }));
             groups.push(gi);
         }
@@ -249,7 +253,7 @@ pub fn spec_certify_corpus(champ: &Program, corpus: &[u32]) -> usize {
         }
     }
     let cycles = (SPEC_PHI_MAX + expected.len() * cell + cell) as u64;
-    let sp = RunSpec { inputs: corpus.to_vec(), cycles, ..dme_spec(0) };
+    let sp = RunSpec { inputs: corpus.to_vec(), cycles, autopull_pad: 2, ..dme_spec(0) };
     let wave = run(champ, &sp);
     let levels = channel_levels(&wave, 0, cycles as usize);
     let p = DmeParams { half_cell: SPEC_H, phi_max: SPEC_PHI_MAX, strict_tail: true };

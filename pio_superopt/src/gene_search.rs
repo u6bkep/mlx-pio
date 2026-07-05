@@ -1000,6 +1000,7 @@ mod tests {
             output_pins: vec![TX],
             capture_pins: vec![TX],
             cycles: 4 * cycles_per_byte,
+            autopull_pad: 0,
         }
     }
 

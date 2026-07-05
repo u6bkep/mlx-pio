@@ -2,6 +2,7 @@
 //! trace inspection.
 //!
 //!     superopt spec-ladder [opts]   # DME under the spec oracle (ticket 005)
+//!     superopt spec-ap-ladder [opts]# spec oracle + autopull gene (ticket 005 step 4)
 //!     superopt wave-ladder [opts]   # DME under the cycle-exact oracle
 //!     superopt diagnose --trace PATH
 //!
@@ -24,7 +25,7 @@
 //! (TOGGLER/CONJUNCTION/OTHER), and the problem's gates on it.
 
 use pio_superopt::fixtures::spec_classify;
-use pio_superopt::problems::{by_id, DmeSpec, DmeWave, Problem};
+use pio_superopt::problems::{by_id, DmeSpec, DmeSpecAutopull, DmeWave, Problem};
 use pio_superopt::search::{synthesize_curriculum_gated, TraceEvent};
 use pio_superopt::trace::{header_json, scan_for_resume, trace_json, RunHeader};
 use pio_superopt::Program;
@@ -33,7 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: superopt <spec-ladder|wave-ladder> [--seed HEX] [--lengths A..B] \
+        "usage: superopt <spec-ladder|spec-ap-ladder|wave-ladder> [--seed HEX] [--lengths A..B] \
          [--restarts N] [--iters N] [--densify F] [--trace PATH] [--fresh]\n\
        superopt diagnose --trace PATH\n\
          \n\
@@ -93,6 +94,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("spec-ladder") => run_ladder(&DmeSpec, "spec-ladder", parse_ladder_opts(&args[1..])),
+        Some("spec-ap-ladder") => run_ladder(&DmeSpecAutopull, "spec-ap-ladder", parse_ladder_opts(&args[1..])),
         Some("wave-ladder") => run_ladder(&DmeWave, "wave-ladder", parse_ladder_opts(&args[1..])),
         Some("diagnose") => diagnose(&args[1..]),
         _ => usage(),

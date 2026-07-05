@@ -28,6 +28,27 @@ pub struct RunSpec {
     pub capture_pins: Vec<u8>,
     /// Number of PIO cycles to run/capture.
     pub cycles: u64,
+    /// Spare `0` symbols appended to `inputs` at run time IFF the program's
+    /// config has autopull ON. Autopull's prefetch fetches the next word as
+    /// the threshold-th bit shifts out and starves at a word boundary without
+    /// spare symbols — including the LAST word of any stream — while the same
+    /// padding poisons autopull-off searches (see `dme_multilength_dataset`).
+    /// Keying the pad on the candidate's own config resolves the conflict
+    /// per-candidate; autopull-off programs see `inputs` verbatim.
+    pub autopull_pad: u32,
+}
+
+/// Apply [`RunSpec::autopull_pad`] for `program` (see its doc). Every capture
+/// entry point ([`run`], [`run_streaming`], [`run_full`]) goes through this,
+/// so their pinned equivalences hold for autopull programs too.
+fn padded<'a>(program: &Program, spec: &'a RunSpec) -> std::borrow::Cow<'a, RunSpec> {
+    if program.config.shift.autopull && spec.autopull_pad > 0 {
+        let mut sp = spec.clone();
+        sp.inputs.extend(std::iter::repeat(0).take(sp.autopull_pad as usize));
+        std::borrow::Cow::Owned(sp)
+    } else {
+        std::borrow::Cow::Borrowed(spec)
+    }
 }
 
 fn hdir(d: ShiftDir) -> HDir {
@@ -52,6 +73,8 @@ const TX_FIFO_DEPTH: usize = 4;
 /// infinite FIFO. Identical output to the fast path on any spec that fits
 /// (pinned by `run::tests::stream_matches_fast`).
 pub fn run(program: &Program, spec: &RunSpec) -> Vec<u32> {
+    let spec = padded(program, spec);
+    let spec = &*spec;
     RUNNER.with(|cell| {
         let mut slot = cell.borrow_mut();
         // Rebuild only if the target block/SM changed (it doesn't, mid-search).
@@ -72,6 +95,8 @@ pub fn run(program: &Program, spec: &RunSpec) -> Vec<u32> {
 /// length — the explicit entry point [`run`] auto-selects for long specs. Public
 /// so the equivalence test can compare it to the fast path on a short spec.
 pub fn run_streaming(program: &Program, spec: &RunSpec) -> Vec<u32> {
+    let spec = padded(program, spec);
+    let spec = &*spec;
     RUNNER.with(|cell| {
         let mut slot = cell.borrow_mut();
         if !matches!(&*slot, Some((b, s, _)) if *b == spec.block && *s == spec.sm) {
@@ -114,6 +139,8 @@ fn run_on(pio: &mut Pio, program: &Program, spec: &RunSpec) -> Vec<u32> {
 /// path is validated against (`fast_step_matches_full`). Not used in the search
 /// hot loop.
 pub fn run_full(program: &Program, spec: &RunSpec) -> Vec<u32> {
+    let spec = padded(program, spec);
+    let spec = &*spec;
     RUNNER.with(|cell| {
         let mut slot = cell.borrow_mut();
         if !matches!(&*slot, Some((b, s, _)) if *b == spec.block && *s == spec.sm) {

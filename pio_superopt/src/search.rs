@@ -2112,6 +2112,7 @@ mod tests {
             output_pins: vec![DATA, CLK],
             capture_pins: vec![DATA, CLK],
             cycles: 16,
+            autopull_pad: 0,
         }
     }
 
@@ -2318,6 +2319,7 @@ mod tests {
             output_pins: vec![TX],
             capture_pins: vec![TX],
             cycles: 4 * 8 * 8, // 4 bytes * 8 bits * 8 cyc/bit
+            autopull_pad: 0,
         };
         (r, spec)
     }
