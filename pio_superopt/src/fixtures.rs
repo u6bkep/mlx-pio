@@ -204,7 +204,8 @@ pub const SPEC_PHI_MAX: usize = 32;
 /// Build a pooled multi-length SPEC curriculum dataset: exhaustive length-L
 /// bit sequences (vary the first `len` bits) while `2^len <= cap`, else `cap`
 /// sampled — the SAME enumeration and RNG discipline as
-/// [`dme_multilength_dataset`] (seed `0xDA7A_5EED ^ len`), so determinism is
+/// `dme_multilength_dataset` (in the gene_search tests; seed
+/// `0xDA7A_5EED ^ len`), so determinism is
 /// identical. Rows carry the expected BITS directly (not a golden waveform):
 /// `Target::SpecBits { bits, h = SPEC_H, phi_max = SPEC_PHI_MAX }`. The
 /// RunSpec packs those bits LSB-first into 5-bit words exactly like
