@@ -1919,6 +1919,227 @@ pub fn synthesize_curriculum_gated(
     (c, full, solved_through)
 }
 
+/// **COMPRESSION** (STOKE-style): start from a CERTIFIED seed and anneal for
+/// SIZE, wandering freely outside the correct region (cost = `w`·spec-error +
+/// size blends correctness and size; `w` ≫ max size so correctness dominates),
+/// while the CHAMPION only ever moves to a smaller program that passes the
+/// independent `certify` gate. The search metric is the assumed-gameable
+/// loose tier; certification is the trust boundary — exactly the ladder's
+/// gate discipline, applied per candidate instead of per run.
+///
+/// Structure: `cycles` sequential anneal cycles; each cycle runs `restarts`
+/// parallel restarts warm-started from the current champion at a reheated
+/// temperature, cooling geometrically over `cycle_iters`. Champion updates
+/// happen ONLY between cycles (single-threaded, deterministic: smallest
+/// certified candidate across restarts, ties to the lowest restart index).
+/// Within a restart, a candidate is certified only when its full-dataset
+/// error is 0 (`cost < hp.w`) AND it is strictly smaller than the restart's
+/// best — certification stays off the hot path.
+///
+/// Snapshot/resume/stop reuse the ladder's [`GatedSnapshot`] protocol with
+/// the field mapping `frontier = cycle`, `attempt = 0`, pool/lib/minima
+/// empty; `champ` is the certified champion, per-restart `best` the restart's
+/// certified best. The per-checkpoint barrier + stop-latch discipline is
+/// identical, so Ctrl-C snapshots and byte-identical resume carry over.
+#[allow(clippy::too_many_arguments)]
+pub fn synthesize_compress(
+    seed_prog: &Program,
+    space: &Space,
+    dataset: &[(RunSpec, Target)],
+    groups: &[usize],
+    n_groups: usize,
+    hp: &CurriculumHp,
+    restarts: usize,
+    cycle_iters: u32,
+    cycles: usize,
+    seed: u64,
+    on_trace: Option<&(dyn Fn(&TraceEvent) + Sync)>,
+    resume: Option<GatedSnapshot>,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+    certify: &(dyn Fn(&Program) -> bool + Sync),
+    mut on_cycle: impl FnMut(usize, &Program, bool),
+) -> Program {
+    let mut champ: Program = resume.as_ref().and_then(|s| s.champ.clone()).unwrap_or_else(|| seed_prog.clone());
+    assert!(certify(&champ), "compression must start from a certified champion");
+    let start_cycle = resume.as_ref().map(|s| s.frontier).unwrap_or(0);
+    let stopped = || stop.map(|s| s.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false);
+    let ones: Vec<f64> = vec![1.0; n_groups];
+    for cycle in start_cycle..cycles {
+        let mid: Option<&GatedSnapshot> =
+            resume.as_ref().filter(|s| s.frontier == cycle && !s.restarts.is_empty());
+        if let Some(s) = mid {
+            assert_eq!(s.restarts.len(), restarts.max(1), "snapshot restart count must match");
+        }
+        let start_iter = mid.map(|s| s.iter).unwrap_or(0);
+        // Every cycle reheats partway (the champion is always warm — there is
+        // no scratch cycle); a fixed reheat keeps cycles statistically alike.
+        let t_start = hp.t_end + hp.reheat * (hp.t0 - hp.t_end);
+
+        let barrier = std::sync::Barrier::new(restarts.max(1));
+        let stop_latch = std::sync::atomic::AtomicBool::new(false);
+        let snap_slots: std::sync::Mutex<Vec<Option<RestartSnap>>> =
+            std::sync::Mutex::new(vec![None; restarts.max(1)]);
+
+        // Each restart returns its certified best (program, size).
+        let results: Vec<(Program, f64)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..restarts.max(1))
+                .map(|r| {
+                    let cs = seed
+                        ^ ((cycle as u64) << 40)
+                        ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    let champ = &champ;
+                    let ones = &ones;
+                    let barrier = &barrier;
+                    let stop_latch = &stop_latch;
+                    let snap_slots = &snap_slots;
+                    let mid_snap = mid;
+                    s.spawn(move || {
+                        let mut rng = match mid_snap {
+                            Some(s) => Rng::from_state(s.restarts[r].rng),
+                            None => Rng::new(cs),
+                        };
+                        let step = (cycle_iters / 256).max(1);
+                        let mut cur = match mid_snap {
+                            Some(s) => s.restarts[r].cur.clone(),
+                            None => champ.clone(),
+                        };
+                        let mut cache = EvalCache::new(groups, n_groups);
+                        let mut cur_cost =
+                            weighted_multidata_cost_cached(&cur, dataset, ones, hp.w, hp.densify_w, f64::INFINITY, &mut cache).0;
+                        // Certified best: (program, size). Starts at the champion.
+                        let mut best: (Program, f64) = match mid_snap {
+                            Some(s) => (s.restarts[r].best.clone(), s.restarts[r].best_sel),
+                            None => (champ.clone(), champ.size() as f64),
+                        };
+                        for i in start_iter..cycle_iters {
+                            let temp = t_start * (hp.t_end / t_start).powf(i as f64 / cycle_iters.max(1) as f64);
+                            if i % step == 0 {
+                                // Pre-block stash — same idempotent-checkpoint
+                                // contract as the ladder (block is RNG-free).
+                                let stash = (rng.state(), cur.clone(), best.0.clone(), best.1);
+                                if let Some(tr) = on_trace {
+                                    tr(&TraceEvent::Checkpoint {
+                                        frontier: cycle, attempt: 0, r, iter: i, temp,
+                                        cur_cost, best_sel_cost: best.1, best_frontier_err: best.1,
+                                        best_size: best.0.size(),
+                                    });
+                                }
+                                if r == 0 {
+                                    let ext = stop.map(|s| s.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false);
+                                    stop_latch.store(ext, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                barrier.wait();
+                                let stopping = stop_latch.load(std::sync::atomic::Ordering::SeqCst);
+                                let hb_checkpoint = (i / step) % 32 == 0;
+                                if on_trace.is_some() && (stopping || hb_checkpoint) {
+                                    snap_slots.lock().unwrap()[r] = Some(RestartSnap {
+                                        rng: stash.0,
+                                        cur: stash.1,
+                                        best: stash.2,
+                                        best_sel: stash.3,
+                                    });
+                                    barrier.wait();
+                                    if r == 0 {
+                                        let snaps: Vec<RestartSnap> = snap_slots
+                                            .lock()
+                                            .unwrap()
+                                            .iter_mut()
+                                            .map(|s| s.take().expect("all restarts deposited"))
+                                            .collect();
+                                        let gs = GatedSnapshot {
+                                            frontier: cycle,
+                                            attempt: 0,
+                                            iter: i,
+                                            champ: Some(champ.clone()),
+                                            solved_through: 0,
+                                            reheat: hp.reheat,
+                                            pool: Vec::new(),
+                                            lib: Vec::new(),
+                                            minima: Vec::new(),
+                                            restarts: snaps,
+                                        };
+                                        if let Some(tr) = on_trace {
+                                            tr(&TraceEvent::Snapshot { snap: &gs });
+                                        }
+                                    }
+                                    barrier.wait();
+                                }
+                                if r == 0 && hb_checkpoint {
+                                    eprintln!(
+                                        "  [hb] cycle#{cycle} iter {i}/{cycle_iters} champ={} best={} cur_cost={cur_cost:.1} cache={:.0}%",
+                                        champ.size(), best.1, 100.0 * cache.hit_rate()
+                                    );
+                                }
+                                if stopping {
+                                    break;
+                                }
+                            }
+                            let cand = mutate_lib(&cur, space, false, &[], &mut rng);
+                            let (cc, exact) = weighted_multidata_cost_cached(
+                                &cand, dataset, ones, hp.w, hp.densify_w,
+                                cur_cost + 40.0 * temp, &mut cache,
+                            );
+                            let accepted = if exact {
+                                cc - cur_cost <= 0.0 || rng.unit() < (-(cc - cur_cost) / temp).exp()
+                            } else {
+                                let _ = rng.unit();
+                                false
+                            };
+                            if accepted {
+                                cur = cand;
+                                cur_cost = cc;
+                                // Champion-candidate: zero spec error (cost < w
+                                // means the error term vanished) AND strictly
+                                // smaller than this restart's certified best.
+                                // Certify OFF the metric: the loose tier is
+                                // assumed gameable. RNG-free, so determinism
+                                // holds; strictly-smaller keeps it rare.
+                                if cur_cost < hp.w && (cur.size() as f64) < best.1 && certify(&cur) {
+                                    best = (cur.clone(), cur.size() as f64);
+                                    if let Some(tr) = on_trace {
+                                        tr(&TraceEvent::NewBest {
+                                            frontier: cycle, attempt: 0, r, iter: i,
+                                            program: &best.0, sel_cost: best.1, frontier_err: 0.0,
+                                            size: best.0.size(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(tr) = on_trace {
+                            tr(&TraceEvent::RestartEnd {
+                                frontier: cycle, attempt: 0, r,
+                                program: &best.0, sel_cost: best.1, frontier_err: 0.0, size: best.0.size(),
+                            });
+                        }
+                        (best.0, best.1)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        if stopped() {
+            return champ; // snapshot already in the trace at the stop checkpoint
+        }
+
+        // Cycle-end champion update (single-threaded, deterministic): the
+        // smallest certified best across restarts; min_by takes the first
+        // minimum, restarts collected in index order, so ties are stable.
+        let (rc, rsize) = results
+            .iter()
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .cloned()
+            .unwrap();
+        let improved = rsize < champ.size() as f64;
+        if improved {
+            champ = rc;
+        }
+        on_cycle(cycle, &champ, improved);
+    }
+    champ
+}
+
 /// **Meta-anneal** over [`CurriculumHp`] — tune the gated ladder's schedule shape.
 /// SA in hyperparameter space over the curriculum genome, starting from a
 /// caller-supplied `seed_hp` (so the base shape / compute budget is set outside).

@@ -1283,6 +1283,52 @@ mod tests {
     }
 
 
+    /// COMPRESS RESUME IS BYTE-IDENTICAL: same contract as the ladder's
+    /// resume test — interrupt mid-cycle via the stop flag, resume from the
+    /// trace's snapshot, identical final champion.
+    #[test]
+    fn dme_compress_resume_is_byte_identical() {
+        use crate::fixtures::{dme_corpus, dme_spec_ref, spec_certify_corpus};
+        use crate::search::{synthesize_compress, CurriculumHp, GatedSnapshot, Genes, Space, TraceEvent};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let space = Space { slots: 10, side: SideCfg::NONE, search_wrap: true, genes: Genes { autopull: true, ..Genes::default() } };
+        let seed_prog = dme_spec_ref();
+        let (dataset, groups) = dme_spec_multilength_dataset(&[2, 3], 32);
+        let hp = CurriculumHp { densify_w: 1.0, ..CurriculumHp::default() };
+        let corpus = dme_corpus();
+        let certify = move |p: &crate::Program| spec_certify_corpus(p, &corpus) == 0;
+
+        let run_once = |resume: Option<GatedSnapshot>,
+                        sink: Option<&(dyn Fn(&TraceEvent) + Sync)>,
+                        stop: Option<&AtomicBool>| {
+            synthesize_compress(
+                &seed_prog, &space, &dataset, &groups, 2, &hp, 4, 30_000, 3, 0xC0DE,
+                sink, resume, stop, &certify, |_, _, _| {},
+            )
+        };
+        // 1. Uninterrupted reference.
+        let full = run_once(None, None, None);
+        // 2. Interrupt after a prefix of checkpoints.
+        let stop = AtomicBool::new(false);
+        let checkpoints = AtomicUsize::new(0);
+        let snapshots = std::sync::Mutex::new(Vec::<GatedSnapshot>::new());
+        let sink = |ev: &TraceEvent| match ev {
+            TraceEvent::Checkpoint { .. } => {
+                if checkpoints.fetch_add(1, Ordering::SeqCst) + 1 == 700 {
+                    stop.store(true, Ordering::SeqCst);
+                }
+            }
+            TraceEvent::Snapshot { snap } => snapshots.lock().unwrap().push((*snap).clone()),
+            _ => {}
+        };
+        let _partial = run_once(None, Some(&sink), Some(&stop));
+        assert!(stop.load(Ordering::SeqCst), "test must actually interrupt the run");
+        let last = snapshots.lock().unwrap().last().cloned().expect("stop checkpoint wrote a snapshot");
+        // 3. Resume.
+        let resumed = run_once(Some(last), None, None);
+        assert_eq!(resumed, full, "resumed compress champion must equal the uninterrupted run's");
+    }
+
     /// DENSIFY SWEEP (spec oracle): find where raising `densify_w` (the spurious-
     /// edge weight) prices the toggler exploit up enough that the read+branch
     /// conjunction wins at a MODEST budget. The toggler's entire cost is the

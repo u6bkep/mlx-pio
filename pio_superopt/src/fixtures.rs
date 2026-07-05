@@ -93,6 +93,45 @@ pub fn dme_spec(cycles: u64) -> RunSpec {
     }
 }
 
+/// Hand-written SPEC-SHAPED DME encoder — the compression seed (ticket 004
+/// follow-on, 2026-07-05). `dme_ref` can never certify (14-cycle cell, data
+/// at +6, +1 slip per word from the in-loop `pull` — see
+/// `dme_ref_is_not_spec_shaped`), so compression needs a seed built for the
+/// certifier's grid: 16-cycle cell, boundary edge at cell+2, data edge at
+/// +8, both bit paths balanced to 16 cycles, AUTOPULL (threshold 5) so word
+/// refill costs zero cycles. 8 instructions.
+///
+/// Cycle layout per cell (edge = `mov Pins,Y` visible):
+/// ```text
+///   c0 out X,1   c1 mov Y,!Y   c2 mov Pins,!Y[5]  (boundary edge @c2)
+/// Drives are `mov Pins, Invert Y` (not plain Y): the emulator pad idles
+/// HIGH, and the first drive must land on the OPPOSITE level or the opening
+/// boundary edge is invisible and the certifier's phase lock lands on the
+/// wrong grid. Polarity itself is spec-free.
+///   c8 jmp X--,5
+///   bit=1: c9 mov Y,!Y  c10 mov Pins,Y (mid edge @c2+8)  c11 mov Pins,Y[4]
+///   bit=0: c9 jmp 7[1]                                   c11 mov Pins,Y[4]
+///   wrap -> next c0 at c16
+/// ```
+pub fn dme_spec_ref() -> Program {
+    use crate::ir::{Insn, JmpCond, MovDst, MovOp, MovSrc, Op, OutDst};
+    let mut cfg = dme_cfg();
+    cfg.shift.autopull = true;
+    let mut p = Program::empty(cfg);
+    let ins = |op, delay| Some(Insn { op, delay, sideset: None });
+    p.slots[0] = ins(Op::Out { dst: OutDst::X, count: 1 }, 0);
+    p.slots[1] = ins(Op::Mov { dst: MovDst::Y, op: MovOp::Invert, src: MovSrc::Y }, 0);
+    p.slots[2] = ins(Op::Mov { dst: MovDst::Pins, op: MovOp::Invert, src: MovSrc::Y }, 5);
+    p.slots[3] = ins(Op::Jmp { cond: JmpCond::XPostDec, target: 5 }, 0);
+    p.slots[4] = ins(Op::Jmp { cond: JmpCond::Always, target: 7 }, 1);
+    p.slots[5] = ins(Op::Mov { dst: MovDst::Y, op: MovOp::Invert, src: MovSrc::Y }, 0);
+    p.slots[6] = ins(Op::Mov { dst: MovDst::Pins, op: MovOp::Invert, src: MovSrc::Y }, 0);
+    p.slots[7] = ins(Op::Mov { dst: MovDst::Pins, op: MovOp::Invert, src: MovSrc::Y }, 4);
+    p.wrap_bottom = 0;
+    p.wrap_top = 7;
+    p
+}
+
 /// The locked DME benchmark: `(spec, golden, full_mask)`. Golden is the
 /// reference's own output under the locked window — a self-consistent oracle.
 pub fn dme_golden() -> (RunSpec, Vec<u32>, Vec<u32>) {
@@ -253,7 +292,11 @@ pub fn spec_certify_corpus(champ: &Program, corpus: &[u32]) -> usize {
         }
     }
     let cycles = (SPEC_PHI_MAX + expected.len() * cell + cell) as u64;
-    let sp = RunSpec { inputs: corpus.to_vec(), cycles, autopull_pad: 2, ..dme_spec(0) };
+    // NO autopull_pad here: pad symbols are extra data an autopull champion
+    // dutifully transmits, guaranteeing strict-tail violations. The last real
+    // word drains fine unpadded (refill only matters mid-stream), verified by
+    // `dme_spec_ref_certifies`.
+    let sp = RunSpec { inputs: corpus.to_vec(), ..dme_spec(cycles) };
     let wave = run(champ, &sp);
     let levels = channel_levels(&wave, 0, cycles as usize);
     let p = DmeParams { half_cell: SPEC_H, phi_max: SPEC_PHI_MAX, strict_tail: true };
@@ -371,5 +414,32 @@ pub fn spec_classify(champ: &Program) -> &'static str {
         (false, false) => "TOGGLER",
         (true, true) => "CONJUNCTION",
         _ => "OTHER",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The compression seed must CERTIFY — train and held-out, zero
+    /// violations — or compression has no certified starting point.
+    #[test]
+    fn dme_spec_ref_certifies() {
+        let seed = dme_spec_ref();
+        let ct = spec_certify_corpus(&seed, &dme_corpus());
+        let cv = spec_certify_corpus(&seed, &dme_validation_corpus());
+        assert_eq!((ct, cv), (0, 0), "seed must certify on train + held-out");
+    }
+
+    /// The seed must also score ZERO on the search dataset (all lengths) —
+    /// the compression anneal's correctness term starts at 0.
+    #[test]
+    fn dme_spec_ref_scores_zero_all_lengths() {
+        use crate::run::run;
+        let seed = dme_spec_ref();
+        let lengths: Vec<usize> = (2..=14).collect();
+        let (dataset, _groups) = dme_spec_multilength_dataset(&lengths, 32);
+        let total: f64 = dataset.iter().map(|(sp, t)| t.search_cost(&run(&seed, sp), 0, 1.0)).sum();
+        assert_eq!(total, 0.0, "seed must have zero spec error at every length");
     }
 }

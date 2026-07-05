@@ -46,6 +46,7 @@ pub fn by_id(id: &str) -> Option<Box<dyn Problem>> {
     match id {
         "dme-spec" => Some(Box::new(DmeSpec)),
         "dme-spec-ap" => Some(Box::new(DmeSpecAutopull)),
+        "dme-spec-compress" => Some(Box::new(DmeSpecCompress)),
         "dme-wave" => Some(Box::new(DmeWave)),
         _ => None,
     }
@@ -117,6 +118,39 @@ impl Problem for DmeSpec {
             Gate { label: "cert train", verdict: fmt_cert(ct), pass: ct == 0 },
             Gate { label: "cert held-out", verdict: fmt_cert(cv), pass: cv == 0 },
         ]
+    }
+}
+
+/// COMPRESSION target (STOKE-style, 2026-07-05): shrink the hand-written
+/// spec-shaped encoder `dme_spec_ref` (8 insns, autopull, certifies clean)
+/// under the same spec dataset + certifier gates as [`DmeSpec`]. `template()`
+/// is the SEED, not an empty program. Separate id: compression traces must
+/// never cross-resume with synthesis runs.
+pub struct DmeSpecCompress;
+
+impl Problem for DmeSpecCompress {
+    fn id(&self) -> &'static str {
+        "dme-spec-compress"
+    }
+    fn describe(&self) -> String {
+        format!("{} | COMPRESS seed=dme_spec_ref(8)", DmeSpec.describe())
+    }
+    fn template(&self) -> Program {
+        crate::fixtures::dme_spec_ref()
+    }
+    fn space(&self) -> Space {
+        // Autopull stays a gene: the seed uses it, but a smaller explicit-pull
+        // program is a legitimate win — let the search choose.
+        Space { genes: Genes { autopull: true, ..Genes::default() }, ..DmeSpec.space() }
+    }
+    fn default_hp(&self) -> CurriculumHp {
+        DmeSpec.default_hp()
+    }
+    fn dataset(&self, lengths: &[usize]) -> (Vec<(RunSpec, Target)>, Vec<usize>) {
+        DmeSpec.dataset(lengths)
+    }
+    fn gates(&self, champ: &Program) -> Vec<Gate> {
+        DmeSpec.gates(champ)
     }
 }
 

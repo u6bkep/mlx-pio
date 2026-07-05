@@ -4,6 +4,7 @@
 //!     superopt spec-ladder [opts]   # DME under the spec oracle (ticket 005)
 //!     superopt spec-ap-ladder [opts]# spec oracle + autopull gene (ticket 005 step 4)
 //!     superopt wave-ladder [opts]   # DME under the cycle-exact oracle
+//!     superopt compress [opts]      # STOKE-style: shrink a certified seed (dme_spec_ref)
 //!     superopt diagnose --trace PATH
 //!
 //! Ladder options: `--seed 0x5EED  --lengths 2..14  --restarts 32
@@ -25,7 +26,7 @@
 //! (TOGGLER/CONJUNCTION/OTHER), and the problem's gates on it.
 
 use pio_superopt::fixtures::spec_classify;
-use pio_superopt::problems::{by_id, DmeSpec, DmeSpecAutopull, DmeWave, Problem};
+use pio_superopt::problems::{by_id, DmeSpec, DmeSpecAutopull, DmeSpecCompress, DmeWave, Problem};
 use pio_superopt::search::{synthesize_curriculum_gated, TraceEvent};
 use pio_superopt::trace::{header_json, scan_for_resume, trace_json, RunHeader};
 use pio_superopt::Program;
@@ -34,7 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: superopt <spec-ladder|spec-ap-ladder|wave-ladder> [--seed HEX] [--lengths A..B] \
+        "usage: superopt <spec-ladder|spec-ap-ladder|wave-ladder|compress> [--seed HEX] [--lengths A..B] \
          [--restarts N] [--iters N] [--densify F] [--trace PATH] [--fresh]\n\
        superopt diagnose --trace PATH\n\
          \n\
@@ -50,6 +51,7 @@ struct LadderOpts {
     lengths: Vec<usize>,
     restarts: usize,
     iters: u32,
+    cycles: usize,
     densify: Option<f64>,
     trace: Option<String>,
     fresh: bool,
@@ -61,6 +63,7 @@ fn parse_ladder_opts(args: &[String]) -> LadderOpts {
         lengths: (2..=14).collect(),
         restarts: 32,
         iters: 4_000_000,
+        cycles: 100_000,
         densify: None,
         trace: None,
         fresh: false,
@@ -81,6 +84,7 @@ fn parse_ladder_opts(args: &[String]) -> LadderOpts {
             }
             "--restarts" => o.restarts = val().parse().unwrap_or_else(|_| usage()),
             "--iters" => o.iters = val().parse().unwrap_or_else(|_| usage()),
+            "--cycles" => o.cycles = val().parse().unwrap_or_else(|_| usage()),
             "--densify" => o.densify = Some(val().parse().unwrap_or_else(|_| usage())),
             "--trace" => o.trace = Some(val()),
             "--fresh" => o.fresh = true,
@@ -96,6 +100,15 @@ fn main() {
         Some("spec-ladder") => run_ladder(&DmeSpec, "spec-ladder", parse_ladder_opts(&args[1..])),
         Some("spec-ap-ladder") => run_ladder(&DmeSpecAutopull, "spec-ap-ladder", parse_ladder_opts(&args[1..])),
         Some("wave-ladder") => run_ladder(&DmeWave, "wave-ladder", parse_ladder_opts(&args[1..])),
+        Some("compress") => {
+            let mut o = parse_ladder_opts(&args[1..]);
+            // Compression cycles are short reheat-and-cool passes from the
+            // champion; the ladder's 4M default is a synthesis-rung budget.
+            if !args[1..].iter().any(|a| a == "--iters") {
+                o.iters = 200_000;
+            }
+            run_compress(&DmeSpecCompress, "compress", o)
+        }
         Some("diagnose") => diagnose(&args[1..]),
         _ => usage(),
     }
@@ -265,6 +278,188 @@ fn run_ladder(problem: &dyn Problem, cmd: &str, o: LadderOpts) {
         "solved": solved,
         "n_groups": o.lengths.len(),
         "full_cost": cost,
+        "champion": {
+            "brief": champ.brief(),
+            "size": champ.size(),
+            "class": spec_classify(&champ),
+            "words": champ.assemble().iter().map(|w| format!("{w:#06x}")).collect::<Vec<_>>(),
+            "wrap": [champ.wrap_bottom, champ.wrap_top],
+        },
+        "gates": gates.iter().map(|g| serde_json::json!({
+            "label": g.label, "verdict": g.verdict, "pass": g.pass,
+        })).collect::<Vec<_>>(),
+        "git_rev": git_rev,
+    });
+    let result_path = path.with_extension("result.json");
+    std::fs::write(&result_path, serde_json::to_string_pretty(&result).unwrap()).expect("write result");
+    eprintln!("result -> {}", result_path.display());
+}
+
+fn run_compress(problem: &dyn Problem, cmd: &str, o: LadderOpts) {
+    use pio_superopt::fixtures::{dme_corpus, spec_certify_corpus};
+    use pio_superopt::search::synthesize_compress;
+    let mut hp = problem.default_hp();
+    if let Some(d) = o.densify {
+        hp.densify_w = d;
+    }
+    let header = RunHeader {
+        problem: problem.id().into(),
+        seed: o.seed,
+        lengths: o.lengths.clone(),
+        restarts: o.restarts,
+        rung_iters: o.iters,
+        hp,
+    };
+    let path = std::path::PathBuf::from(
+        o.trace.unwrap_or_else(|| format!("runs/{cmd}-{:#x}.jsonl", o.seed)),
+    );
+    std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new("."))).expect("create trace dir");
+
+    let resume = if path.exists() && !o.fresh {
+        let scan = scan_for_resume(&path).unwrap_or_else(|e| {
+            eprintln!("cannot resume from {}: {e}\n(pass --fresh to discard it)", path.display());
+            std::process::exit(1);
+        });
+        if scan.header != header {
+            eprintln!(
+                "{} belongs to a different run (header mismatch):\n  file: {:?}\n  args: {:?}\n\
+                 rerun with the original parameters, another --trace, or --fresh.",
+                path.display(),
+                scan.header,
+                header
+            );
+            std::process::exit(1);
+        }
+        match scan.snapshot {
+            Some(s) => {
+                eprintln!(
+                    "resuming {} at cycle#{} iter {} (champ size {})",
+                    path.display(),
+                    s.frontier,
+                    s.iter,
+                    s.champ.as_ref().map(|c| c.size()).unwrap_or(0)
+                );
+                Some(s)
+            }
+            None => {
+                eprintln!(
+                    "{} has a matching header but no snapshot yet; pass --fresh to restart it.",
+                    path.display()
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(resume.is_some())
+        .truncate(resume.is_none())
+        .write(true)
+        .open(&path)
+        .expect("open trace file");
+    let sink = std::sync::Mutex::new(std::io::BufWriter::new(file));
+    if resume.is_none() {
+        let mut w = sink.lock().unwrap();
+        writeln!(w, "{}", header_json(&header)).unwrap();
+        w.flush().unwrap();
+    }
+
+    static STOP: AtomicBool = AtomicBool::new(false);
+    ctrlc::set_handler(|| {
+        if STOP.swap(true, Ordering::SeqCst) {
+            eprintln!("\nsecond Ctrl-C — exiting immediately (snapshot may be stale)");
+            std::process::exit(130);
+        }
+        eprintln!("\nCtrl-C — stopping at the next checkpoint (snapshot will be saved)...");
+    })
+    .expect("install Ctrl-C handler");
+
+    let (dataset, groups) = problem.dataset(&o.lengths);
+    let seed_prog = problem.template();
+    eprintln!(
+        "=== {cmd} === {} | lengths {:?} ({} seqs) densify={} seed={:#x} | seed program size={} [{}]",
+        problem.describe(),
+        o.lengths,
+        dataset.len(),
+        hp.densify_w,
+        o.seed,
+        seed_prog.size(),
+        seed_prog.brief()
+    );
+    eprintln!("trace -> {}", path.display());
+
+    let space = problem.space();
+    let on_trace = |ev: &TraceEvent| {
+        let line = trace_json(ev);
+        let mut w = sink.lock().unwrap();
+        let _ = writeln!(w, "{line}");
+        if matches!(ev, TraceEvent::Snapshot { .. }) {
+            let _ = w.flush();
+        }
+    };
+    // The champion gate: the TRAIN certifier corpus only — held-out stays an
+    // independent end-of-run report, never a selection signal.
+    let corpus = dme_corpus();
+    let certify = move |p: &pio_superopt::Program| spec_certify_corpus(p, &corpus) == 0;
+    let champ = synthesize_compress(
+        &seed_prog,
+        &space,
+        &dataset,
+        &groups,
+        o.lengths.len(),
+        &hp,
+        o.restarts,
+        o.iters,
+        o.cycles,
+        o.seed,
+        Some(&on_trace),
+        resume,
+        Some(&STOP),
+        &certify,
+        |cycle, champ, improved| {
+            if improved {
+                eprintln!(
+                    "{cmd} CYCLE {cycle:<5} SHRUNK size={} [{}]",
+                    champ.size(),
+                    champ.brief()
+                );
+            } else if cycle % 10 == 0 {
+                eprintln!("{cmd} CYCLE {cycle:<5} champ size={} (no change)", champ.size());
+            }
+        },
+    );
+    sink.lock().unwrap().flush().unwrap();
+
+    if STOP.load(Ordering::SeqCst) {
+        eprintln!(
+            "interrupted — snapshot saved in {}; rerun the same command to resume.",
+            path.display()
+        );
+        std::process::exit(130);
+    }
+
+    let gates = problem.gates(&champ);
+    let gates_str: Vec<String> = gates.iter().map(|g| format!("{}={}", g.label, g.verdict)).collect();
+    eprintln!(
+        "{cmd} DONE size {} -> {} [{}] {}",
+        seed_prog.size(),
+        champ.size(),
+        gates_str.join(" "),
+        champ.brief()
+    );
+
+    let git_rev = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let result = serde_json::json!({
+        "run": header,
+        "seed_size": seed_prog.size(),
         "champion": {
             "brief": champ.brief(),
             "size": champ.size(),
