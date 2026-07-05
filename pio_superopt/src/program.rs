@@ -113,14 +113,29 @@ impl Program {
         }
     }
 
-    /// Adopted size metric ①: occupied **span** in instruction-memory
-    /// words = `max_used - min_used + 1` (interior NOPs are real flash
-    /// words and count). 0 for an empty program.
+    /// Adopted size metric ①: instruction-memory **footprint** — the span
+    /// of every address the program occupies or executes: occupied slots,
+    /// the wrap region bounds, and static jmp targets. (Execution flows
+    /// forward from any entry point to `wrap_top`, then to `wrap_bottom`,
+    /// so every traversed address lies inside this span.) Interior NOPs
+    /// are real flash words and count. 0 for an empty program.
+    ///
+    /// The wrap/jmp-target terms were added 2026-07-05 after a compression
+    /// champion GAMED the occupied-span-only metric: `jmp ->5` + `wrap
+    /// 0..5` with slot 5 EMPTY executes a real NOP at address 5 — six
+    /// words on hardware, reported as five. Trailing/leading executed
+    /// NOPs are footprint exactly like interior ones.
     pub fn size(&self) -> u8 {
-        match self.span() {
-            Some((lo, hi)) => hi - lo + 1,
-            None => 0,
+        let Some((mut lo, mut hi)) = self.span() else { return 0 };
+        lo = lo.min(self.wrap_bottom);
+        hi = hi.max(self.wrap_top);
+        for s in self.slots.iter().flatten() {
+            if let crate::ir::Op::Jmp { target, .. } = s.op {
+                lo = lo.min(target);
+                hi = hi.max(target);
+            }
         }
+        hi - lo + 1
     }
 
     /// Compact one-line rendering for experiment logs and traces: occupied
@@ -204,11 +219,27 @@ mod tests {
         slot[i] = Some(Insn::plain(op));
     }
 
+    /// The 2026-07-05 exploit shape: wrap_top / jmp target past the last
+    /// occupied slot execute a real NOP word — size must count it.
+    #[test]
+    fn size_counts_wrap_and_jmp_targets_beyond_occupied() {
+        use crate::ir::{Insn, JmpCond, Op};
+        let mut p = Program::empty(Config::default());
+        p.slots[0] = Some(Insn::plain(Op::Jmp { cond: JmpCond::XPostDec, target: 5 }));
+        p.wrap_bottom = 0;
+        p.wrap_top = 5;
+        assert_eq!(p.size(), 6, "empty-but-executed address 5 is footprint");
+        p.wrap_top = 3; // jmp target alone must still extend the span
+        assert_eq!(p.size(), 6);
+    }
+
     #[test]
     fn span_counts_interior_gaps() {
         let mut p = Program::empty(Config::default());
         set(&mut p.slots, 0, Op::Set { dst: SetDst::X, data: 1 });
         set(&mut p.slots, 17, Op::Set { dst: SetDst::Y, data: 2 });
+        p.wrap_bottom = 0;
+        p.wrap_top = 17; // footprint = wrap ∪ occupied; keep them aligned here
         // Two real instructions, but the deployable footprint is 18 words.
         assert_eq!(p.span(), Some((0, 17)));
         assert_eq!(p.size(), 18);
