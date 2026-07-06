@@ -18,6 +18,10 @@ ctrlc = { version = "3", features = ["termination"] }
 # JSON bodies go through serde_json strings — no json features needed.
 tiny_http = "0.12"
 ureq = "2"
+# Symbolic PIO semantics for the SAT/SMT synthesis track (`smt` module,
+# feature-gated). Links the SYSTEM libz3 — optional so fleet worker boxes
+# without z3 installed keep building with default features.
+z3 = { version = "0.20.2", optional = true }
 
 [dev-dependencies]
 # Ground-truth decoder, used to prove the encoder round-trips
@@ -51,3 +55,8 @@ codegen-units = 1
 picoem-common = { path = "../vendor/picoem-common" }
 # Vendored emulator (see pio_harness): forked for a PIO-only fast step.
 rp2350-emu = { path = "../vendor/rp2350-emu" }
+
+[features]
+# `cargo test --features smt` / `cargo build --features smt` to include the
+# symbolic-semantics + synthesis module. Off by default (system libz3 dep).
+smt = ["dep:z3"]

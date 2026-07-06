@@ -30,6 +30,8 @@ pub mod program;
 pub mod rng;
 pub mod run;
 pub mod search;
+#[cfg(feature = "smt")]
+pub mod smt;
 pub mod spec_cost;
 pub mod trace;
 
