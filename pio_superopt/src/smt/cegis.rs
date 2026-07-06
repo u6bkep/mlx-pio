@@ -171,12 +171,28 @@ pub fn cegis_dme(cfg: &Config, template: &[Option<u16>], opts: &CegisOpts) -> Ce
     supported_config(cfg).expect("unsupported config for the smt model");
     let len = template.len();
     let sym = SymProgram::with_holes(template, &cfg.side);
-    let solver = z3::Solver::new();
+    // Everything here is quantifier-free bit-vectors; pin the QF_BV strategy
+    // (pre-simplify → bit-blast → CDCL SAT) instead of letting z3 guess, and
+    // let its parallel cube-and-conquer use the idle cores. Measured on the
+    // len-4 full-free probe (2026-07-06): the default single-core solver
+    // spent 16 min on iteration 2 and 6+ h on iteration 3.
+    z3::set_global_param("parallel.enable", "true");
+    let solver = z3::Solver::new_for_logic("QF_BV").unwrap_or_else(z3::Solver::new);
     for (i, slot) in template.iter().enumerate() {
         if slot.is_none() {
             solver.assert(&legal_word(&sym.words[i], len as u8));
         }
     }
+    // Sound pruning: a program with NO instruction that can drive the pin
+    // (level or direction, incl. an asserted side-set) cannot encode
+    // anything — the same generation-time reject enumerate.rs uses. Concrete
+    // template slots participate as constants, so this never excludes a
+    // valid completion.
+    let any_pin_write = (0..len)
+        .map(|i| writes_pin_word(&sym.words[i], cfg))
+        .reduce(|a, b| a | b)
+        .expect("len >= 1");
+    solver.assert(&any_pin_write);
 
     let mut trace_file = opts.trace.as_ref().map(|p| {
         if let Some(dir) = p.parent() {
@@ -283,6 +299,29 @@ pub fn cegis_dme(cfg: &Config, template: &[Option<u16>], opts: &CegisOpts) -> Ce
             }
         }
     }
+}
+
+/// Can this instruction word drive the observed pin — OUT/MOV/SET to
+/// Pins/PinDirs, or an asserted side-set (when the config has side-set
+/// value pins)? Mirrors `enumerate::writes_pin`, extended with side-set.
+fn writes_pin_word(word: &BV, cfg: &Config) -> Bool {
+    let opcode = word.extract(15, 13);
+    let dst = word.extract(7, 5);
+    let out_pins = opcode._eq(&bvu(3, 3)) & (dst._eq(&bvu(0, 3)) | dst._eq(&bvu(4, 3)));
+    let mov_pins = opcode._eq(&bvu(5, 3)) & (dst._eq(&bvu(0, 3)) | dst._eq(&bvu(3, 3)));
+    let set_pins = opcode._eq(&bvu(7, 3)) & (dst._eq(&bvu(0, 3)) | dst._eq(&bvu(4, 3)));
+    let mut writes = out_pins | mov_pins | set_pins;
+    if cfg.side.count.saturating_sub(cfg.side.en as u8) > 0 {
+        // With SIDE_EN the field's bit 4 (word bit 12) is the per-insn
+        // enable; without it every instruction asserts side-set.
+        let side_asserted = if cfg.side.en {
+            word.extract(12, 12)._eq(&bvu(1, 1))
+        } else {
+            bt(true)
+        };
+        writes = writes | side_asserted;
+    }
+    writes
 }
 
 /// Decode solver words into a runnable [`Program`] (wrap = (0, len-1)).
