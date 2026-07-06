@@ -4,6 +4,42 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-06 — SAT/SMT track opened: symbolic PIO semantics + differential harness (b73939f)
+
+New third track alongside compression/enumeration, user-initiated ("the
+landscape is so bumpy SA is proving to be hard"): encode PIO semantics into
+SMT bitvectors and synthesize/refute by solver instead of search. Rationale:
+the len-5 question is a *decision problem* — CDCL is enumeration-with-
+learning and can return UNSAT proofs SA never can; side-set costs the
+solver a few bits per slot instead of enumeration's ~3^len blowup, so it is
+IN scope from day one (a len-5 UNSAT without side-set would be the weaker
+claim, and the sweep already covers the no-side-set region).
+
+Landed (`pio_superopt/src/smt.rs`, feature `smt`, links system libz3 —
+default build unchanged for fleet boxes): `step()` mirrors picoem-common's
+`execute_cycle` bit-for-bit for the single-SM/single-pin TX subset
+(enumeration alphabet + PULL + side-set incl. pindir drive and
+apply-on-stall ordering + autopull + delays + wrap + one-cycle GPIO
+loopback; FIFO modeled as index into the concrete input stream — valid for
+both preload and streaming paths per `stream_matches_fast`). `unroll()`
+gives per-cycle (level, OE); `SymProgram::free` + `legal_word()` make the
+program words solver variables confined to the modeled subset.
+
+**Fidelity is the entire risk** (a wrong mirror poisons UNSAT verdicts
+silently — models are certifier-checked, refutations are not). Gates:
+dme_spec_ref cycle-exact over the full 278-cycle window; 60 random subset
+programs across the side-set/autopull/shift-dir/threshold grid; 2000-case
+`differential_fuzz` `#[ignore]` tier (passes clean, ~7.6 min, rerun before
+trusting any UNSAT); two hand-planted mutations (X-- decrement-at-zero,
+side-set-skipped-on-stall) both caught by the random tier.
+`synthesize_len1_toggler` closes the ∃ loop: solver invents a word, real
+emulator confirms the waveform.
+
+Next: CEGIS engine (solver proposes against accumulated example frames,
+certifier is the ∀-oracle, failures become new constraints), then aim at
+len-5 DME as a race against the fleet sweep. User is learning SAT along
+the way (reference/sat_playground is the sandbox; not used by the crate).
+
 ## 2026-07-05 (evening) — strategy pivot: compression + enumeration; certified 6-word encoder; len<=4 proven impossible
 
 Morning queue executed: runner-restructure merged (090d423), eval cache
