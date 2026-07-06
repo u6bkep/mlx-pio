@@ -57,6 +57,8 @@ use z3::ast::{Bool, BV};
 use crate::ir::SideCfg;
 use crate::program::{Config, Program, ShiftDir};
 
+pub mod cegis;
+
 // ---- small constructors --------------------------------------------------
 
 fn bvu(v: u64, sz: u32) -> BV {
@@ -148,15 +150,22 @@ impl SymProgram {
     /// the rest (what `Program::assemble` puts in empty slots), wrap =
     /// `(0, len-1)`. Callers must assert [`legal_word`] on each free word.
     pub fn free(len: usize, side: &SideCfg) -> SymProgram {
+        Self::with_holes(&vec![None; len], side)
+    }
+
+    /// Like [`SymProgram::free`], but with a template: `Some(word)` slots are
+    /// concrete, `None` slots are free variables (named `w<i>`). Wrap =
+    /// `(0, len-1)`; slots past the template are NOP. Callers must assert
+    /// [`legal_word`] on each free (`None`) slot.
+    pub fn with_holes(template: &[Option<u16>], side: &SideCfg) -> SymProgram {
+        let len = template.len();
         assert!((1..=32).contains(&len));
         let nop = crate::encode::encode_insn(&crate::ir::Insn::nop_for(side), side);
         let words = (0..32)
-            .map(|i| {
-                if i < len {
-                    BV::new_const(format!("w{i}"), 16)
-                } else {
-                    bvu(nop as u64, 16)
-                }
+            .map(|i| match template.get(i) {
+                Some(Some(w)) => bvu(*w as u64, 16),
+                Some(None) => BV::new_const(format!("w{i}"), 16),
+                None => bvu(nop as u64, 16),
             })
             .collect();
         SymProgram { words, wrap_bottom: 0, wrap_top: (len - 1) as u8 }
@@ -502,6 +511,12 @@ pub struct SymTrace {
 }
 
 /// Unroll `cycles` PIO cycles from the post-configure initial state.
+///
+/// Pure expression form: each cycle's state is the full nested term over the
+/// previous one. Right for GROUND evaluation (differential tests fold it with
+/// `simplify`), pathological for solving — with free program words the term
+/// tree duplicates exponentially. Solver queries should use
+/// [`unroll_interned`] instead.
 pub fn unroll(prog: &SymProgram, cfg: &Config, inputs: &[u32], cycles: usize) -> SymTrace {
     supported_config(cfg).expect("unsupported config for the smt model");
     assert!(inputs.len() < 256, "fifo_next is 8 bits");
@@ -511,6 +526,57 @@ pub fn unroll(prog: &SymProgram, cfg: &Config, inputs: &[u32], cycles: usize) ->
     states.push(SymState::initial());
     for t in 0..cycles {
         let next = step(&states[t], prog, cfg, inputs);
+        levels.push(next.level());
+        oes.push(next.oe.clone());
+        states.push(next);
+    }
+    SymTrace { states, levels, oes }
+}
+
+/// [`unroll`] in SSA/BMC form: after every cycle each state field is replaced
+/// by a fresh constant asserted equal on `solver` (`u<tag>_<cycle>_<field>`),
+/// so the formula stays linear in `cycles` instead of nesting — the standard
+/// bounded-model-checking shape. Semantically identical to [`unroll`]
+/// (`interned_unroll_matches_pure` pins it); use for every solver query.
+pub fn unroll_interned(
+    solver: &z3::Solver,
+    prog: &SymProgram,
+    cfg: &Config,
+    inputs: &[u32],
+    cycles: usize,
+    tag: usize,
+) -> SymTrace {
+    supported_config(cfg).expect("unsupported config for the smt model");
+    assert!(inputs.len() < 256, "fifo_next is 8 bits");
+    let mut states = Vec::with_capacity(cycles + 1);
+    let mut levels = Vec::with_capacity(cycles);
+    let mut oes = Vec::with_capacity(cycles);
+    states.push(SymState::initial());
+    for t in 0..cycles {
+        let next = step(&states[t], prog, cfg, inputs);
+        let ibv = |name: &str, e: &BV| -> BV {
+            let v = BV::new_const(format!("u{tag}_{t}_{name}"), e.get_size());
+            solver.assert(&v._eq(e));
+            v
+        };
+        let ib = |name: &str, e: &Bool| -> Bool {
+            let v = Bool::new_const(format!("u{tag}_{t}_{name}"));
+            solver.assert(&v.iff(e));
+            v
+        };
+        let next = SymState {
+            pc: ibv("pc", &next.pc),
+            x: ibv("x", &next.x),
+            y: ibv("y", &next.y),
+            osr: ibv("osr", &next.osr),
+            isr: ibv("isr", &next.isr),
+            osr_cnt: ibv("cnt", &next.osr_cnt),
+            delay: ibv("dly", &next.delay),
+            stalled: ib("stl", &next.stalled),
+            fifo_next: ibv("fifo", &next.fifo_next),
+            pin: ib("pin", &next.pin),
+            oe: ib("oe", &next.oe),
+        };
         levels.push(next.level());
         oes.push(next.oe.clone());
         states.push(next);
@@ -620,6 +686,29 @@ mod tests {
             let n_inputs = rng.below(8) as usize; // 0..=7, incl. no-input starvation
             let inputs: Vec<u32> = (0..n_inputs).map(|_| rng.next_u64() as u32).collect();
             assert_matches(&p, &inputs, 128, &format!("fuzz case {case}"));
+        }
+    }
+
+    /// The SSA/BMC unroll must be semantically identical to the pure one:
+    /// same concrete program, solver-completed interned levels == ground
+    /// pure levels, every cycle.
+    #[test]
+    fn interned_unroll_matches_pure() {
+        let mut rng = Rng::new(0x155A_B3C5);
+        for case in 0..5 {
+            let autopull = rng.boolean();
+            let p = random_supported_program(&mut rng, 4, SideCfg::NONE, false, autopull);
+            let inputs = [0x0Bu32, 0x1D];
+            let sym = SymProgram::from_program(&p);
+            let pure = unroll(&sym, &p.config, &inputs, 48);
+            let solver = z3::Solver::new();
+            let interned = unroll_interned(&solver, &sym, &p.config, &inputs, 48, 0);
+            assert_eq!(solver.check(), z3::SatResult::Sat, "concrete chain must be sat");
+            let model = solver.get_model().unwrap();
+            for t in 0..48 {
+                let iv = model.eval(&interned.levels[t], true).unwrap().as_bool().unwrap();
+                assert_eq!(iv, ground(&pure.levels[t]), "case {case} cycle {t}");
+            }
         }
     }
 

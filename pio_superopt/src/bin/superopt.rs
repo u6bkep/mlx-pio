@@ -9,6 +9,7 @@
 //!     superopt serve --len N        # shard-lease coordinator for a worker fleet
 //!     superopt work --server URL    # pull shards from a coordinator until drained
 //!     superopt diagnose --trace PATH
+//!     superopt smt-synth --len N    # CEGIS synthesis via z3 (--features smt)
 //!
 //! Ladder options: `--seed 0x5EED  --lengths 2..14  --restarts 32
 //! --iters 4000000  --densify F  --trace PATH  --fresh`.
@@ -44,6 +45,8 @@ fn usage() -> ! {
        superopt serve --len N [--out DIR] [--listen ADDR:PORT] [--lease-secs S]\n\
        superopt work --server URL [--threads T]\n\
        superopt diagnose --trace PATH\n\
+       superopt smt-synth --len N [--side none|1|2en] [--side-pindir] [--no-autopull]\n\
+                          [--max-iters N] [--trace PATH]   (needs --features smt)\n\
          \n\
          Ladders resume automatically from an existing trace (same parameters);\n\
          pass --fresh to discard it and start over. Ctrl-C saves a snapshot and\n\
@@ -119,7 +122,90 @@ fn main() {
         Some("serve") => serve_cmd(&args[1..]),
         Some("work") => work_cmd(&args[1..]),
         Some("diagnose") => diagnose(&args[1..]),
+        #[cfg(feature = "smt")]
+        Some("smt-synth") => smt_synth_cmd(&args[1..]),
+        #[cfg(not(feature = "smt"))]
+        Some("smt-synth") => {
+            eprintln!("smt-synth requires the `smt` feature: cargo run --release --features smt --bin superopt -- smt-synth …");
+            std::process::exit(2);
+        }
         _ => usage(),
+    }
+}
+
+/// `superopt smt-synth --len N [--side none|1|2en] [--side-pindir]
+/// [--no-autopull] [--max-iters N] [--trace PATH]` — CEGIS synthesis of a
+/// len-N DME TX program (wrap 0..N-1) under the compression-seed config
+/// (autopull ON threshold 5, shift right) with the chosen side-set mode.
+/// Streams a heartbeat per iteration; JSONL trace defaults to
+/// `runs/smt-synth-len<N>-<side>.jsonl`. NOT resumable (solver state is not
+/// snapshottable) — the trace is observability, reruns start over.
+#[cfg(feature = "smt")]
+fn smt_synth_cmd(args: &[String]) {
+    use pio_superopt::fixtures::dme_cfg;
+    use pio_superopt::ir::SideCfg;
+    use pio_superopt::smt::cegis::{cegis_dme, CegisOpts, Outcome};
+
+    let mut len: Option<usize> = None;
+    let mut side = SideCfg::NONE;
+    let mut side_name = "none".to_string();
+    let mut side_pindir = false;
+    let mut autopull = true;
+    let mut max_iters = 0usize;
+    let mut trace: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().unwrap_or_else(|| usage()).clone();
+        match a.as_str() {
+            "--len" => len = Some(val().parse().unwrap_or_else(|_| usage())),
+            "--side" => {
+                side_name = val();
+                side = match side_name.as_str() {
+                    "none" => SideCfg::NONE,
+                    "1" => SideCfg { count: 1, en: false },
+                    "2en" => SideCfg { count: 2, en: true },
+                    _ => usage(),
+                };
+            }
+            "--side-pindir" => side_pindir = true,
+            "--no-autopull" => autopull = false,
+            "--max-iters" => max_iters = val().parse().unwrap_or_else(|_| usage()),
+            "--trace" => trace = Some(val()),
+            _ => usage(),
+        }
+    }
+    let len = len.unwrap_or_else(|| usage());
+    let mut cfg = dme_cfg();
+    cfg.side = side;
+    cfg.side_pindir = side_pindir;
+    cfg.shift.autopull = autopull;
+
+    let trace = trace.unwrap_or_else(|| format!("runs/smt-synth-len{len}-{side_name}.jsonl"));
+    eprintln!(
+        "[smt-synth] len {len}, side {side_name}{}, autopull {}, trace {trace}",
+        if side_pindir { " (pindir)" } else { "" },
+        if autopull { "on(5)" } else { "off" },
+    );
+    let opts = CegisOpts { max_iters, trace: Some(trace.into()), verbose: true };
+    let report = cegis_dme(&cfg, &vec![None; len], &opts);
+    match report.outcome {
+        Outcome::Found(p) => {
+            println!("FOUND (battery-certified, {} iters): {}", report.iters, p.brief());
+            println!("words: {:04x?}", &p.assemble()[..len]);
+        }
+        Outcome::Unsat => {
+            println!(
+                "UNSAT after {} iters / {} examples: no len-{len} program in the modeled \
+                 subset (side {side_name}, autopull {autopull}). Verdict rests on mirror \
+                 fidelity — rerun differential_fuzz before trusting it.",
+                report.iters,
+                report.examples.len()
+            );
+        }
+        Outcome::MaxIters => {
+            println!("stopped at --max-iters {} ({} examples)", report.iters, report.examples.len());
+            std::process::exit(1);
+        }
     }
 }
 
