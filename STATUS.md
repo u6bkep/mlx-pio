@@ -28,7 +28,16 @@ loopback alternative). SSA interning (`unroll_interned`) was 60x on solve
 time. Runner: `superopt smt-synth --len N [--side …]` (not resumable).
 CEGIS subset ⊋ enumeration alphabet (adds PULL, all delays, out counts
 to 32) — so a len-4 UNSAT independently corroborates the enumeration proof,
-and a len-4 SAT would be a real discovery. First probe launched 2026-07-06.
+and a len-4 SAT would be a real discovery.
+
+**SMT perf frontier (the open problem):** full-free len-4 iters took 16 min
+(iter 2) then 6+ h (iter 3, killed) on the default solver. Levers added
+d22dad5 (QF_BV logic, z3 parallel mode, pin-write pruning); probe restarted
+2026-07-06 eve, running detached: `pio_superopt/runs/smt-synth-len4-none.log`
+(check `tail` + `ps -C superopt`; NOT resumable — a rerun starts over).
+If still crawling, next levers: diverse seed examples, shorter frame
+windows (phi_max), structure constraints (canonical slot ordering), or
+bitwuzla via SMT-LIB dump.
 
 ## Paused runs (user resumes in own shell)
 

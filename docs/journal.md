@@ -4,6 +4,24 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-06 (eve) — len-4 probe: full-free solves are the bottleneck; solver levers added (d22dad5)
+
+First len-4 full-free probe (all 64 program bits free): iter 1 solved in
+7 s, iter 2 in 16 min, iter 3 killed after 6+ h single-core CPU. The
+hole-refill numbers (9 s) do NOT extrapolate — each battery counterexample
+multiplies solve cost steeply when the whole program is free. Candidates
+were entertainingly weird (`mov PinDirs,!Pins` direction-toggle encoding,
+`mov Osr,!Osr` scramblers) — the certifier accepts direction-driven levels,
+FYI, since it reads the merged pad like a receiver would.
+
+Levers added (d22dad5): `Solver::new_for_logic("QF_BV")` (pin the
+bit-blast→CDCL strategy), `parallel.enable` (still looked single-core in
+the first minute — check overnight), and the sound enumerate-style
+"some instruction must drive the pin" pruning constraint. Probe restarted
+detached (survives session close): `runs/smt-synth-len4-none.log`. If it's
+still crawling tomorrow: diverse seed examples, smaller phi_max windows,
+canonical-ordering symmetry breaking, or dump SMT-LIB and try bitwuzla.
+
 ## 2026-07-06 (later) — CEGIS engine built and working (40bb822); len-4 cross-validation probe launched
 
 `smt/cegis.rs` on top of the morning's mirror. `assert_frame` restates
