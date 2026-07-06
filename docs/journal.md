@@ -4,6 +4,45 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-06 (later) — CEGIS engine built and working (40bb822); len-4 cross-validation probe launched
+
+`smt/cegis.rs` on top of the morning's mirror. `assert_frame` restates
+`certify_dme` in bitvectors with ONE free variable per example (frame phase
+φ): per-cycle biconditional "transition iff on the φ-grid" covers clock
+edges, data-iff-bit, spurious edges, strict tail; window sized exactly like
+`spec_certify_corpus`. Agreement with the real certifier pinned positive
+(spec seed × 4 corpora) and negative (dme_ref, delay-mutated seed).
+
+Loop: solver ∃ on accumulated examples → candidate → REAL emulator +
+certifier battery (32 singles → 1024 pairs → train/held-out corpora → 16
+random 8-word streams, cheapest first) → failing corpus becomes a new frame
+constraint. Found = battery-certified, mirror-independent. Unsat = subset
+impossibility resting on mirror fidelity. **Divergence guard**: if a
+battery-refuted candidate is re-proposed (i.e. mirror and certifier
+disagree), abort loudly rather than spin.
+
+**Perf lesson (the big one):** naive nested-ite unrolling made a 1-free-word
+solve take 565 s; SSA/BMC interning (`unroll_interned`: fresh constants per
+state field per cycle, asserted equal) brought it to 9.3 s — 60x. Whole smt
+suite: 14.5 s release. Equivalence to the pure unroll is a pinned test;
+diff tests still use the pure form (ground simplify, no solver).
+
+End-to-end test frees seed slot 1 and re-derives it in 2 iters. A pre-SSA
+run instead invented `mov Y, NonePins` — reading the current line level back
+through the GPIO loopback instead of tracking it in Y. The solver is already
+finding non-obvious mechanisms; good omen for side-set worlds.
+
+Runner: `superopt smt-synth --len N [--side none|1|2en] [--side-pindir]
+[--no-autopull] [--max-iters] [--trace]` (needs `--features smt`; binary
+must be REBUILT with the feature — plain `cargo build --release` silently
+lacks the subcommand). NOT resumable; trace is observability only.
+
+Launched: len-4, side none, autopull — the CEGIS subset is STRICTLY LARGER
+than the enumeration alphabet (adds PULL, all delays, out counts to 32, any
+set imm), so UNSAT corroborates the 12.3B-eval enumeration proof from a
+fully independent engine, while SAT would be a real len-4 discovery outside
+the alphabet. Trace: `runs/smt-synth-len4-none.jsonl` + `.log`.
+
 ## 2026-07-06 — SAT/SMT track opened: symbolic PIO semantics + differential harness (b73939f)
 
 New third track alongside compression/enumeration, user-initiated ("the
