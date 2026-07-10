@@ -77,12 +77,30 @@ target. Raven changes now live on branch `single-sm-tx-bench`
 (Raven-Firmware.single-sm-tx-bench, commit 825d829a); main is clean.
 Logic2 DME decoder being built by a subagent (tools/logic2-dme-decoder).
 
+## RX fixes implemented (branch ca183707) — PARTIAL bench success
+
+Both fixes built + flashed: (1) PIO margin patches (found_low +1cy,
+mid-bit sample 56ns; certified rx_fix.rs battery incl. 133MHz) and
+(2) BitRealigner software re-frame in RXProcessor (J-H-H prefix lock at
+any bit offset; validated reframe_proto.rs; replaces the all-data batch
+path — perf note for Christian). MILESTONE: board -1 now decodes the
+K2L's 926-byte frames WITH VALID CRC (first cross-clock accept ever on
+this bench). STILL FAILING: peer pneumatics NS frames — RX captures ONLY
+the trailing R symbol (wire Saleae-verified perfect). Learned the hard
+way: retiming the startup foundit_next_high path ([7][7]->[9][9], which
+the 133MHz battery wanted) makes hardware MISS whole frames — the
+input-sync delay shifts scan-branch decisions a whole cycle vs the
+emulator; reverted. Suspect the remaining mode is the startup scan vs
+the pneumatics TX frame lead-in (DE-assert timing / first-transition
+shape differs from K2L) under sync timing the emulator doesn't model.
+
 ## Next
 
-1. Fix design for RX: (a) resample/vote or retimed sampling offsets in
-   the PIO program (superopt objective: max edge distance across phases,
-   certify with wave_replay + aperture Monte Carlo), (b) software
-   re-frame in RXProcessor as belt-and-suspenders. User/Christian call.
-2. Narrowing engine (own evaluator w/ sub-cycle phase + aperture
-   modeling) — tx_a optimality, then phase-invariant RX as flagship.
-3. Paused: SMT len-4 probe, compress2, len-5 fleet (benchmark tier).
+1. Model the 2-FF input-sync DELAY (not just aperture) in the replay
+   harness; replay the real NS capture with RX state carried across
+   repeated frames (bench does frame-after-frame; replay was fresh-boot).
+   Find why the scan misses pneumatics frames but not K2L frames.
+2. Then: bench green -> single-SM TX ping-through finale.
+3. Narrowing engine (evaluator MUST model sync delay + aperture — now
+   proven load-bearing); tx_a optimality, phase-invariant RX flagship.
+4. Paused: SMT len-4 probe, compress2, len-5 fleet (benchmark tier).
