@@ -61,12 +61,28 @@ bringup by 2 days — R6-1 only ever ran post-bump code. v0.1.3 worktree
 staged at /tmp/claude-1000/rf-v013 (submodules cloned) for a released-
 firmware A/B if needed. K2L PLCA config unchecked.
 
+## RX MECHANISM REPRODUCED (waveform replay, 725ff8b)
+
+pio_harness/tests/wave_replay.rs replays the real Saleae capture through
+the emulated slow RX. Ideal sampling: decodes perfectly at EVERY phase.
+With a 1.5ns sync-FF aperture model (edges near sample instants resolve
+randomly): 10/16 phases corrupt every frame — only ~2.5ns clean window
+per 8ns cycle. Explains everything: ~1ppm-matched bench boards PARK at
+one phase for seconds (bad phase = dead link, our bench); same-clock
+echo parks at a good phase (works); production 150/125 grid mismatch +
+clkdiv-1.2 TX jitter smears each frame across phases (mostly-good +
+retries = "fairly reliable"). Fix spec is now QUANTITATIVE: maximize
+sampling distance from expected edges, phase-invariant — prime superopt
+target. Raven changes now live on branch `single-sm-tx-bench`
+(Raven-Firmware.single-sm-tx-bench, commit 825d829a); main is clean.
+Logic2 DME decoder being built by a subagent (tools/logic2-dme-decoder).
+
 ## Next
 
-1. Waveform replay: feed real Saleae edge lists into the emulated RX as
-   pin stimulus, sweep sub-cycle phase — deterministic, fully visible
-   reproduction of both failure modes. Then fix (PIO startup surgery
-   and/or software re-frame in RXProcessor) with user/Christian buy-in.
-2. Narrowing engine (own evaluator w/ sub-cycle phase modeling) — tx_a
-   optimality, then phase-invariant RX resynthesis as flagship.
+1. Fix design for RX: (a) resample/vote or retimed sampling offsets in
+   the PIO program (superopt objective: max edge distance across phases,
+   certify with wave_replay + aperture Monte Carlo), (b) software
+   re-frame in RXProcessor as belt-and-suspenders. User/Christian call.
+2. Narrowing engine (own evaluator w/ sub-cycle phase + aperture
+   modeling) — tx_a optimality, then phase-invariant RX as flagship.
 3. Paused: SMT len-4 probe, compress2, len-5 fleet (benchmark tier).
