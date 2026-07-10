@@ -21,11 +21,14 @@ IRQ freed, TX PIO 31→27. Proof: `pio_harness/tests/tx_single_sm.rs` —
 DE cycle-exact, DI edge-identical (constant 3-cycle lead), both clkdivs,
 multi-frame parking; shipped RX round-trips all 16 data codes.
 
-**Hardware next (user)**: Raven-Firmware.main has UNCOMMITTED changes —
-rs485-eth feature `single-sm-tx` + refreshed rs485_eth_test HIL firmware
-(both variants build). Flash `--features single-sm-tx`, ping over the rig
-vs known-good RX. If DI is dead on hardware, suspect pad input-enable on
-the DI pin (mov ~pins readback) — emulator models no sync latency.
+**Hardware next (user)**: bench = 2x pneumatics R6-1 boards (RP2354A,
+RS485 GP18-21) wired together. Raven-Firmware.main has UNCOMMITTED
+changes — rs485-eth feature `single-sm-tx`; rs485_eth_test refreshed
+(current APIs, `board-pneumatics-r6-1` pins, `pinger` = ff02::1 echo
+loop, MAC from OTP chipid so two boards don't collide). Baseline
+stock+pinger vs stock first, then swap responder to single-sm-tx. If DI
+is dead on hardware, suspect pad input-enable on the DI pin (mov ~pins
+readback) — emulator models no sync latency.
 
 ## Narrowing engine (planned third engine, not started)
 
