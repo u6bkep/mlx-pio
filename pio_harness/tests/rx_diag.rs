@@ -200,7 +200,10 @@ fn decode_sym(v: u8) -> &'static str {
     }
 }
 
-fn reframe_and_decode(rx_syms: &[u8]) -> Vec<&'static str> {
+/// Re-frame across all 5 bit offsets; returns (chosen_offset, labels).
+/// Offset 0 = the alignment the FIRMWARE decoder assumes (it never
+/// re-frames); any other offset means the firmware would see garbage.
+fn reframe_and_decode(rx_syms: &[u8]) -> (usize, Vec<&'static str>) {
     let mut bits = Vec::new();
     for &s in rx_syms {
         for i in (0..5).rev() {
@@ -214,18 +217,18 @@ fn reframe_and_decode(rx_syms: &[u8]) -> Vec<&'static str> {
             .map(|c| c.iter().enumerate().fold(0u8, |a, (i, &b)| a | (b << (4 - i))))
             .collect()
     };
-    let mut best: (usize, Vec<&str>) = (0, Vec::new());
+    let mut best: (usize, usize, Vec<&'static str>) = (0, 0, Vec::new());
     for off in 0..5 {
-        let labels: Vec<&str> = group(off).iter().map(|&c| decode_sym(c)).collect();
+        let labels: Vec<&'static str> = group(off).iter().map(|&c| decode_sym(c)).collect();
         if let Some(p) = labels.iter().position(|&l| l == "K") {
             let after = &labels[p + 1..];
             let known = after.iter().take_while(|&&l| l != "?").count();
-            if known > best.0 {
-                best = (known, after.to_vec());
+            if known > best.1 {
+                best = (off, known, after.to_vec());
             }
         }
     }
-    best.1
+    (best.0, best.2)
 }
 
 /// One round trip; TX runs at (tx_int, tx_frac)·(base), the tx_a toggler
@@ -240,7 +243,7 @@ fn trial2(
     rx_int: u16,
     rx_frac: u8,
     rx_delay: u64,
-) -> (usize, usize) {
+) -> (usize, usize, usize) {
     let (mut tx_a, mut tx_b) = build_pair(1, 0);
     // Override divisors: tx_b encoder base is 1.0 at "125MHz"; scale.
     tx_b.clkdiv(tx_int, tx_frac);
@@ -279,31 +282,34 @@ fn trial2(
             syms.push((w & 0x1F) as u8);
         }
     }
-    let decoded = reframe_and_decode(&syms);
+    let (offset, decoded) = reframe_and_decode(&syms);
     let matched = decoded
         .iter()
         .zip(&sent)
         .filter(|(a, b)| a == b)
         .count();
-    (matched, sent.len())
+    (matched, sent.len(), offset)
 }
 
 #[test]
 fn rx_phase_margin_sweep() {
     println!("== RX enable-delay sweep, exact rate lock (TX=RX=10.0) ==");
+    println!("   offset != 0 means the firmware decoder (which never re-frames) sees garbage");
     for d in 0..10u64 {
-        let (m, t) = trial2(10, 0, 10, 10, 0, d * 10);
-        println!("  rx_delay={d}: {m}/{t} data codes");
+        let (m, t, off) = trial2(10, 0, 10, 10, 0, d * 10);
+        let fw = if off == 0 { "FW-OK" } else { "FW-GARBAGE" };
+        println!("  rx_delay={d}: {m}/{t} data codes at bit-offset {off}  [{fw}]");
     }
     println!("== relative rate sweep: RX clkdiv 10+f/256 vs TX 10.0 ==");
-    println!("   (f=1 -> 390ppm, f=2 -> 780ppm, f=4 -> 1560ppm, f=8 -> 3125ppm)");
     for f in [1u8, 2, 4, 8] {
-        let (m, t) = trial2(10, 0, 10, 10, f, 0);
-        println!("  rx slower by {f}/2560: {m}/{t} data codes");
+        let (m, t, off) = trial2(10, 0, 10, 10, f, 0);
+        let fw = if off == 0 { "FW-OK" } else { "FW-GARBAGE" };
+        println!("  rx slower by {f}/2560: {m}/{t} at bit-offset {off}  [{fw}]");
     }
     println!("== reverse: TX 10+f/256, RX 10.0 ==");
     for f in [1u8, 2, 4, 8] {
-        let (m, t) = trial2(10, f, 10, 10, 0, 0);
-        println!("  tx slower by {f}/2560: {m}/{t} data codes");
+        let (m, t, off) = trial2(10, f, 10, 10, 0, 0);
+        let fw = if off == 0 { "FW-OK" } else { "FW-GARBAGE" };
+        println!("  tx slower by {f}/2560: {m}/{t} at bit-offset {off}  [{fw}]");
     }
 }

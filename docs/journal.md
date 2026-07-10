@@ -4,6 +4,51 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-10 (eve) — Bench session: single-SM TX hardware-validated; shipped RX bit-alignment bug root-caused
+
+Bench = 2x pneumatics R6-1 (RP2354A), multiprobe `2e8a:000c-{0,1}:
+E66368254F694937:0` (trailing :0 mandatory or probe-rs says "no probes").
+Debug chronology, kept for method value:
+
+1. Baseline (stock TX both boards) FAILED: 0 ping replies. Not our bug —
+   single-SM was never flashed. Fixed two real test-firmware issues en
+   route: embassy-default 150 MHz (product REQUIRES 125; at 150 the RX is
+   completely dead — no RX-S DMA activity even for own echo) and
+   identical MACs (fixed seed 0x1234_5678_9ABC_DEF0 → both boards same
+   link-local; now OTP-chipid-derived).
+2. At 125 MHz: RX pipeline alive; own echo decodes (MAC-matched, silently
+   dropped by design — the discard_frame path is the ONLY fully silent
+   one, everything else warns/counts). Cross-board: 100% loss, both
+   directions, `rx_runts` ticking.
+3. Saleae Logic Pro 8 on the bus (automation API :10430, scripts in
+   session scratchpad): WIRE IS PERFECT. J J H H + scrambled payload +
+   T R decode flawlessly at 500 MS/s; 40/80ns runs clean; both boards'
+   crystals within ~1-25 ppm (baud from edge sums, ppm-level).
+4. Emulator sweeps (rx_diag.rs): all whole-cycle phases and realistic ppm
+   offsets decode 16/16 — but ONLY with the test helper's re-framing.
+   Strict alignment check: emulator slow-RX delivers bit-offset 3 at
+   EVERY phase; bench delivers offset 0 for own-echo, offset 1 cross.
+   The -1 dump `01 12 02` = wire's `00011 00100 00100` with ONE extra
+   bit prepended — bits perfect, grouping off by one, whole frame
+   garbage since RXProcessor never re-frames. drift-cluster prediction
+   (phase parks ~8s/cell at 1ppm) FALSIFIED by 6-min 0-reply run —
+   consistent with alignment (not sampling margin) being the failure.
+   Slow-variant startup paths also mistimed vs fast (1.6 vs 2.0 bit
+   skips). PRODUCT IMPLICATION: pneumatics<->pneumatics rs485-eth cannot
+   work; main<->pneumatics may be phase-lucky. Needs Christian/user
+   disposition.
+5. Single-SM TX verdict WITHOUT working RX: the Saleae is the oracle.
+   Flashed single-sm-tx on -0; captured 3 NS frames at 3.000s cadence;
+   structurally identical to stock capture (J J H H, clean runs, T R,
+   990 bits, 12.5 MBd). mov pins,!pins pin-as-state toggling CONFIRMED
+   on real silicon. Combined with emulator equivalence (incl. new 125MHz
+   + slow-RX round trips, commit 4f2e195): single-SM TX is validated;
+   ping-through blocked only by the pre-existing RX bug.
+
+Also: slow RX variant is 31 instructions (dme_pio.rs "32" comment stale).
+Harness lesson reinforced: tolerant test decoders hide alignment bugs —
+rx_diag.rs now reports the raw bit offset (FW-GARBAGE marker).
+
 ## 2026-07-10 — Project pivot to the real firmware TX; single-SM TX transform certified in emulator + firmware built
 
 Two things happened. First, direction discussion: the shard-search-playground
