@@ -49,13 +49,24 @@ to certify it — narrowing-engine evaluator requirement).
   127.0.0.1:10430 (MCP on 10530 needs session restart), scripts in
   session scratchpad (saleae_cap/analyze/baud.py — DME wire decoder).
 
+## RX bug refinement (2026-07-10 night, K2L on bus)
+
+K2L (enp8s0u1u1u3u3) decodes board TX perfectly; boards fail against the
+K2L too. Production clock pairing (150<->125) reproduced on bench: still
+0 valid frames. New failure mode vs K2L: full 926-byte assemblies failing
+only CRC — alignment CAN lock; residual = mid-frame bit errors. So the
+RX bug is >=2-factor (phase-dependent alignment + mid-frame corruption).
+Timeline: embassy bump (51dff4da, not in any release) precedes R6-1
+bringup by 2 days — R6-1 only ever ran post-bump code. v0.1.3 worktree
+staged at /tmp/claude-1000/rf-v013 (submodules cloned) for a released-
+firmware A/B if needed. K2L PLCA config unchecked.
+
 ## Next
 
-1. Discuss with user/Christian: RX bug disposition (product impact?
-   main<->pneumatics may be phase-lucky or limping on retries).
-2. RX re-frame fix (software) to get bench pings green, then single-SM
-   TX ping-through as icing.
-3. Narrowing engine (bit-field needed-narrowing, own evaluator w/
-   sub-cycle phase modeling) — first targets tx_a optimality, then the
-   phase-invariant RX resynthesis.
-4. Paused: SMT len-4 probe, compress2, len-5 fleet (benchmark tier).
+1. Waveform replay: feed real Saleae edge lists into the emulated RX as
+   pin stimulus, sweep sub-cycle phase — deterministic, fully visible
+   reproduction of both failure modes. Then fix (PIO startup surgery
+   and/or software re-frame in RXProcessor) with user/Christian buy-in.
+2. Narrowing engine (own evaluator w/ sub-cycle phase modeling) — tx_a
+   optimality, then phase-invariant RX resynthesis as flagship.
+3. Paused: SMT len-4 probe, compress2, len-5 fleet (benchmark tier).

@@ -4,6 +4,43 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-10 (night) — Survey vs production + K2L cross-check: RX bug refined, embassy-bump timeline, jitter direction tested
+
+User challenged "production works reliably" vs our 100%-fail bench. Survey:
+- crates/main runs embassy-DEFAULT **150 MHz** (system_freq commented out);
+  only pneumatics pins 125. Production always pairs 150(fast RX, 1.2
+  jittered TX) <-> 125(slow RX, 1.0 clean TX). All validated combos ever
+  were cross-grid (also RP2040@125 <-> K2L in the Jan HIL report).
+- No caller-side fixes missing: no sync-bypass/pad conditioning anywhere;
+  raven-net sits above link decode.
+- Timeline: embassy fork bump to upstream (51dff4da, 2026-04-07) is NOT
+  in any release; R6-1 bringup (pneumatics-rp2350, the "requires 125 MHz"
+  note) landed 2026-04-09 ON TOP of it — R6-1 only ever ran post-bump
+  code, and no release tag contains R6-1 support. v0.1.3 worktree +
+  submodules staged at /tmp/claude-1000/rf-v013 (unused so far).
+- Bringup notes (Orbiter-Ultra-Hardware .../r6-1-firmware-bringup-notes.md)
+  are pinout-only, no RS485 war story.
+
+K2L USB 10BASE-T1S adapter added to the bus (enp8s0u1u1u3u3) = compliant
+third-party referee + tshark visibility:
+- K2L decodes the boards' stock TX PERFECTLY (clean NS frames at 3s
+  cadence in tshark). TX fully exonerated again.
+- Host->board ping: 100% loss; boards receive K2L frames as runts/CRC
+  errors. Board RX fails against a real PHY too.
+- Production clock pairing reproduced on bench (150 stock <-> 125 stock):
+  STILL 0 valid frames. Clock config is not the masking factor.
+- Jittered-TX direction (150/1.2 pinger -> 125 slow RX): runts + a
+  KEY new failure mode: TWO full-length **926-byte assemblies failing
+  only CRC** (the host's UDP spam) — alignment was CORRECT for those
+  frames (misalignment dies in runts within symbols), so slow-RX CAN
+  lock right vs the K2L; the residual is bit error(s) mid-frame. RX bug
+  is at least two-factor: phase-dependent alignment AND occasional
+  mid-frame corruption.
+Open: K2L PLCA/beacon config unknown (could pollute the bus — check
+raven_net_tests host setup); next move = replay real Saleae edge lists
+through the emulated RX as pin stimulus (sub-cycle phase sweep, full
+visibility) instead of more bench poking.
+
 ## 2026-07-10 (eve) — Bench session: single-SM TX hardware-validated; shipped RX bit-alignment bug root-caused
 
 Bench = 2x pneumatics R6-1 (RP2354A), multiprobe `2e8a:000c-{0,1}:
