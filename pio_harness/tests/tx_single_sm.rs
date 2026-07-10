@@ -340,6 +340,14 @@ fn single_sm_matches_pair_133mhz() {
     compare_at(16, "133MHz clkdiv 1.0625");
 }
 
+#[test]
+fn single_sm_matches_pair_125mhz() {
+    // The DEPLOYED config: the product firmware pins clk_sys to 125 MHz
+    // ("RS485 Ethernet driver requires 125 MHz system clock").
+    // (125e6/10)/12.5e6 = 1.0 exactly -> int 1, frac 0.
+    compare_at(0, "125MHz clkdiv 1.0");
+}
+
 // ---------------------------------------------------------------------
 // Round-trip: single-SM TX -> shipped RX decoder (fast/RP2350 variant),
 // same emulator, DI is the wire. Mirrors round_trip.rs::clean_round_trip
@@ -461,6 +469,194 @@ fn reframe_and_decode(rx_syms: &[u8]) -> Vec<&'static str> {
         }
     }
     best.1
+}
+
+/// Slow (RP2040-class / 125-133 MHz) RX variant from dme_pio.rs — the
+/// variant the DEPLOYED 125 MHz config actually selects.
+fn build_rx_slow(emu: std::rc::Rc<std::cell::RefCell<rp2350_emu::Emulator>>, block: usize) -> Pio {
+    let prog = pio::pio_asm!(
+        "wait_for_low_stall:
+             nop
+         wait_for_low:
+         loop:
+             jmp pin loop1
+             jmp found_low
+         loop1:
+             jmp pin loop2
+             jmp found_low
+         loop2:
+             jmp pin loop3
+             jmp found_low
+         loop3:
+             jmp pin loop4
+             jmp found_low
+         loop4:
+             jmp pin loop5
+             jmp found_low
+         loop5:
+             jmp pin low_wait_timeout [1]
+         found_low:
+             in x 1
+             set x 1 [1]
+             jmp pin wait_for_low_stall
+         .wrap_target
+         wait_for_high:
+             wait 1 pin 0
+             mov x ~ x
+             in x 1
+             set x 0 [2]
+             jmp pin wait_for_low
+         .wrap
+         low_wait_timeout:
+             mov isr osr
+             push
+             irq set 0
+         startup_search_high_cont:
+             wait 0 pin 0 [5]
+         startup_search_low:
+             jmp pin startup_foundit_next_low [2]
+             wait 1 pin 0 [5]
+         startup_search_high:
+             jmp pin startup_search_high_cont [2]
+         startup_foundit_next_high:
+             set X 0 [7]
+             jmp wait_for_low_stall [7]
+         startup_foundit_next_low:
+             set X 1 [3]
+             jmp wait_for_high [7]"
+    );
+    let code: Vec<u16> = prog.program.code.iter().copied().collect();
+    // NB dme_pio.rs comments claim "32 instructions" for both RX variants;
+    // the slow variant actually assembles to 31 (the fast one is 32).
+    assert_eq!(code.len(), 31, "slow RX program is 31 instructions");
+
+    let mut rx = Pio::from_shared(emu, block, 0);
+    rx.load_at(0, &code, prog.program.wrap.target, prog.program.wrap.source);
+    rx.jmp_pin(DI);
+    rx.pinctrl(PinCtrl { in_base: DI, ..Default::default() });
+    rx.shiftctrl(ShiftCtrl {
+        autopush: true,
+        in_dir: ShiftDir::Left,
+        push_threshold: 5,
+        fjoin_rx: true,
+        ..Default::default()
+    });
+    rx.clkdiv(1, 0);
+    rx.exec(0xE03F); // set x, 1F
+    rx.exec(0xA0E1); // mov osr, x
+    rx
+}
+
+fn round_trip_with(mut tx: Pio, mut rx: Pio, label: &str) {
+    tx.enable();
+    rx.enable();
+
+    // Framed payload as in round_trip.rs::clean_round_trip: silence
+    // preamble, StartJ/StartK, 16 distinct data codes, EndT, silence.
+    let payload: &[(u32, &str)] = &[
+        (0x18, "J"), (0x11, "K"),
+        (0x1E, "0"), (0x09, "1"), (0x14, "2"), (0x15, "3"),
+        (0x0A, "4"), (0x0B, "5"), (0x0E, "6"), (0x0F, "7"),
+        (0x12, "8"), (0x13, "9"), (0x16, "A"), (0x17, "B"),
+        (0x1A, "C"), (0x1B, "D"), (0x1C, "E"), (0x1D, "F"),
+        (0x0D, "T"),
+    ];
+    let mut words = vec![0x1F1F_1F1Fu32, 0x1F1F_1F1F];
+    for &(c, _) in payload {
+        words.push(c);
+    }
+    words.push(0x1F1F_1F1F);
+
+    let mut i = 0;
+    let mut syms: Vec<u8> = Vec::new();
+    for _ in 0..9000 {
+        if i < words.len() && !tx.tx_full() {
+            tx.tx_push(words[i]);
+            i += 1;
+        }
+        tx.step();
+        if let Some(w) = rx.rx_pop() {
+            syms.push((w & 0x1F) as u8);
+        }
+    }
+    assert_eq!(i, words.len(), "[{label}] feed did not drain");
+
+    let decoded = reframe_and_decode(&syms);
+    let sent_data: Vec<&str> = payload
+        .iter()
+        .map(|&(_, l)| l)
+        .filter(|&l| l != "J" && l != "K" && l != "T")
+        .collect();
+    let got_data: Vec<&str> = decoded.iter().copied().take(sent_data.len()).collect();
+    println!("[{label}] sent data : {:?}", sent_data);
+    println!("[{label}] got  data : {:?}", got_data);
+    assert_eq!(
+        got_data, sent_data,
+        "[{label}] shipped RX did not recover the 16 data codes from the single-SM TX"
+    );
+}
+
+/// Deployed config: 125 MHz sys clock -> TX clkdiv exactly 1.0, slow RX.
+#[test]
+fn single_sm_round_trip_slow_rx_125mhz() {
+    let tx = build_single(0);
+    let rx = build_rx_slow(tx.emulator(), 1);
+    round_trip_with(tx, rx, "125MHz/slow-RX");
+}
+
+/// Also pin the BASELINE at the deployed config: the two-SM pair through
+/// the slow RX. If this fails, the emulator disagrees with the bench
+/// about the deployed configuration itself.
+#[test]
+fn pair_round_trip_slow_rx_125mhz() {
+    let (tx_a, mut tx_b) = build_pair(0);
+    let rx = build_rx_slow(tx_a.emulator(), 1);
+    // round_trip_with drives stepping through the tx handle; for the pair
+    // the shared emulator is stepped via tx_a, FIFO fed via tx_b.
+    let mut tx_a = tx_a;
+    tx_a.enable();
+    tx_b.enable();
+    let mut rx = rx;
+    rx.enable();
+
+    let payload: &[(u32, &str)] = &[
+        (0x18, "J"), (0x11, "K"),
+        (0x1E, "0"), (0x09, "1"), (0x14, "2"), (0x15, "3"),
+        (0x0A, "4"), (0x0B, "5"), (0x0E, "6"), (0x0F, "7"),
+        (0x12, "8"), (0x13, "9"), (0x16, "A"), (0x17, "B"),
+        (0x1A, "C"), (0x1B, "D"), (0x1C, "E"), (0x1D, "F"),
+        (0x0D, "T"),
+    ];
+    let mut words = vec![0x1F1F_1F1Fu32, 0x1F1F_1F1F];
+    for &(c, _) in payload {
+        words.push(c);
+    }
+    words.push(0x1F1F_1F1F);
+
+    let mut i = 0;
+    let mut syms: Vec<u8> = Vec::new();
+    for _ in 0..9000 {
+        if i < words.len() && !tx_b.tx_full() {
+            tx_b.tx_push(words[i]);
+            i += 1;
+        }
+        tx_a.step();
+        if let Some(w) = rx.rx_pop() {
+            syms.push((w & 0x1F) as u8);
+        }
+    }
+    assert_eq!(i, words.len(), "pair feed did not drain");
+
+    let decoded = reframe_and_decode(&syms);
+    let sent_data: Vec<&str> = payload
+        .iter()
+        .map(|&(_, l)| l)
+        .filter(|&l| l != "J" && l != "K" && l != "T")
+        .collect();
+    let got_data: Vec<&str> = decoded.iter().copied().take(sent_data.len()).collect();
+    println!("[pair/125MHz] sent: {:?}", sent_data);
+    println!("[pair/125MHz] got : {:?}", got_data);
+    assert_eq!(got_data, sent_data, "pair TX through slow RX failed at 125MHz");
 }
 
 #[test]
