@@ -1,0 +1,3 @@
+# Offline validator / decoder dependencies (Logic 2 supplies its own runtime
+# for the HLA itself, which needs no third-party packages).
+pytest>=7

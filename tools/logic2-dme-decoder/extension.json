@@ -1,0 +1,13 @@
+{
+  "version": "0.1.0",
+  "apiVersion": "1.0.0",
+  "author": "Raven firmware team",
+  "name": "RS485-ETH DME Decoder",
+  "description": "Decodes the rs485-eth 12.5 MBd biphase-mark / 4b5b / scrambled Ethernet frames (stacks on the built-in Manchester analyzer).",
+  "extensions": {
+    "RS485-ETH DME": {
+      "type": "HighLevelAnalyzer",
+      "entryPoint": "HighLevelAnalyzer.DmeAnalyzer"
+    }
+  }
+}
