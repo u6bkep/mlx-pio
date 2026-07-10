@@ -4,6 +4,54 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-10 — Project pivot to the real firmware TX; single-SM TX transform certified in emulator + firmware built
+
+Two things happened. First, direction discussion: the shard-search-playground
+reference (needed narrowing / superposed evaluation — lazy hole-forking,
+output-prefix pruning, consulted-set sharing) maps naturally onto PIO as a
+third engine: holes = instruction slots/fields, demand = fetch, prune = per-
+cycle pin-trace mismatch. Bit-level (fork on opcode/side-set/delay/operand
+FIELDS at the cycle each is semantically consulted) beats whole-instruction
+alphabets: side-set asserts on the first cycle even under stall, so for
+dense waveforms the trace nearly determines those bits before the rest of
+the instruction is ever forked. Decision: build our own demand-driven
+narrowing evaluator (SMT-mirror pattern: differentially fuzzed accelerator,
+emulator+certifier stay the soundness authority), NOT contort the vendored
+emulator. Engine not started yet.
+
+Second, target re-aim: the REAL rs485-eth firmware (copied to
+reference/rs485-eth) doesn't use our single-SM DME encoder at all. TX is a
+two-SM pair: tx_b (17 instr, sequencer, side-set=DE, fires IRQ 0 per DME
+transition) + tx_a (4 instr, IRQ→DI toggle; its jmp-PIN-on-DE makes IRQs
+while DE is low idempotent force-highs = parity absorber, parks DI high).
+The split exists ONLY because side-set can't XOR — and our compress track's
+`mov pins, !pins` pin-as-state discovery dissolves it. Hand transform:
+irq set 0 → mov pins ~pins (DI as OUT+IN pin), final parking irq →
+mov pins ~null (absolute high). 17 instr, one SM, IRQ gone, TX PIO 31→27.
+
+Certified in emulator (pio_harness/tests/tx_single_sm.rs): DE cycle-exact,
+DI edge-identical with constant 3-sys-cycle lead (tx_a's IRQ latency),
+both clkdivs (1+51/256 @150MHz exact-6-cycle half-bits; 1+16/256 @133MHz
+delta-sigma), multi-frame with silence gaps + parking; shipped 32-instr RX
+decodes all 16 data codes from the single-SM waveform (round-trip test).
+Gotcha logged: harness set_pin() is EXTERNAL stimulus and overrides PIO
+output in the GPIO merge — preset latches via exec'd mov, not set_pin.
+
+Hardware validation prepared in Raven-Firmware.main (UNCOMMITTED, user
+reviews/flashes): rs485-eth gets feature `single-sm-tx` (tx_a left unused);
+stale hil_testing/ethernet_tests/rs485_eth_test refreshed to current APIs
+(embassy path-deps — old crates-io pins silently missed the [patch] after
+the embassy bump and built TWO embassy copies; DMEPioHardware ctrl_dma/
+ts_pio_sm fields; StaticConfigV6::single; dma::Channel::new + DMA_IRQ_0
+bindings). Both variants release-build to thumbv8m ELFs. Plan: flash
+--features single-sm-tx TX against known-good RX on the rig, ping test.
+
+Scoreboard implication: DME single-SM results (≤4 impossible, 6-word
+champion) demote to benchmark suite; ≤4 proof also predates side-set
+enumeration. Next targets: tx_b-derived single-SM (17) compression, tx_a
+optimality as narrowing-engine validation, RX (32/32) flagship later.
+Single-SM-TX moonshot upgraded to "done pending hardware".
+
 ## 2026-07-06 (eve) — len-4 probe: full-free solves are the bottleneck; solver levers added (d22dad5)
 
 First len-4 full-free probe (all 64 program bits free): iter 1 solved in
