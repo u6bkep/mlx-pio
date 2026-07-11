@@ -21,34 +21,39 @@ PHANTOM — flash-timeline audit showed the revert never reached the
 board (cached-binary flash). ALWAYS verify `Compiling <crate>` in the
 flash log after a source edit.
 
-## Fix state (raven `single-sm-tx-bench` @ 5a06f0eb, both boards flashed)
+## RESOLVED: the ±20ns was the Saleae ground clip (user's call)
 
-Polarity-asymmetric retiming [4][1][9][4] (low-side test ~fall+80ns,
-high-side rise+40ns) + BitRealigner software re-frame: 7/7 sampled
-captures decode in the harness (3 bit-perfect, rest >97%) vs 0/7 for
-shipped AND the earlier aperture patch. Bench: board -1 went ~2 → 533
-CRC-valid frames/min; first-ever cross-board NS decode + NA reply.
-**Pings still red (0/71):** residual ~2% symbol errors (vanished
-one-sample pulses — unrecoverable by any retiming) → P(clean 86-byte
-frame) ≈ 0.98^172 ≈ 3%. Short frames (PTP 58B) decode often.
+Ground clip moved off the differential leg → residual skew ~±4-8ns,
+opposite sign, no vanishing pulses (lows 4-5/9-10, highs 5-6/10-11 at
+8ns; identical both boards; fixtures ro_sampled2_*). New timing
+**[3][4][4][4]** (raven @ 350ede86) selected by the harness: bit-perfect
+on BOTH regimes' real captures, 156/160 over -12..+24ns synthetic duty
+× phase. Flashed on both boards.
 
-## The frontier: beat the 2% floor
+## Bench truth (2026-07-10 ~23:20)
 
-1. **Analog question (user hands):** is the ±20ns skew intrinsic to the
-   R6-1 (transceiver/RC on RO) or bench wiring (Saleae ground clip on
-   one differential leg; termination/bias)? Unclip/rewire and rerun
-   `ro_sampler` (2 min). If intrinsic, hardware ticket.
-2. **RX resynthesis (THE flagship superopt target, now with real spec):**
-   decode DME under {duty ±24ns, phase, aperture, vanished high pulses}.
-   Fixtures = `pio_harness/tests/data/ro_sampled_*` (real signals, both
-   boards) + `rx_bench_repro.rs` `distort()` model. Falling edges are
-   trustworthy (lows never vanish) — an edge-position decoder keyed on
-   falls may be phase/duty-invariant. Narrowing-engine evaluator must
-   model duty + vanishing pulses (aperture/sync-delay alone certified a
-   WRONG fix twice).
-3. Main firmware module is now on the bus (production 150MHz, PTP +
-   100ms telemetry) — realistic noise + a production peer to test
-   against; all its frames decode FCS-clean offline.
+- Both boards accept ~85-87% of the MAIN module's frames (production
+  150MHz TX, clkdiv-1.2 delta-sigma jitter smears phase per frame).
+- Parked-phase 125↔125 peer frames: ~10% decode at current (bad)
+  parking — NS→NA works BOTH directions but lossy; pings still red.
+  Mechanism: 1ppm-matched crystals park the sub-cycle phase; an 8ns
+  sample grid vs ±6ns residual duty leaves ~1-cycle margins at some
+  parkings. THIS is the resynthesis spec (below).
+- **Production main (shipped fast RX) answered 0 of ~70 NS from the
+  boards** — production firmware needs this fix class too (both RX
+  variants). Note: host-side tshark can NOT arbitrate the bus (lan865x
+  MAC-filters other nodes' multicast even in promiscuous mode).
+
+## The frontier: phase-invariant RX (flagship, spec now concrete)
+
+Decode DME on an 8ns grid under duty ±8ns (design for ±24) × all
+parked phases × aperture. Fixtures: ro_sampled_* (clip era, extreme),
+ro_sampled2_* (current), `distort()` + phase sweep in rx_bench_repro.rs.
+Ideas: falling-edge-keyed decoding (falls are the cleaner polarity),
+both-polarity redundant sampling, 2-SM oversampling. The narrowing
+evaluator MUST model duty + parking (aperture-only certified wrong
+fixes twice). Fast-RX (150MHz) variant needs the same treatment for
+production main.
 
 ## Single-SM TX — HARDWARE-VALIDATED (unchanged, 8b6755f/825d829a)
 
