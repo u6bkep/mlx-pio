@@ -1,0 +1,58 @@
+;;; runner.shard — validate the shard PIO emulator against the certified
+;;; vector set (docs/shard_vectors.jsonl, embedded as vectors_data.shard).
+;;;
+;;; Run:  eval direct shard_pio/runner.shard
+;;; Prints one "PASS name" / "FAIL name (N bad)" line per vector, then a
+;;; final "P passed, F failed (of 101)"; exit 0 iff all pass.
+
+(import "emulator.shard")
+(use (:: shard_pio emulator *))
+(import "vectors_data.shard")
+(use (:: shard_pio vectors_data *))
+
+(type World
+  (World Int))
+
+(extern write_line ((line (List Int)) (w World)) World)
+
+(extern exit ((code Int) (w World)) World)
+
+(fn digit ((d Int)) Int
+  (+ 48 d))
+
+;; render 0..999 as decimal bytes.
+(fn render3 ((n Int)) (List Int)
+  (if (lt n 10)
+    (Cons (digit n) Nil)
+    (if (lt n 100)
+      (Cons (digit (ediv n 10)) (Cons (digit (mod n 10)) Nil))
+      (Cons (digit (ediv n 100))
+        (Cons (digit (mod (ediv n 10) 10)) (Cons (digit (mod n 10)) Nil))))))
+
+(fn report ((w World) (pass Int) (fail Int) (total Int)) World
+  (let ((line (blist_app (render3 pass)
+                (blist_app " passed, "
+                  (blist_app (render3 fail)
+                    (blist_app " failed (of " (blist_app (render3 total) ")")))))))
+    (let ((w1 (write_line line w)))
+      (if (int_eq fail 0) (exit 0 w1) (exit 1 w1)))))
+
+(fn run_all ((vs (List Vec)) (w World) (pass Int) (fail Int) (total Int)) World
+  (measure (struct vs))
+  (match vs
+    (Nil (report w pass fail total))
+    ((Cons v t)
+      (let ((bad (run_vector v)))
+        (if (int_eq bad 0)
+          (run_all t (write_line (blist_app "PASS " (vec_name v)) w)
+            (+ pass 1) fail (+ total 1))
+          (run_all t
+            (write_line
+              (blist_app "FAIL "
+                (blist_app (vec_name v)
+                  (blist_app " (" (blist_app (render3 bad) " bad)"))))
+              w)
+            pass (+ fail 1) (+ total 1)))))))
+
+(fn main ((w World)) World
+  (run_all (vectors) w 0 0 0))
