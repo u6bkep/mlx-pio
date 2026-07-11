@@ -10,9 +10,10 @@ bench-certified). Trust chain position:
 
     shard twin ==vectors== Rust evaluator ==diff-fuzz== vendored emulator ==certified== hardware
 
-**Status: 101/101 vectors pass** (`eval direct`, ~0.5 s), and the sources go
-through the shard checker clean: type gate green, all recursive fns
-admitted via `(measure (struct …))` obligations, zero CANON advisories.
+**Status: 101/101 vectors pass** (~0.5 s), and the FULL closure (emulator +
+runner + all 101 embedded vectors) goes through the shard checker clean:
+type gate green, all recursive fns admitted via `(measure (struct …))`
+obligations, zero CANON advisories.
 The gate discriminates: a broad mutation (out_latch reset 0 instead of
 all-ones) fails 101/101; a subtle one (side-set suppressed under stall)
 fails exactly the 4 vectors that exercise it.
@@ -28,41 +29,40 @@ fails exactly the 4 vectors that exercise it.
 
 ## Running the gate
 
-Build the shard bootstrap once:
+Preferred: the compiled native engine `<shard>/bin/shard_eval` (built by
+`<shard>/bin/rebuild.sh`; the Rust bootstrap remains the soundness
+authority). Regenerate the embedded vectors if the jsonl changed, then run
+from this directory:
 
-    cargo build --release --manifest-path <shard>/rust_bootstrap/Cargo.toml
+    python3 tools/gen_vectors.py        # only when the jsonl changes
+    <shard>/bin/shard_eval run runner.shard
 
-Regenerate the embedded vectors (only needed when the jsonl changes):
-
-    python3 tools/gen_vectors.py
-
-Run the validation (from this directory; `eval direct` runs a narrow app's
-`main` on the bootstrap evaluator — fast path, no repo-root restriction):
+Expected tail: `101 passed, 0 failed (of 101)`, exit 0 (any FAIL ⇒ exit 1).
+Runs in well under a second. Fallback without the compiled engine
+(`cargo build --release --manifest-path <shard>/rust_bootstrap/Cargo.toml`):
 
     <shard>/rust_bootstrap/target/release/eval direct runner.shard
 
-Expected tail: `101 passed, 0 failed (of 101)`, exit 0 (any FAIL ⇒ exit 1).
-
 ## Running the checker (type gate + totality + CANON)
 
-The self-hosted checker requires its target to live under the shard repo
-root (module identity is repo-root-relative). Copy — do not touch the
-colleague's tree in place — the shard repo somewhere scratch, drop this
-directory in as `shard_pio/` (the name is load-bearing: the `(use (::
-shard_pio emulator *))` lines encode the module path), and check:
+The checker requires its target to live under the shard repo root (module
+identity is repo-root-relative). Copy — do not touch the colleague's tree
+in place — the shard repo somewhere scratch, drop this directory in as
+`shard_pio/` (the name is load-bearing: the `(use (:: shard_pio emulator
+*))` lines encode the module path), and check:
 
     cp -r <shard> /tmp/shard-check && cp -r <this dir> /tmp/shard-check/shard_pio
     cd /tmp/shard-check
-    rust_bootstrap/target/release/eval run kernel/check.shard shard_pio/runner.shard
+    bin/shard_eval run kernel/check.shard shard_pio/runner.shard
 
 Expected: `0 passed, 0 failed` (there are no claims yet — the value is the
 type/measure/CANON gates all being silent), with a `MEASURED … OK` line per
-recursive fn. Checking the full 101-vector `vectors_data.shard` is slow in
-the self-hosted tower (tens of minutes — 240 KB of list literals);
-substituting a 3-vector file (`python3 tools/gen_vectors.py <(head -3
-vectors/shard_vectors.jsonl) …/shard_pio/vectors_data.shard`) checks the
-whole closure in ~2.5 min. `emulator.shard` alone (the part with actual
-semantics) checks in ~1 min.
+recursive fn. Via the compiled engine the FULL 101-vector closure checks in
+~30 s (`emulator.shard` alone ~2 s). Through the Rust-bootstrap tower the
+240 KB data file takes tens of minutes; substituting a 3-vector file
+(`python3 tools/gen_vectors.py <(head -3 vectors/shard_vectors.jsonl)
+…/shard_pio/vectors_data.shard`) gets the whole closure through it in
+~2.5 min.
 
 ## Implementation notes (deviations are representational only)
 
@@ -90,14 +90,17 @@ semantics) checks in ~1 min.
   is `stim_values[min(i, len-1)]` (empty = 0); observation is
   `compose` + raw `dir_latch` on the capture pins, after the tick.
 
-## Spec gaps found while implementing (candidate amendments)
+## Spec gaps found while implementing
 
-1. **Driver layer is unspecified.** §3 defines the per-system-clock cycle
+(Reported upstream and ADOPTED — the driver contract landed in
+`docs/evaluator-spec.md` §9 on master, 8c9b1af. Kept here as the record of
+what the twin surfaced.)
+
+1. **Driver layer was unspecified.** §3 defines the per-system-clock cycle
    but the harness conventions the vectors depend on (FIFO pre-load vs
    streaming and its threshold-on-padded-length, autopull padding,
-   stim-value latching, capture-word encoding) live only in Rust
-   (`narrow_diff.rs` / `run_with_stim`). The spec could gain a §10
-   "driver/harness contract".
+   stim-value latching, capture-word encoding) lived only in Rust
+   (`narrow_diff.rs` / `run_with_stim`). Now spec §9.
 2. **Truncation masks are implicit.** OUT EXEC / MOV EXEC store
    `data as u16` (mask 0xFFFF), OUT PC / MOV PC mask to 0x1F — the spec
    says "pending_exec := data" / "PC (pc_set)" without stating the masks.
