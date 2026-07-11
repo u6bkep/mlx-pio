@@ -1,86 +1,60 @@
 # STATUS — current frontier
 
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
-> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-10 (late night).
+> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-11.
 
-## ROOT CAUSE FOUND: RX failure = receive-path duty-cycle distortion
+## Narrowing engine — UNDERWAY (evaluator v1 landed)
 
-`ro_sampler.rs` (raven branch, PIO1 raw-samples its own RO pin at
-125 Msps) proved the signal the RX SM sees is duty-distorted ~±20 ns
-(rising edges late; low runs 7-8/12-13 samples, high runs 1-3/7-8 —
-some high pulses shrink to ONE 8ns sample). The WIRE is pristine
-(Saleae + K2L + offline decoder all agree); the skew is in the R6-1
-transceiver-RO/pad path, identical on both bench boards. Feeding the
-sampled streams into the emulator reproduces the historic bench garbage
-(`01 12 02...`) exactly — mechanism closed. The earlier aperture story
-was a red herring for this failure; uniform sync delay provably cancels
-(`rx_bench_repro.rs`).
+`pio_superopt/src/narrow/` (4b9a364): our own forkable evaluator —
+flat Copy `NState` (~120B, fork checkpoint = memcpy), total bit-field
+decode, vendored-exact cycle semantics. Contract: `docs/
+evaluator-spec.md` (written to double as the shard twin's spec).
+Differential gate: `tests/narrow_diff.rs` — DME reference + ~2,500
+random programs (side-set configs, config genes, streaming, RX
+flavors, pin stimulus), byte-identical to `run::run`. 2.8x the fused
+vendored path. Contract facts the fuzz pinned: pin value latch idles
+ALL-ONES; osr_count resets 32. A sub-agent semantic review of
+narrow/mod.rs vs vendored sm.rs was launched 2026-07-11 — check its
+findings before building on edge-case semantics.
 
-Also: the "reverted [7][7] build still misses" observation was a
-PHANTOM — flash-timeline audit showed the revert never reached the
-board (cached-binary flash). ALWAYS verify `Compiling <crate>` in the
-flash log after a source edit.
+## Next: the narrowing layer itself
 
-## RESOLVED: the ±20ns was the Saleae ground clip (user's call)
+1. Hole representation + demand-driven forking at bit-field
+   granularity (side-set bits first, then opcode, operands lazily,
+   delay last); DFS + checkpoint prefix sharing (v1).
+2. Canonicalization fork-filters, from Christian's CANON.md
+   (`~/Documents/programmingSync/computer-whisperer/shard/docs/`):
+   P1 virtual registers (candidates over r0/r1, link-time binding
+   first-consulted→X, preloads are candidate holes and rename with the
+   binding), P2 canonical nop, P3 delay-normal form, P4 vacuous
+   control. Constraints: every rule LENGTH-NON-INCREASING on the
+   representative (else ≤N impossibility proofs die); leaf filters
+   only at fork time (sibling-content constraints stay out); license =
+   fuzz-certified. Gate: len≤2 exactness census (every behavior class
+   keeps exactly one representative) + per-rule differential fuzz.
+3. First target: tx_a (4-instr) optimality as validation. Flagship:
+   phase-invariant RX — the spec/oracle must quantify over duty skew
+   (±8ns measured, design ±24) and parked sub-cycle phase; battery =
+   pio_harness/tests/rx_bench_repro.rs + ro_sampled fixtures.
 
-Ground clip moved off the differential leg → residual skew ~±4-8ns,
-opposite sign, no vanishing pulses (lows 4-5/9-10, highs 5-6/10-11 at
-8ns; identical both boards; fixtures ro_sampled2_*). New timing
-**[3][4][4][4]** (raven @ 350ede86) selected by the harness: bit-perfect
-on BOTH regimes' real captures, 156/160 over -12..+24ns synthetic duty
-× phase. Flashed on both boards.
+## Shard prover track (ratified direction, not started)
 
-## Bench truth (2026-07-10 ~23:20)
+Shard PIO emulator implementing evaluator-spec.md (total step,
+first-order — good shard fit), diff-fuzzed three ways; then the prize:
+unbounded equality proof of shipped 2-SM TX pair ≡ our 1-SM TX
+(delayed bisimulation, constant 3-cycle DI lead). Christian's actual
+TX requirement (clarified 2026-07-11): implementations must MATCH —
+they do per emulator cert incl. parking (tx_a parks DI high; our
+mov pins,~null identical); the proof is what would fully convince.
 
-- Both boards accept ~85-87% of the MAIN module's frames (production
-  150MHz TX, clkdiv-1.2 delta-sigma jitter smears phase per frame).
-- Parked-phase 125↔125 peer frames: ~10% decode at current (bad)
-  parking — NS→NA works BOTH directions but lossy; pings still red.
-  Mechanism: 1ppm-matched crystals park the sub-cycle phase; an 8ns
-  sample grid vs ±6ns residual duty leaves ~1-cycle margins at some
-  parkings. THIS is the resynthesis spec (below).
-- **Production main (shipped fast RX) answered 0 of ~70 NS from the
-  boards** — production firmware needs this fix class too (both RX
-  variants). Note: host-side tshark can NOT arbitrate the bus (lan865x
-  MAC-filters other nodes' multicast even in promiscuous mode).
+## Bench (idle, carried from 2026-07-10)
 
-## The frontier: phase-invariant RX (flagship, spec now concrete)
+-0 pinger / -1 responder on [3][4][4][4] duty-robust RX, worktree
+Raven-Firmware.single-sm-tx-bench (branch UNPUSHED, @350ede86).
+Parked-phase 125↔125 margins = the phase-invariant RX spec; production
+main's shipped fast RX is deaf to boards (needs the fix class too).
+Hardware validation deferred until phase-invariant RX lands.
 
-Decode DME on an 8ns grid under duty ±8ns (design for ±24) × all
-parked phases × aperture. Fixtures: ro_sampled_* (clip era, extreme),
-ro_sampled2_* (current), `distort()` + phase sweep in rx_bench_repro.rs.
-Ideas: falling-edge-keyed decoding (falls are the cleaner polarity),
-both-polarity redundant sampling, 2-SM oversampling. The narrowing
-evaluator MUST model duty + parking (aperture-only certified wrong
-fixes twice). Fast-RX (150MHz) variant needs the same treatment for
-production main.
+## Paused
 
-## Single-SM TX — HARDWARE-VALIDATED (unchanged, 8b6755f/825d829a)
-
-17 instr, one SM, IRQ freed; emulator-certified vs shipped pair; Saleae
-wire captures structurally identical. Ping-through finale still blocked
-on RX (above).
-
-## Bench state (left running)
-
--0 = duty-robust pinger (PING_TARGET=-1's LL addr), -1 = duty-robust
-responder, both 125 MHz from worktree `Raven-Firmware.single-sm-tx-bench`
-(branch UNPUSHED). Probes `2e8a:000c-{0,1}:E66368254F694937:0`, one op
-at a time. `ro_sampler` diagnostic: `cargo run --bin ro_sampler`.
-Saleae automation on 127.0.0.1:10430; offline decoder
-`tools/logic2-dme-decoder/decode_csv.py` (FCS-validated).
-
-## Next (user decision 2026-07-10 close: exit the hardware rabbit hole)
-
-1. **Resume the optimizer: the needed-narrowing engine** (bit-field
-   search over 32x16 instruction space, own evaluator — see
-   [[narrowing-engine-design]] memory + docs/architecture.md). The
-   bench detour's payoff feeds straight in: the evaluator MUST model
-   duty skew and parked sub-cycle phase (aperture-only certified wrong
-   fixes twice), and `rx_bench_repro.rs` + ro_sampled fixtures are the
-   certification battery. Flagship objective: phase-invariant RX.
-2. Hardware validation DEFERRED: single-SM TX accepted as functionally
-   identical on wire evidence (emulator edge-identical + Saleae).
-   Ping-through demo + 1-vs-2-SM comparison waits until phase-invariant
-   RX makes clean N/N runs possible.
-3. Paused: SMT len-4 probe, compress2, len-5 fleet (benchmark tier).
+SMT len-4 probe, compress2, len-5 fleet (benchmark tier).

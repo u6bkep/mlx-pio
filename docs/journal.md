@@ -4,6 +4,53 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-11 — narrowing engine begins: forkable evaluator landed; CANON.md canonicalization plan
+
+Back on the optimizer per the 07-10 decision. Two threads:
+
+**Canonicalization (Christian's shard CANON.md, now at
+`~/Documents/programmingSync/computer-whisperer/shard/docs/CANON.md`).**
+Read in full — v1 (C1–C10 recognizer + rewriter + exactness census +
+content hash) is LANDED there, std at stage 2. Transfer analysis for
+PIO agreed with user: canonicalization is a multiplier ON TOP of
+narrowing (narrowing refutes duplicate spellings one waveform at a
+time; measured there: quotient turned an unfinishable depth-4 space
+into 4,095 steps). Adopted for our v1: fork-time leaf filters only
+(D17's placement taxonomy: sibling-content constraints stay OUT of
+generation), rules P1 register-canonicality / P2 canonical nop /
+P3 delay-normal form / P4 vacuous control; every rule must be
+LENGTH-NON-INCREASING on the representative or ≤N impossibility proofs
+die (their depth-budget caveat, load-bearing for us); license =
+fuzz-certified (no proof kernel here — weakest tier of CANON §6).
+Register symmetry lands as VIRTUAL REGISTERS (user's call): candidates
+written over r0/r1, deterministic link-time binding first-consulted→X,
+ARM-side preloads are candidate holes and rename with the binding —
+D16's "the freedom never exists". Exactness census at len≤2 is the
+rule-set gate. ALSO ratified direction: a shard PIO emulator +
+unbounded 2-SM-pair ≡ 1-SM-TX equality proof (delayed bisimulation,
+constant 3-cycle lead — the invariant shape our emulator cert already
+measured). Parking clarification: user misremembered the polarity
+claim; Christian's actual requirement is that the implementations
+MATCH (they do — parking covered by the emulator cert; shipped tx_a
+parks DI high via idempotent force-highs, our mov pins,~null is
+identical); a machine-checked proof is what would fully convince him.
+
+**Evaluator v1 landed (4b9a364, 573f7b3).** `pio_superopt/src/narrow/`:
+flat Copy NState (~120B — fork checkpoint = memcpy), total bit-field
+decode (pending_exec can carry arbitrary words; no IR round-trip),
+step() mirroring the vendored SM cycle ordering; `docs/
+evaluator-spec.md` is the state/step contract written to double as the
+shard twin's spec. Differential gate `tests/narrow_diff.rs`: DME
+reference + ~2,500 random programs across side-set configs, config
+genes, streaming, RX flavors (autopush thresholds × shift dirs × FIFO
+joins), and per-cycle pin stimulus — all byte-identical to run::run.
+The fuzz caught two contract facts now pinned in the spec: the pin
+VALUE latch idles ALL-ONES, and osr_count resets to 32 (OSR empty at
+reset — jmp !OSRE false, autopull fires on first OUT). Throughput
+2.8x the fused vendored path (fat-LTO) on the DME workload — but the
+structural win is the memcpy-able state the Bus-embedded vendored SM
+can never give. Sub-agent semantic review launched at session end.
+
 ## 2026-07-10 (post-midnight wrap) — ground clip was the monster; bench truth
 
 Continuation: user moved the Saleae ground clip off the differential leg
