@@ -25,6 +25,7 @@ pub mod fixtures;
 pub mod gene;
 pub mod gene_search;
 pub mod ir;
+pub mod narrow;
 pub mod problems;
 pub mod program;
 pub mod rng;
