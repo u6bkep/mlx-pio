@@ -142,6 +142,129 @@ fn random_programs_match_streaming() {
     }
 }
 
+/// Dump differential test vectors for the shard PIO emulator (the twin
+/// implementation of docs/evaluator-spec.md): one JSON object per line,
+/// each a fully-decoded config + program + stimulus + the certified
+/// per-cycle trace from the vendored emulator. A shard implementation
+/// replays these and must reproduce every trace byte-identically.
+/// Run with:
+/// `cargo test --release --test narrow_diff -- --ignored dump_shard_vectors --nocapture`
+#[test]
+#[ignore]
+fn dump_shard_vectors() {
+    use std::io::Write;
+    let out_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/shard_vectors.jsonl");
+    let mut f = std::io::BufWriter::new(std::fs::File::create(out_path).unwrap());
+
+    let mut emit = |name: &str, p: &Program, sp: &RunSpec, stim: &Stim| {
+        let trace = narrow::run_with_stim(p, sp, stim);
+        // The narrow path IS the certified one (differential gate above);
+        // sanity-pin the no-stim cases against the vendored path anyway.
+        if stim.mask == 0 {
+            assert_eq!(trace, run::run(p, sp), "{name}: vendored disagreement");
+        }
+        let cfg = narrow::NCfg::from_program(p, sp.sm as u8);
+        let row = serde_json::json!({
+            "name": name,
+            "code": cfg.code.to_vec(),
+            "wrap_bottom": cfg.wrap_bottom, "wrap_top": cfg.wrap_top,
+            "side_count": cfg.side_count, "side_en": cfg.side_en,
+            "side_pindir": cfg.side_pindir,
+            "jmp_pin": cfg.jmp_pin,
+            "in_base": cfg.in_base,
+            "out_base": cfg.out_base, "out_count": cfg.out_count,
+            "set_base": cfg.set_base, "set_count": cfg.set_count,
+            "sideset_base": cfg.sideset_base,
+            "autopush": cfg.autopush, "autopull": cfg.autopull,
+            "push_threshold": cfg.push_threshold,
+            "pull_threshold": cfg.pull_threshold,
+            "in_shift_right": cfg.in_shift_right,
+            "out_shift_right": cfg.out_shift_right,
+            "clkdiv_int": cfg.clkdiv_int, "clkdiv_frac": cfg.clkdiv_frac,
+            "sm_id": cfg.sm_id,
+            "tx_depth": cfg.tx_depth, "rx_depth": cfg.rx_depth,
+            // Driver-level spec: inputs are pre-loaded when <= 4 words,
+            // else streamed (refill-before-cycle); autopull_pad applied.
+            "inputs": sp.inputs.clone(),
+            "autopull_pad": if p.config.shift.autopull { sp.autopull_pad } else { 0 },
+            "output_pins": sp.output_pins.clone(),
+            "capture_pins": sp.capture_pins.clone(),
+            "cycles": sp.cycles,
+            "stim_mask": stim.mask,
+            "stim_values": stim.values.clone(),
+            "trace": trace,
+        });
+        writeln!(f, "{row}").unwrap();
+    };
+
+    // The DME reference — the one vector a human can eyeball.
+    emit("dme_reference", &dme_ref(DME_H).lower(), &dme_spec(278), &Stim::default());
+
+    // Random fleets from the same spaces the differential gate uses.
+    let no_stim = Stim::default();
+    let space = Space {
+        slots: 20,
+        side: SideCfg::NONE,
+        search_wrap: true,
+        genes: Genes { clkdiv: true, pull_threshold: true, out_dir: true, autopull: true },
+    };
+    let template = Program::empty(dme_cfg());
+    let sp = dme_spec(200);
+    let mut rng = Rng::new(0x5AAD_0001);
+    for i in 0..40 {
+        emit(&format!("plain_{i}"), &random_program(&template, &space, &mut rng), &sp, &no_stim);
+    }
+
+    let mut side_cfg = dme_cfg();
+    side_cfg.side = SideCfg { count: 2, en: true };
+    side_cfg.pins.sideset_base = 1;
+    let side_space =
+        Space { slots: 16, side: side_cfg.side, search_wrap: true, genes: Genes::default() };
+    let side_template = Program::empty(side_cfg);
+    let side_sp =
+        RunSpec { capture_pins: vec![0, 1, 2], output_pins: vec![0, 1, 2], ..dme_spec(200) };
+    for i in 0..30 {
+        emit(
+            &format!("sideset_{i}"),
+            &random_program(&side_template, &side_space, &mut rng),
+            &side_sp,
+            &no_stim,
+        );
+    }
+
+    let mut rx_cfg = dme_cfg();
+    rx_cfg.pins.in_base = 8;
+    rx_cfg.jmp_pin = 9;
+    rx_cfg.shift.autopush = true;
+    rx_cfg.shift.push_threshold = 5;
+    let rx_space = Space { slots: 16, side: SideCfg::NONE, search_wrap: true, genes: Genes::default() };
+    let rx_template = Program::empty(rx_cfg);
+    for i in 0..30 {
+        let p = random_program(&rx_template, &rx_space, &mut rng);
+        let mut values = Vec::with_capacity(300);
+        let mut cur = 0u32;
+        for c in 0..300usize {
+            if c % 3 == 0 {
+                cur = (rng.below(16) as u32) << 8;
+            }
+            values.push(cur);
+        }
+        let stim = Stim { mask: 0xF << 8, values };
+        let sp = RunSpec {
+            block: 0,
+            sm: 0,
+            inputs: pio_superopt::fixtures::dme_corpus(),
+            output_pins: vec![0, 1, 2],
+            capture_pins: vec![0, 1, 2, 8, 9],
+            cycles: 300,
+            autopull_pad: 0,
+        };
+        emit(&format!("stim_{i}"), &p, &sp, &stim);
+    }
+
+    println!("wrote {out_path}");
+}
+
 /// Throughput comparison, narrow vs vendored path, on the locked DME
 /// workload. Run with:
 /// `cargo test --release --test narrow_diff -- --ignored eval_throughput --nocapture`
