@@ -29,16 +29,23 @@
 //!   ever pushed — an exact one-cycle lookahead reusing `step` itself, so
 //!   champion sets are provably identical (the killed child would have
 //!   been refuted on this cycle before forking anything).
-//! - Canonicality filter P1-lite (OFF by default): register-symmetry
-//!   breaking — while no scratch register has been named, field values
-//!   whose only register is Y are pruned (the X-renamed twin lives in a
-//!   kept branch); `JMP X!=Y` names both at once (its own mirror). It is
-//!   a FLAG because X/Y renaming is NOT a true ISA symmetry: a
-//!   non-blocking or `if_empty` PULL on an empty TX FIFO loads X
-//!   specifically, so a pruned Y-first program containing such a PULL
-//!   has no behavioral twin in the kept branch. Enable only for spaces
-//!   where pull-on-empty is unreachable; the full P1 (virtual registers
-//!   with a link binding that models PULL's implicit X) replaces this.
+//! - Canonicality filter P1 (register symmetry, ALWAYS ON): while no
+//!   scratch register has been named and the binding is unbound, field
+//!   values whose only register is Y are pruned — the item then stands
+//!   for BOTH its words and their register-mirror (`JMP X!=Y` names both
+//!   at once, its own mirror). X/Y renaming is NOT a free ISA symmetry;
+//!   the two asymmetric channels (audited against `exec_op`, the only
+//!   two) are handled by a BINDING FORK at execution time:
+//!   1. PULL nonblocking / `if_empty` on an empty TX FIFO reads
+//!      physical X into OSR — distinguishes the twins iff x != y.
+//!   2. A `pending_exec` word (OUT/MOV EXEC) comes from DATA, which the
+//!      mirror does not rename, so an exec'd word touching any register
+//!      executes un-mirrored in both twins.
+//!   When such an event is about to execute on an Unbound item, the item
+//!   forks into an Identity child and a Mirrored child (x/y swapped;
+//!   champions materialize with register fields mirrored via
+//!   `mirror_word`). A champion still Unbound at the end covers its
+//!   mirror twin too (`Champion::binding_free`).
 //! - No memoization, plain DFS (checkpoint prefix sharing comes free:
 //!   children copy the parent's `NState` at the fork cycle).
 
@@ -65,10 +72,14 @@ pub struct EngineSpec {
     pub irq_sets: Vec<(u32, u8)>,
     /// Expected trace, one word per cycle.
     pub expected: Vec<u32>,
-    /// P1-lite register-symmetry pruning. UNSOUND when a non-blocking /
-    /// if_empty PULL can execute on an empty TX FIFO (see module docs);
-    /// leave off unless the space provably excludes that.
-    pub p1_register_symmetry: bool,
+    /// Pre-decided fields of the root item: `(slot, decided_mask,
+    /// value)` — constrained resynthesis (pin known scaffolding, search
+    /// the rest). A seed that names a register disables the P1
+    /// first-naming prune (the caller chose the spelling); NOTE that
+    /// champions may still be register-MIRRORS of the seed when a
+    /// binding fork executes — post-filter if the seed spelling is
+    /// load-bearing.
+    pub seed: Vec<(u8, u16, u16)>,
 }
 
 /// A surviving candidate subspace: decided fields plus don't-cares.
@@ -76,6 +87,10 @@ pub struct EngineSpec {
 pub struct Champion {
     pub decided: [u16; 32],
     pub value: [u16; 32],
+    /// True when no binding-asymmetric event executed on this item's
+    /// path: the register-mirror of this subspace (swap X/Y in every
+    /// decided field, `mirror_word`) reproduces the trace too.
+    pub binding_free: bool,
 }
 
 impl Champion {
@@ -112,8 +127,15 @@ struct Item {
     st: NState,
     cycle: u32,
     next_input: u32,
-    seen_x: bool,
-    seen_y: bool,
+    /// Any register-naming field decided yet? (Gates the P1 prune.)
+    named: bool,
+    /// True while no binding-asymmetric event has executed: the item
+    /// stands for both its words AND their register-mirror (whose true
+    /// machine state is the x/y-swap of this item's — equal until an
+    /// asymmetric event, which is exactly when this flag drops). The
+    /// binding fork turns the twin into its own ordinary item by
+    /// mirroring the decided words and swapping x/y.
+    unbound: bool,
 }
 
 /// A forkable bit-field of one slot: contiguous `mask`, candidate raw
@@ -374,6 +396,80 @@ fn side_value_consistent(
     true
 }
 
+/// Swap every X/Y register naming in a (possibly partially decided)
+/// word: JMP conds !X/X-- <-> !Y/Y--, IN/OUT/MOV/SET register codes
+/// 1 <-> 2. Undecided fields are 0 and map to 0. PUSH/PULL/WAIT/IRQ
+/// carry no register fields — PULL's implicit X read is physical and is
+/// handled by the binding fork at execution time, not by renaming.
+pub fn mirror_word(w: u16) -> u16 {
+    let swap12 = |v: u16| match v {
+        1 => 2,
+        2 => 1,
+        v => v,
+    };
+    match (w >> 13) & 0x7 {
+        0 => {
+            let cond = match (w >> 5) & 0x7 {
+                1 => 3,
+                3 => 1,
+                2 => 4,
+                4 => 2,
+                c => c,
+            };
+            (w & !(0x7 << 5)) | (cond << 5)
+        }
+        2 | 3 | 7 => (w & !(0x7 << 5)) | (swap12((w >> 5) & 0x7) << 5),
+        5 => {
+            let dst = swap12((w >> 5) & 0x7);
+            let src = swap12(w & 0x7);
+            (w & !((0x7 << 5) | 0x7)) | (dst << 5) | src
+        }
+        _ => w,
+    }
+}
+
+/// Does executing this concrete word consult or write a physical
+/// scratch register (including PULL's implicit X read on an empty TX
+/// FIFO)? Used for `pending_exec` words: they come from DATA, are not
+/// renamed by the mirror, and so distinguish the two bindings whenever
+/// they touch a register (writes diverge even at x == y — an exec'd
+/// `SET Y, n` writes physical Y in BOTH twins).
+fn word_touches_regs(w: u16) -> bool {
+    let f = (w >> 5) & 0x7;
+    match (w >> 13) & 0x7 {
+        0 => matches!(f, 1..=5),
+        2 | 3 | 7 => f == 1 || f == 2,
+        5 => f == 1 || f == 2 || (w & 0x7) == 1 || (w & 0x7) == 2,
+        4 => (w >> 7) & 1 != 0, // any PULL may read X when TX is empty
+        _ => false,
+    }
+}
+
+/// Is this word a PULL that READS X this cycle (nonblocking or if_empty
+/// variant executing on an empty TX FIFO)? The one binding-asymmetric
+/// instruction reachable from CODE (register fields there are virtual);
+/// it distinguishes the twins iff x != y at execution.
+fn is_pull_empty_read(w: u16, st: &NState) -> bool {
+    if (w >> 13) & 0x7 != 4 || (w >> 7) & 1 == 0 {
+        return false;
+    }
+    let if_empty = (w >> 6) & 1 != 0;
+    let block = (w >> 5) & 1 != 0;
+    st.tx.is_empty() && (if_empty || !block)
+}
+
+/// Would the next `step` EXECUTE an instruction (fetched or pending)?
+/// Like `will_fetch` but pending_exec counts as execution.
+fn will_execute(st: &NState, cfg: &NCfg, gpio_in: u32) -> bool {
+    if st.delay_count > 0 {
+        return false;
+    }
+    if st.stall != Stall::None && still_stalled(st, cfg, gpio_in) {
+        return false;
+    }
+    true
+}
+
 /// Does this (fully fetch-decided) word write a pin latch when it
 /// executes? SET/OUT to PINS or PINDIRS, MOV to PINS or PINDIRS. These
 /// are the only instructions whose OPERAND value can change the current
@@ -432,12 +528,22 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
         st: NState::new(&spec.cfg),
         cycle: 0,
         next_input: 0,
-        seen_x: false,
-        seen_y: false,
+        named: false,
+        unbound: true,
     };
     for s in spec.slots as usize..32 {
         root.decided[s] = 0xFFFF;
         root.value[s] = nop_word;
+    }
+    for &(s, d, v) in &spec.seed {
+        root.decided[s as usize] |= d;
+        root.value[s as usize] |= v & d;
+        // A register-naming seed fixes the spelling by caller fiat; an
+        // opcode-incomplete seed is treated conservatively the same way
+        // (disabling the P1 prune is always sound, only less pruned).
+        if d & 0xE000 != 0xE000 || word_touches_regs(v) {
+            root.named = true;
+        }
     }
     for &p in &spec.output_pins {
         root.st.dir_latch |= 1u32 << p;
@@ -523,9 +629,14 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                             continue;
                         }
                         let (nx, ny) = names_regs(field.kind, raw);
-                        // P1-lite: first named scratch register must be X
-                        // (or both at once, the self-mirror X!=Y).
-                        if spec.p1_register_symmetry && !it.seen_x && !it.seen_y && ny && !nx {
+                        // P1: while unbound and unnamed, the first named
+                        // scratch register must be X (or both at once,
+                        // the self-mirror X!=Y) — the Y-first spelling is
+                        // this item's mirror twin, which the item itself
+                        // stands for until a binding fork. After a fork
+                        // the item represents ONE concrete program, so
+                        // both spellings must be enumerated.
+                        if !it.named && it.unbound && ny && !nx {
                             continue;
                         }
                         // Pin-write pre-filter, an exact one-cycle
@@ -560,9 +671,53 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                         let mut child = it;
                         child.decided[fetch_pc] |= field.mask;
                         child.value[fetch_pc] |= v;
-                        child.seen_x |= nx;
-                        child.seen_y |= ny;
+                        child.named |= nx | ny;
                         stack.push(child);
+                        stats.forks += 1;
+                    }
+                    continue 'items;
+                }
+            }
+
+            // Binding demand: an unbound item and its mirror twin
+            // diverge the moment an asymmetric event executes — PULL's
+            // implicit physical-X read with x != y, or a pending_exec
+            // word (data is not mirror-renamed) touching any register.
+            // Fork: one child keeps the words as spelled; the other
+            // BECOMES the twin as an ordinary concrete item — decided
+            // searched slots mirrored, x/y swapped (the twin's true
+            // machine state; every other state component is equal by
+            // the equivariance of all prior, symmetric steps). Both
+            // re-enter this cycle (the environment re-application is
+            // idempotent) bound, and step straight through.
+            if it.unbound && peek_tick(&it.st, &cfg) {
+                let demands_binding = if !will_execute(&it.st, &cfg, gpio_in) {
+                    false
+                } else if let Some(w) = it.st.pending_exec {
+                    word_touches_regs(w)
+                } else {
+                    it.st.x != it.st.y
+                        && is_pull_empty_read(cfg.code[it.st.pc as usize], &it.st)
+                };
+                if demands_binding {
+                    it.unbound = false;
+                    let mut twin = it;
+                    // The twin is distinct unless state AND words are
+                    // both mirror-fixed (possible on the exec path with
+                    // x == y and register-free decided words) — there
+                    // the bound child's full future enumeration already
+                    // contains every mirror spelling, so skip the dup.
+                    let mut twin_differs = it.st.x != it.st.y;
+                    for s in 0..spec.slots as usize {
+                        let m = mirror_word(twin.value[s]);
+                        twin_differs |= m != twin.value[s];
+                        twin.value[s] = m;
+                    }
+                    stack.push(it);
+                    stats.forks += 1;
+                    if twin_differs {
+                        std::mem::swap(&mut twin.st.x, &mut twin.st.y);
+                        stack.push(twin);
                         stats.forks += 1;
                     }
                     continue 'items;
@@ -604,7 +759,11 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
 
         stats.champions_found += 1;
         if champions.len() < champion_cap {
-            champions.push(Champion { decided: it.decided, value: it.value });
+            champions.push(Champion {
+                decided: it.decided,
+                value: it.value,
+                binding_free: it.unbound,
+            });
         } else {
             champion_cap_hit = true;
         }

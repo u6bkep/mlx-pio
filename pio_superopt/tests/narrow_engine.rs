@@ -8,7 +8,7 @@
 
 use pio_superopt::encode::encode_insn;
 use pio_superopt::ir::{Insn, JmpCond, Op, SetDst, SideCfg, WaitSrc};
-use pio_superopt::narrow::engine::{run_spec, search, EngineSpec};
+use pio_superopt::narrow::engine::{mirror_word, run_spec, search, EngineSpec};
 use pio_superopt::narrow::{NCfg, Stim};
 use pio_superopt::program::{Config, PinMap, Program};
 
@@ -29,8 +29,19 @@ fn words_of(insns: &[Insn], side: &SideCfg) -> [u16; 32] {
     code
 }
 
+/// Mirror the searched slots of a program (the P1 register-rename twin).
+fn mirror_program(words: &[u16; 32], slots: u8) -> [u16; 32] {
+    let mut m = *words;
+    for s in 0..slots as usize {
+        m[s] = mirror_word(m[s]);
+    }
+    m
+}
+
 /// Every champion, materialized, must reproduce the spec's trace — the
 /// engine's own don't-care claim checked against the concrete runner.
+/// A binding-free champion additionally claims its register-mirror
+/// reproduces the trace; check that claim too.
 fn assert_champions_sound(spec: &EngineSpec, champions: &[pio_superopt::narrow::engine::Champion]) {
     for (i, ch) in champions.iter().enumerate() {
         assert_eq!(
@@ -38,6 +49,13 @@ fn assert_champions_sound(spec: &EngineSpec, champions: &[pio_superopt::narrow::
             spec.expected,
             "champion {i} does not reproduce the spec trace"
         );
+        if ch.binding_free {
+            assert_eq!(
+                run_spec(spec, mirror_program(&ch.words(), spec.slots)),
+                spec.expected,
+                "champion {i} is binding-free but its register-mirror diverges"
+            );
+        }
     }
 }
 
@@ -61,7 +79,14 @@ fn census_l1(spec: &EngineSpec, side: &SideCfg, champions: &[pio_superopt::narro
         code[0] = w;
         let matches = run_spec(spec, code) == spec.expected;
         n_match += matches as u32;
-        let cov = covered(champions, &code);
+        // P1 quotient: a word is covered directly, or (its canonical
+        // respelling having ended binding-free) via its mirror.
+        let cov = covered(champions, &code) || {
+            let mirrored = mirror_program(&code, spec.slots);
+            champions.iter().any(|ch| {
+                ch.binding_free && (0..32).all(|s| mirrored[s] & ch.decided[s] == ch.value[s])
+            })
+        };
         assert_eq!(
             matches, cov,
             "census mismatch at word {w:04x}: reproduces-trace={matches} covered-by-champion={cov}"
@@ -99,7 +124,7 @@ fn square_wave_l2_rediscovered() {
         stim: Stim::default(),
         irq_sets: vec![],
         expected: vec![],
-        p1_register_symmetry: false,
+        seed: vec![],
     };
     spec.expected = run_spec(&spec, reference);
     // Sanity of the oracle itself: a strict square wave after the first edge.
@@ -157,7 +182,7 @@ fn period3_l1_impossible() {
         stim: Stim::default(),
         irq_sets: vec![],
         expected,
-        p1_register_symmetry: false,
+        seed: vec![],
     };
     let result = search(&spec, 10);
     assert_eq!(
@@ -198,7 +223,7 @@ fn mov_toggle_l1_census_exact() {
         stim: Stim::default(),
         irq_sets: vec![],
         expected: vec![],
-        p1_register_symmetry: false,
+        seed: vec![],
     };
     spec.expected = run_spec(&spec, reference);
     assert!(spec.expected.windows(2).all(|w| (w[0] ^ w[1]) & 1 != 0), "oracle is not a toggle");
@@ -216,6 +241,76 @@ fn mov_toggle_l1_census_exact() {
         result.stats.refuted,
         result.stats.prefiltered,
         result.stats.champions_found
+    );
+}
+
+/// The P1 binding fork, exercised end to end. PULL nonblocking on an
+/// empty TX FIFO reads PHYSICAL X — the one register asymmetry in the
+/// ISA — so an item whose x != y must fork into its two register
+/// bindings there. Seed `set y,3 / pull noblock` (slots 0,1) and search
+/// slot 2 only:
+/// - against the seeded spelling's own trace (`out pins,1` emits
+///   OSR = x = 0, pin LOW): the IDENTITY branch must cover it, and the
+///   mirror spelling (whose OSR would be 3, pin HIGH) must NOT be
+///   covered;
+/// - against the mirror's trace: the TWIN branch must produce a
+///   champion whose words ARE the mirror spelling (set x,3), and the
+///   seeded spelling must NOT be covered.
+#[test]
+fn pull_empty_binding_fork() {
+    const SET_Y_3: u16 = 0xE043; // set y, 3
+    const SET_X_3: u16 = 0xE023; // set x, 3 (the mirror)
+    const PULL_NOBLOCK: u16 = 0x8080;
+    const OUT_PINS_1: u16 = 0x6001;
+
+    let side = SideCfg::NONE;
+    let base_spec = || {
+        let config = Config {
+            pins: PinMap { out_base: 0, out_count: 1, ..PinMap::default() },
+            ..Config::default()
+        };
+        EngineSpec {
+            cfg: cfg_for(config, 0, 2),
+            slots: 3,
+            cycles: 6,
+            inputs: vec![],
+            output_pins: vec![0],
+            capture_pins: vec![0],
+            stim: Stim::default(),
+            irq_sets: vec![],
+            expected: vec![],
+            seed: vec![(0, 0xFFFF, SET_Y_3), (1, 0xFFFF, PULL_NOBLOCK)],
+        }
+    };
+    let mut w_seeded = words_of(&[], &side);
+    w_seeded[0] = SET_Y_3;
+    w_seeded[1] = PULL_NOBLOCK;
+    w_seeded[2] = OUT_PINS_1;
+    let w_mirror = mirror_program(&w_seeded, 3);
+    assert_eq!(w_mirror[0], SET_X_3);
+    assert_eq!(w_mirror[1], PULL_NOBLOCK);
+
+    // (a) The seeded spelling's trace: OSR <- x = 0, pin driven LOW.
+    let mut spec_a = base_spec();
+    spec_a.expected = run_spec(&spec_a, w_seeded);
+    let ra = search(&spec_a, 100_000);
+    assert!(!ra.champion_cap_hit);
+    assert_champions_sound(&spec_a, &ra.champions);
+    assert!(covered(&ra.champions, &w_seeded), "identity branch lost the seeded program");
+    assert!(!covered(&ra.champions, &w_mirror), "mirror spelling wrongly covered — traces differ");
+
+    // (b) The mirror's trace: its pull reads x = 3, pin stays HIGH.
+    let mut spec_b = base_spec();
+    spec_b.expected = run_spec(&spec_b, w_mirror);
+    assert_ne!(spec_a.expected, spec_b.expected, "the two bindings must be distinguishable");
+    let rb = search(&spec_b, 100_000);
+    assert!(!rb.champion_cap_hit);
+    assert_champions_sound(&spec_b, &rb.champions);
+    assert!(covered(&rb.champions, &w_mirror), "twin branch failed to produce the mirror champion");
+    assert!(!covered(&rb.champions, &w_seeded), "seeded spelling wrongly covered — traces differ");
+    eprintln!(
+        "pull_empty_binding_fork: a items={} champs={}, b items={} champs={}",
+        ra.stats.items, ra.stats.champions_found, rb.stats.items, rb.stats.champions_found
     );
 }
 
@@ -277,7 +372,7 @@ fn tx_a_spec(cycles: u32) -> (EngineSpec, SideCfg) {
         stim: Stim { mask: 1 << 8, values: stim_values },
         irq_sets,
         expected: vec![],
-        p1_register_symmetry: false,
+        seed: vec![],
     };
     (spec, side)
 }
