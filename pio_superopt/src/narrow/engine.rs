@@ -13,10 +13,15 @@
 //! opt-side-set value bits under a clear enable are never forked at all).
 //!
 //! v1 scope, documented trade-offs:
-//! - Demand is EAGER WITHIN A FETCH: every field the opcode can consult
-//!   is decided before the instruction runs (JMP targets are not
-//!   cond-lazy; delay is demanded at fetch, not completion). Sound —
-//!   over-demanding only costs don't-care coverage, never correctness.
+//! - Demand is EAGER WITHIN A FETCH for the op fields (JMP targets are
+//!   not cond-lazy). Sound — over-demanding only costs don't-care
+//!   coverage, never correctness. Two laziness levers ARE implemented:
+//!   DELAY forks post-step, only for instructions that completed on an
+//!   already-survived cycle (refuted items never pay the 8x delay
+//!   multiplier); and SIDE-SET values are pre-filtered against the
+//!   expected trace at the fetch cycle (an asserted side-set overwrites
+//!   the op's writes on its pins, so it is refutable before the opcode
+//!   is forked — see `side_value_consistent` for the OE soundness rule).
 //! - Canonicality filter P1-lite (OFF by default): register-symmetry
 //!   breaking — while no scratch register has been named, field values
 //!   whose only register is Y are pruned (the X-renamed twin lives in a
@@ -112,7 +117,6 @@ struct Field {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FieldKind {
     Side,
-    Delay,
     Opcode,
     JmpCond,
     JmpTarget,
@@ -173,11 +177,6 @@ impl Field {
                     for v in 0..(1u16 << count) {
                         put(out, v);
                     }
-                }
-            }
-            FieldKind::Delay => {
-                for v in 0..(1u16 << (5 - cfg.side_count)) {
-                    put(out, v);
                 }
             }
             FieldKind::Opcode => {
@@ -304,13 +303,10 @@ fn demand(decided: u16, value: u16, cfg: &NCfg) -> Option<Field> {
         }
     }
 
-    // Delay last (v1: eager at fetch; completion-lazy is a v2 refinement).
-    if cfg.side_count < 5 {
-        let delay_mask = ((1u16 << (5 - cfg.side_count)) - 1) << 8;
-        if let Some(f) = need(delay_mask, FieldKind::Delay) {
-            return Some(f);
-        }
-    }
+    // Delay is NOT demanded at fetch: it is only consulted when the
+    // instruction COMPLETES, so the search forks it post-step (and only
+    // for items that survived this cycle's trace check) — see the delay
+    // post-fork in `search`.
     None
 }
 
@@ -322,6 +318,49 @@ fn will_fetch(st: &NState, cfg: &NCfg, gpio_in: u32) -> bool {
     }
     if st.stall != Stall::None && still_stalled(st, cfg, gpio_in) {
         return false;
+    }
+    true
+}
+
+/// Can side-set raw value `raw` produce this cycle's expected capture?
+/// Sound one-sided check: an asserted value-drive side-set overwrites
+/// the op's writes on its pins, so wherever the expected trace pins a
+/// pin's OE high (surviving items must match OE too) and the pin isn't
+/// stimulus-forced, the expected LEVEL must equal the side-set bit.
+/// PINDIR-drive and non-asserted values are never refuted here.
+fn side_value_consistent(
+    raw: u16,
+    cfg: &NCfg,
+    capture_pins: &[u8],
+    stim_mask: u32,
+    expected: u32,
+) -> bool {
+    if cfg.side_pindir {
+        return true;
+    }
+    let (asserted, val, value_bits) = if cfg.side_en {
+        let en = (raw >> (cfg.side_count - 1)) & 1 != 0;
+        (en, raw & ((1u16 << (cfg.side_count - 1)) - 1), cfg.side_count - 1)
+    } else {
+        (true, raw, cfg.side_count)
+    };
+    if !asserted {
+        return true;
+    }
+    for b in 0..value_bits {
+        let pin = (cfg.sideset_base + b) & 31;
+        if (stim_mask >> pin) & 1 != 0 {
+            continue;
+        }
+        if let Some(j) = capture_pins.iter().position(|&p| p == pin) {
+            if (expected >> (16 + j)) & 1 != 0 {
+                let want = (expected >> j) & 1;
+                let have = ((val >> b) & 1) as u32;
+                if want != have {
+                    return false;
+                }
+            }
+        }
     }
     true
 }
@@ -378,6 +417,9 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
         *irq_at.entry(c).or_insert(0u8) |= m;
     }
 
+    let delay_bits = 5 - spec.cfg.side_count.min(5);
+    let delay_mask: u16 = if delay_bits == 0 { 0 } else { ((1u16 << delay_bits) - 1) << 8 };
+
     let mut stack = vec![root];
     let mut champions = Vec::new();
     let mut champion_cap_hit = false;
@@ -412,13 +454,30 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
             let ext = self::stim_at(&spec.stim, it.cycle);
             let gpio_in = compose(&it.st, spec.stim.mask, ext);
 
-            if peek_tick(&it.st, &cfg) && will_fetch(&it.st, &cfg, gpio_in) {
-                let pc = it.st.pc as usize;
-                if let Some(field) = demand(it.decided[pc], it.value[pc], &cfg) {
+            let fetching = peek_tick(&it.st, &cfg) && will_fetch(&it.st, &cfg, gpio_in);
+            let fetch_pc = it.st.pc as usize;
+            if fetching {
+                if let Some(field) = demand(it.decided[fetch_pc], it.value[fetch_pc], &cfg) {
                     values.clear();
                     field.values_into(&cfg, spec.slots, &mut values);
                     for &v in &values {
                         let raw = v >> field.shift();
+                        // Side-set pre-filter: an ASSERTED side-set is
+                        // applied after the op's writes, so it determines
+                        // this cycle's captured level of every pin it
+                        // drives — refutable against expected[cycle]
+                        // before the opcode is ever forked.
+                        if field.kind == FieldKind::Side
+                            && !side_value_consistent(
+                                raw,
+                                &cfg,
+                                &spec.capture_pins,
+                                spec.stim.mask,
+                                spec.expected[it.cycle as usize],
+                            )
+                        {
+                            continue;
+                        }
                         let (nx, ny) = names_regs(field.kind, raw);
                         // P1-lite: first named scratch register must be X
                         // (or both at once, the self-mirror X!=Y).
@@ -426,8 +485,8 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                             continue;
                         }
                         let mut child = it;
-                        child.decided[pc] |= field.mask;
-                        child.value[pc] |= v;
+                        child.decided[fetch_pc] |= field.mask;
+                        child.value[fetch_pc] |= v;
                         child.seen_x |= nx;
                         child.seen_y |= ny;
                         stack.push(child);
@@ -457,6 +516,26 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                 continue 'items;
             }
             it.cycle += 1;
+
+            // Delay post-fork: delay is consulted only at COMPLETION, so
+            // it is forked only for instructions that actually completed
+            // (no stall) on an already-survived cycle. Refuted items
+            // never pay the delay multiplier; an instruction completing
+            // on the final cycle keeps delay as a don't-care.
+            if fetching && it.st.stall == Stall::None && delay_mask != 0 {
+                let undecided = it.decided[fetch_pc] & delay_mask != delay_mask;
+                if undecided && it.cycle < spec.cycles {
+                    for v in 0..(1u16 << delay_bits) {
+                        let mut child = it;
+                        child.decided[fetch_pc] |= delay_mask;
+                        child.value[fetch_pc] |= v << 8;
+                        child.st.delay_count = v as u8;
+                        stack.push(child);
+                        stats.forks += 1;
+                    }
+                    continue 'items;
+                }
+            }
         }
 
         stats.champions_found += 1;
