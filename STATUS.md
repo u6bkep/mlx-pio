@@ -1,60 +1,61 @@
 # STATUS — current frontier
 
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
-> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-11.
+> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-11 (late).
 
-## Narrowing engine — UNDERWAY (evaluator v1 landed)
+## Narrowing engine — evaluator + fork loop LANDED; L=3 wall says: build the memo
 
-`pio_superopt/src/narrow/` (4b9a364): our own forkable evaluator —
-flat Copy `NState` (~120B, fork checkpoint = memcpy), total bit-field
-decode, vendored-exact cycle semantics. Contract: `docs/
-evaluator-spec.md` (written to double as the shard twin's spec).
-Differential gate: `tests/narrow_diff.rs` — DME reference + ~2,500
-random programs (side-set configs, config genes, streaming, RX
-flavors, pin stimulus), byte-identical to `run::run`. 2.8x the fused
-vendored path. Contract facts the fuzz pinned: pin value latch idles
-ALL-ONES; osr_count resets 32. A sub-agent semantic review of
-narrow/mod.rs vs vendored sm.rs was launched 2026-07-11 — check its
-findings before building on edge-case semantics.
+- **Evaluator** (`pio_superopt/src/narrow/`, 4b9a364..42ecea0): flat Copy
+  NState, total bit-field decode, vendored-exact; diff-gate ~2,500
+  programs byte-identical; independently reviewed (zero divergences).
+  Contract: `docs/evaluator-spec.md` (now incl. §9 driver contract).
+- **Fork engine** (`narrow/engine.rs`, aa489b3, cf892d0): bit-field
+  demand forking, trace refutation, don't-care champions; delay
+  post-fork + side-set trace pre-filter (≈1.65x). Gates green
+  (`tests/narrow_engine.rs`).
+- **Proofs banked** (tx_a oracle, 0 champions, eager+lazy engines
+  agree): footprint 1 and 2 CANNOT reproduce tx_a's trace (all wraps;
+  L=2 0..1 = 220M items). L=1 period-3 duty impossible.
+- **The wall**: L=3 first bracket abandoned >5.67B items/~90min of six
+  brackets. Plain DFS has no cross-item sharing — the playground's
+  lesson holds ("the memo is the whole game"). PIVOT (user call).
 
-## Next: the narrowing layer itself
+## Next (in expected-value order)
 
-1. Hole representation + demand-driven forking at bit-field
-   granularity (side-set bits first, then opcode, operands lazily,
-   delay last); DFS + checkpoint prefix sharing (v1).
-2. Canonicalization fork-filters, from Christian's CANON.md
-   (`~/Documents/programmingSync/computer-whisperer/shard/docs/`):
-   P1 virtual registers (candidates over r0/r1, link-time binding
-   first-consulted→X, preloads are candidate holes and rename with the
-   binding), P2 canonical nop, P3 delay-normal form, P4 vacuous
-   control. Constraints: every rule LENGTH-NON-INCREASING on the
-   representative (else ≤N impossibility proofs die); leaf filters
-   only at fork time (sibling-content constraints stay out); license =
-   fuzz-certified. Gate: len≤2 exactness census (every behavior class
-   keeps exactly one representative) + per-rule differential fuzz.
-3. First target: tx_a (4-instr) optimality as validation. Flagship:
-   phase-invariant RX — the spec/oracle must quantify over duty skew
-   (±8ns measured, design ±24) and parked sub-cycle phase; battery =
-   pio_harness/tests/rx_bench_repro.rs + ro_sampled fixtures.
+1. **Consulted-set memoization** — the real narrowing machinery;
+   canonical-prefix hashing is the memo key (ties into CANON content
+   addressing). Design against the playground's memo.
+2. **Op-level pin-write pre-filter** — SET/OUT/MOV PINS to captured,
+   OE-pinned pins determine levels like side-set does; kills 32-wide
+   data forks early.
+3. **Runner integration** — resumable brackets (spec-ladder pattern)
+   before any more L=3+ compute.
+4. Full P1 virtual registers: must model PULL's implicit X at the link
+   binding (nonblocking/if_empty PULL on empty FIFO loads X — X/Y
+   renaming is NOT a free symmetry; P1-lite is a default-off flag).
 
-## Shard prover track (ratified direction, not started)
+## Shard twin — COMPLETE (merged 2a3a2e7)
 
-Shard PIO emulator implementing evaluator-spec.md (total step,
-first-order — good shard fit), diff-fuzzed three ways; then the prize:
-unbounded equality proof of shipped 2-SM TX pair ≡ our 1-SM TX
-(delayed bisimulation, constant 3-cycle DI lead). Christian's actual
-TX requirement (clarified 2026-07-11): implementations must MATCH —
-they do per emulator cert incl. parking (tx_a parks DI high; our
-mov pins,~null identical); the proof is what would fully convince.
+`shard_pio/`: evaluator-spec.md implemented in shard; 101/101 certified
+vectors byte-identical; full closure checker-green, zero CANON
+advisories. Run: `bin/shard_eval run runner.shard` from shard_pio/
+(prebuilt binary at ~/Documents/programmingSync/computer-whisperer/
+shard/bin — 40-60x faster than the Rust bootstrap). PIO semantics now
+exist as CHECKED SHARD DEFINITIONS → Christian's 2-SM ≡ 1-SM equality
+proof is statable. Proof arc needs (README design notes): Block-record
+lift of shared latches/irq_flags, inter-SM intra-cycle ordering pinned
+in spec + 2-SM vectors, then step2 bisimulation by induction over the
+cycle list. Hand shard_pio/ to Christian for review.
 
-## Bench (idle, carried from 2026-07-10)
+## Flagship (unchanged): phase-invariant RX
 
--0 pinger / -1 responder on [3][4][4][4] duty-robust RX, worktree
-Raven-Firmware.single-sm-tx-bench (branch UNPUSHED, @350ede86).
-Parked-phase 125↔125 margins = the phase-invariant RX spec; production
-main's shipped fast RX is deaf to boards (needs the fix class too).
-Hardware validation deferred until phase-invariant RX lands.
+Spec/oracle must quantify duty skew (±8ns measured / ±24 design) ×
+parked phase; battery = pio_harness/tests/rx_bench_repro.rs +
+ro_sampled fixtures. Fast-RX variant needed for production main.
 
-## Paused
+## Bench (idle) / paused
 
-SMT len-4 probe, compress2, len-5 fleet (benchmark tier).
+-0 pinger / -1 responder on [3][4][4][4], worktree
+Raven-Firmware.single-sm-tx-bench UNPUSHED @350ede86. Hardware
+validation deferred until phase-invariant RX. Paused: SMT len-4,
+compress2, len-5 fleet.

@@ -4,6 +4,52 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-11 (later) — fork engine v1 + first impossibility proofs; shard twin COMPLETE; L=3 wall → memo is the pivot
+
+**Fork engine landed (aa489b3, cf892d0).** narrow/engine.rs: hole
+programs (per-slot decided-mask/value), demand-driven forking at
+bit-field granularity, DFS with NState checkpoint copies, per-cycle
+trace refutation, don't-care champions. Statically dead bits never
+fork. Two laziness levers: delay forks POST-step only on survived
+cycles; asserted side-set values pre-filtered against expected[cycle]
+(OE-gated soundness rule). Gates: L=2 square wave rediscovered;
+L=1 period-3 duty proven impossible by exhaustion (first narrowing
+impossibility proof). SOUNDNESS FIND: X/Y renaming is NOT a true ISA
+symmetry — nonblocking/if_empty PULL on empty TX FIFO loads X — so
+P1-lite pruning is a default-off flag; full P1 (virtual registers)
+must model PULL's implicit X at the link binding.
+
+**tx_a ladder (460-cycle oracle: DE stim + IRQ pulses, parity-absorber
+cases).** Banked, zero champions everywhere: L=1 16,735 items; L=2
+0..0 1,080,991; L=2 0..1 220,364,655; L=2 1..1 220,364,655 (eager
+baselines 27,670 / 1,812,526 / 364,094,446 — levers ≈1.65x; eager and
+lazy engines agree on every verdict). The identical 0..1/1..1 counts
+are a THEOREM not a bug (probe: wrap IS applied, 1,364 vs 678
+champions on a square-wave oracle with the same items/forks): for
+2-slot spaces sharing an oracle, slot-consultation order is
+wrap-invariant and wrap only acts after the last fork. L=3 0..0:
+ABANDONED >5.67B items / ~90min, first of six brackets — plain DFS
+without cross-item sharing hits the wall exactly where the playground
+said: THE MEMO IS THE WHOLE GAME. User called the pivot. Next levers,
+in expected-value order: consulted-set memoization, op-level pin-write
+pre-filter (SET/OUT/MOV PINS determine captured OE-pinned levels like
+side-set does), runner integration (resumable brackets).
+
+**Shard twin COMPLETE and merged (2a3a2e7).** Sub-agent implemented
+evaluator-spec.md in shard (shard_pio/: emulator 880 lines, runner,
+vector generator): 101/101 certified vectors byte-identical (~0.5s via
+the prebuilt bin/shard_eval — user's tip cut the full-closure check
+from 30-60min to 32s), full closure checker-green (type gate,
+structural measures, ZERO CANON advisories), gate discriminates
+(seeded mutations fail exactly the right vectors). Verified 101/101
+from master post-merge. Spec amendments from the twin adopted
+(8c9b1af): driver/harness contract is now spec §9; OUT/MOV EXEC
+truncate u16, OUT/MOV PC mask 0x1F; WaitIrq stores the resolved index.
+PIO semantics now exist as checked shard definitions — Christian's
+proof arc (2-SM ≡ 1-SM delayed bisimulation) is STATABLE; multi-SM
+design notes in shard_pio/README.md (Block record lift, inter-SM
+intra-cycle ordering to pin in spec + 2-SM vectors before proving).
+
 ## 2026-07-11 — narrowing engine begins: forkable evaluator landed; CANON.md canonicalization plan
 
 Back on the optimizer per the 07-10 decision. Two threads:
