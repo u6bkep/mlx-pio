@@ -1,106 +1,74 @@
 # STATUS — current frontier
 
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
-> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-10 (eve).
+> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-10 (late night).
 
-## Targets = real rs485-eth firmware (pivot 2026-07-10)
+## ROOT CAUSE FOUND: RX failure = receive-path duty-cycle distortion
 
-TX pair (tx_a 4 + tx_b 17 instr), RX (31/32, "32" comment is stale),
-timestamp (10). Old single-SM DME scoreboard = benchmark suite only.
-Deployed config: **clk_sys 125 MHz** (TX clkdiv exactly 1.0, SLOW RX
-variant) — at the embassy default 150 MHz the RX is dead on hardware.
+`ro_sampler.rs` (raven branch, PIO1 raw-samples its own RO pin at
+125 Msps) proved the signal the RX SM sees is duty-distorted ~±20 ns
+(rising edges late; low runs 7-8/12-13 samples, high runs 1-3/7-8 —
+some high pulses shrink to ONE 8ns sample). The WIRE is pristine
+(Saleae + K2L + offline decoder all agree); the skew is in the R6-1
+transceiver-RO/pad path, identical on both bench boards. Feeding the
+sampled streams into the emulator reproduces the historic bench garbage
+(`01 12 02...`) exactly — mechanism closed. The earlier aperture story
+was a red herring for this failure; uniform sync delay provably cancels
+(`rx_bench_repro.rs`).
 
-## Single-SM TX — HARDWARE-VALIDATED (wire-level, 2026-07-10)
+Also: the "reverted [7][7] build still misses" observation was a
+PHANTOM — flash-timeline audit showed the revert never reached the
+board (cached-binary flash). ALWAYS verify `Compiling <crate>` in the
+flash log after a source edit.
 
-`mov pins, !pins` dissolves the two-SM split. 17 instr, one SM, IRQ
-freed, TX PIO 31→27. Emulator proof: `pio_harness/tests/tx_single_sm.rs`
-(150/133/125 MHz equivalence + slow-RX round trips). Hardware proof:
-Saleae wire captures on the R6-1 bench — single-SM frames structurally
-identical to stock (J J H H prefix, clean 40/80ns runs, T R trailer,
-990 bits, 12.5 MBd). Ping-through validation was impossible due to the
-RX bug below (affects stock TX identically — verified baseline-first).
+## Fix state (raven `single-sm-tx-bench` @ 5a06f0eb, both boards flashed)
 
-## DISCOVERY: shipped RX has a phase-dependent bit-alignment bug
+Polarity-asymmetric retiming [4][1][9][4] (low-side test ~fall+80ns,
+high-side rise+40ns) + BitRealigner software re-frame: 7/7 sampled
+captures decode in the harness (3 bit-perfect, rest >97%) vs 0/7 for
+shipped AND the earlier aperture patch. Bench: board -1 went ~2 → 533
+CRC-valid frames/min; first-ever cross-board NS decode + NA reply.
+**Pings still red (0/71):** residual ~2% symbol errors (vanished
+one-sample pulses — unrecoverable by any retiming) → P(clean 86-byte
+frame) ≈ 0.98^172 ≈ 3%. Short frames (PTP 58B) decode often.
 
-On the 2-board bench (crystals ~1-25 ppm apart) NO frames decode
-cross-board while own-echo decodes fine, at 100% rate, both directions.
-Saleae shows the wire is perfect; the RX recovers every BIT correctly
-but its 5-bit ISR grouping is offset (bench: +1 bit; emulator: +3 at
-every phase — `pio_harness/tests/rx_diag.rs`) depending on startup-lock
-phase. The firmware RXProcessor never re-frames → misaligned frames are
-100% garbage (silently discarded, wrong-MAC path). The slow variant's
-startup paths are also mistimed vs fast (16 cycles ≈ 1.6 bits where fast
-skips 2.0). Fix candidates: (a) software re-framing in rs485-eth
-RXProcessor (sync on J-J-H-H across 5 offsets), (b) resynthesize the RX
-startup so alignment is phase-invariant — **this is now the concrete
-flagship spec for the superopt RX target** (spec must quantify over
-TX/RX phase, and the emulator needs sub-cycle-phase/sync-jitter modeling
-to certify it — narrowing-engine evaluator requirement).
+## The frontier: beat the 2% floor
 
-## Raven-Firmware.main (kalogon repo) — UNCOMMITTED, user reviews
+1. **Analog question (user hands):** is the ±20ns skew intrinsic to the
+   R6-1 (transceiver/RC on RO) or bench wiring (Saleae ground clip on
+   one differential leg; termination/bias)? Unclip/rewire and rerun
+   `ro_sampler` (2 min). If intrinsic, hardware ticket.
+2. **RX resynthesis (THE flagship superopt target, now with real spec):**
+   decode DME under {duty ±24ns, phase, aperture, vanished high pulses}.
+   Fixtures = `pio_harness/tests/data/ro_sampled_*` (real signals, both
+   boards) + `rx_bench_repro.rs` `distort()` model. Falling edges are
+   trustworthy (lows never vanish) — an edge-position decoder keyed on
+   falls may be phase/duty-invariant. Narrowing-engine evaluator must
+   model duty + vanishing pulses (aperture/sync-delay alone certified a
+   WRONG fix twice).
+3. Main firmware module is now on the bus (production 150MHz, PTP +
+   100ms telemetry) — realistic noise + a production peer to test
+   against; all its frames decode FCS-clean offline.
 
-- crates/rs485-eth: feature `single-sm-tx` (default-off, tx_a unused).
-- rs485_eth_test: refreshed to current APIs; 125 MHz clock (required);
-  `board-pneumatics-r6-1` pins GP18-21 no LED (GP25 = VBUS FET!);
-  `pinger` (PING_TARGET env, default ff02::1 — NB bare smoltcp doesn't
-  answer multicast echo, use unicast); MAC from OTP chipid.
-- Bench: probes `2e8a:000c-{0,1}:E66368254F694937:0` (trailing :0
-  required); one probe op at a time; Saleae Logic 2 automation on
-  127.0.0.1:10430 (MCP on 10530 needs session restart), scripts in
-  session scratchpad (saleae_cap/analyze/baud.py — DME wire decoder).
+## Single-SM TX — HARDWARE-VALIDATED (unchanged, 8b6755f/825d829a)
 
-## RX bug refinement (2026-07-10 night, K2L on bus)
+17 instr, one SM, IRQ freed; emulator-certified vs shipped pair; Saleae
+wire captures structurally identical. Ping-through finale still blocked
+on RX (above).
 
-K2L (enp8s0u1u1u3u3) decodes board TX perfectly; boards fail against the
-K2L too. Production clock pairing (150<->125) reproduced on bench: still
-0 valid frames. New failure mode vs K2L: full 926-byte assemblies failing
-only CRC — alignment CAN lock; residual = mid-frame bit errors. So the
-RX bug is >=2-factor (phase-dependent alignment + mid-frame corruption).
-Timeline: embassy bump (51dff4da, not in any release) precedes R6-1
-bringup by 2 days — R6-1 only ever ran post-bump code. v0.1.3 worktree
-staged at /tmp/claude-1000/rf-v013 (submodules cloned) for a released-
-firmware A/B if needed. K2L PLCA config unchecked.
+## Bench state (left running)
 
-## RX MECHANISM REPRODUCED (waveform replay, 725ff8b)
-
-pio_harness/tests/wave_replay.rs replays the real Saleae capture through
-the emulated slow RX. Ideal sampling: decodes perfectly at EVERY phase.
-With a 1.5ns sync-FF aperture model (edges near sample instants resolve
-randomly): 10/16 phases corrupt every frame — only ~2.5ns clean window
-per 8ns cycle. Explains everything: ~1ppm-matched bench boards PARK at
-one phase for seconds (bad phase = dead link, our bench); same-clock
-echo parks at a good phase (works); production 150/125 grid mismatch +
-clkdiv-1.2 TX jitter smears each frame across phases (mostly-good +
-retries = "fairly reliable"). Fix spec is now QUANTITATIVE: maximize
-sampling distance from expected edges, phase-invariant — prime superopt
-target. Raven changes now live on branch `single-sm-tx-bench`
-(Raven-Firmware.single-sm-tx-bench, commit 825d829a); main is clean.
-Logic2 DME decoder being built by a subagent (tools/logic2-dme-decoder).
-
-## RX fixes implemented (branch ca183707) — PARTIAL bench success
-
-Both fixes built + flashed: (1) PIO margin patches (found_low +1cy,
-mid-bit sample 56ns; certified rx_fix.rs battery incl. 133MHz) and
-(2) BitRealigner software re-frame in RXProcessor (J-H-H prefix lock at
-any bit offset; validated reframe_proto.rs; replaces the all-data batch
-path — perf note for Christian). MILESTONE: board -1 now decodes the
-K2L's 926-byte frames WITH VALID CRC (first cross-clock accept ever on
-this bench). STILL FAILING: peer pneumatics NS frames — RX captures ONLY
-the trailing R symbol (wire Saleae-verified perfect). Learned the hard
-way: retiming the startup foundit_next_high path ([7][7]->[9][9], which
-the 133MHz battery wanted) makes hardware MISS whole frames — the
-input-sync delay shifts scan-branch decisions a whole cycle vs the
-emulator; reverted. Suspect the remaining mode is the startup scan vs
-the pneumatics TX frame lead-in (DE-assert timing / first-transition
-shape differs from K2L) under sync timing the emulator doesn't model.
+-0 = duty-robust pinger (PING_TARGET=-1's LL addr), -1 = duty-robust
+responder, both 125 MHz from worktree `Raven-Firmware.single-sm-tx-bench`
+(branch UNPUSHED). Probes `2e8a:000c-{0,1}:E66368254F694937:0`, one op
+at a time. `ro_sampler` diagnostic: `cargo run --bin ro_sampler`.
+Saleae automation on 127.0.0.1:10430; offline decoder
+`tools/logic2-dme-decoder/decode_csv.py` (FCS-validated).
 
 ## Next
 
-1. Model the 2-FF input-sync DELAY (not just aperture) in the replay
-   harness; replay the real NS capture with RX state carried across
-   repeated frames (bench does frame-after-frame; replay was fresh-boot).
-   Find why the scan misses pneumatics frames but not K2L frames.
-2. Then: bench green -> single-SM TX ping-through finale.
-3. Narrowing engine (evaluator MUST model sync delay + aperture — now
-   proven load-bearing); tx_a optimality, phase-invariant RX flagship.
+1. User: analog check (ground clip / termination), then rerun sampler.
+2. Resynthesis spec + narrowing evaluator with duty/vanish model;
+   iterate candidates against `rx_bench_repro.rs` fixtures.
+3. After bench green: single-SM TX ping-through finale.
 4. Paused: SMT len-4 probe, compress2, len-5 fleet (benchmark tier).

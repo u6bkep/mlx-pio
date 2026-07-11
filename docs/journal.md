@@ -4,6 +4,50 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-10 (late night) — duty distortion found: the RX mystery closed
+
+Continuation of the "both RX fixes" bench session. Chain of discoveries:
+
+1. **Phantom failure.** Built the missing model pieces (2-cycle sync-delay
+   pipeline, carried frame state, candidate-C code, real current-bus capture
+   — `rx_bench_repro.rs`): emulator clean at EVERY phase, all models. Audited
+   the flash timeline: board -1's last flash (18:21) predated the startup
+   revert edit (18:23) — the "reverted build still misses" observation was
+   made on the [9][9] build; the committed build had never run. Lesson:
+   verify `Compiling <crate>` appears in the flash log after any edit.
+2. **Real build on hardware:** cross-clock frames pass CRC, but peer NS
+   frames still never assemble; -0's pinger had also been down (probe
+   teardown halted it) which masked cadence. Live-bus Saleae capture: 191
+   bursts/8s (main module now on bus: PTP + 100ms telemetry + host), ALL
+   FCS-clean on the wire.
+3. **Register + DMA forensics (probe-rs reads on live target):** RX SM
+   parked at `wait 0 pin 0` (25/25 samples), config registers all correct,
+   FDEBUG.RXSTALL sticky-set, DMA write pointer advancing at 268 sym/s vs
+   ~10k/s on the wire → the PIO itself misses frames; software exonerated.
+4. **ro_sampler.rs** (new raven diagnostic): PIO1 raw-samples its own RO at
+   125 Msps. Result: duty-cycle distortion ~±20ns — low runs 7-8/12-13
+   samples, high runs 1-3/7-8 (some ONE sample), rising edges late. Wire
+   pristine ⇒ skew lives in the transceiver-RO/pad path. Identical on both
+   boards. Feeding sampled streams to the emulator reproduces the historic
+   bench garbage head `01 12 02...` exactly. The aperture story was a red
+   herring; uniform sync delay provably cancels.
+5. **Fix:** polarity-asymmetric retiming (low test ~fall+80ns, high test
+   rise+40ns = [4][1][9][4]), grid-searched against 7 real sampled captures
+   + duty-distorted wire replays: 7/7 decode (3 bit-perfect) vs 0/7 shipped
+   and 0/7 for the old aperture patch. Bench: -1 went ~2 → 533 CRC-valid
+   frames/min; first-ever cross-board NS decode + NA reply (fd85bc52 →
+   TX len=86).
+6. **Ceiling:** pings still 0/71 — residual ~2% symbol errors are the
+   vanished one-sample high pulses; P(clean 86B frame) ≈ 3%. Beating this
+   needs the analog answer (Saleae ground clip? termination?) or RX
+   resynthesis keyed on falling edges (lows never vanish) — the flagship
+   superopt target, now with a real measured spec + fixtures.
+
+Commits: pio_optimization bfab6f2 (harness + fixtures), raven 5a06f0eb
+(dme_pio retiming + ro_sampler). Bench left running: -0 duty-robust pinger,
+-1 duty-robust responder, both attached tasks stopped, -0 attach live.
+
+
 ## 2026-07-10 (night) — Survey vs production + K2L cross-check: RX bug refined, embassy-bump timeline, jitter direction tested
 
 User challenged "production works reliably" vs our 100%-fail bench. Survey:
