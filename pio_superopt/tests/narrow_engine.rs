@@ -1,0 +1,259 @@
+//! Gate for the needed-narrowing fork loop (`narrow::engine`).
+//!
+//! The sanity tests run small exhaustive searches whose answers are
+//! knowable by hand; the tx_a validation (the engine's first real
+//! target) rediscovers the shipped 4-instruction IRQ→DI toggler from
+//! its trace and proves nothing shorter matches — run it with:
+//! `cargo test --release --test narrow_engine -- --ignored tx_a --nocapture`
+
+use pio_superopt::encode::encode_insn;
+use pio_superopt::ir::{Insn, JmpCond, Op, SetDst, SideCfg, WaitSrc};
+use pio_superopt::narrow::engine::{run_spec, search, EngineSpec};
+use pio_superopt::narrow::{NCfg, Stim};
+use pio_superopt::program::{Config, PinMap, Program};
+
+/// NCfg for a searchable space: config fields from `Config`, wrap from
+/// arguments, code irrelevant (the engine owns it).
+fn cfg_for(config: Config, wrap_bottom: u8, wrap_top: u8) -> NCfg {
+    let mut p = Program::empty(config);
+    p.wrap_bottom = wrap_bottom;
+    p.wrap_top = wrap_top;
+    NCfg::from_program(&p, 0)
+}
+
+fn words_of(insns: &[Insn], side: &SideCfg) -> [u16; 32] {
+    let mut code = [encode_insn(&Insn::nop_for(side), side); 32];
+    for (i, ins) in insns.iter().enumerate() {
+        code[i] = encode_insn(ins, side);
+    }
+    code
+}
+
+/// Every champion, materialized, must reproduce the spec's trace — the
+/// engine's own don't-care claim checked against the concrete runner.
+fn assert_champions_sound(spec: &EngineSpec, champions: &[pio_superopt::narrow::engine::Champion]) {
+    for (i, ch) in champions.iter().enumerate() {
+        assert_eq!(
+            run_spec(spec, ch.words()),
+            spec.expected,
+            "champion {i} does not reproduce the spec trace"
+        );
+    }
+}
+
+/// Does some champion subspace cover this concrete program?
+fn covered(champions: &[pio_superopt::narrow::engine::Champion], words: &[u16; 32]) -> bool {
+    champions.iter().any(|ch| (0..32).all(|s| words[s] & ch.decided[s] == ch.value[s]))
+}
+
+/// A 2-slot square wave: `set pins,1 / set pins,0`, wrap 0..1. The
+/// search must terminate, find champions, and one of them must cover
+/// the hand-written program.
+#[test]
+fn square_wave_l2_rediscovered() {
+    let config = Config {
+        pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 1, ..PinMap::default() },
+        ..Config::default()
+    };
+    let cfg = cfg_for(config, 0, 1);
+    let side = SideCfg::NONE;
+    let reference = words_of(
+        &[
+            Insn::plain(Op::Set { dst: SetDst::Pins, data: 1 }),
+            Insn::plain(Op::Set { dst: SetDst::Pins, data: 0 }),
+        ],
+        &side,
+    );
+
+    let mut spec = EngineSpec {
+        cfg,
+        slots: 2,
+        cycles: 17,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        p1_register_symmetry: false,
+    };
+    spec.expected = run_spec(&spec, reference);
+    // Sanity of the oracle itself: a strict square wave after the first edge.
+    assert!(spec.expected.windows(2).all(|w| w[0] != w[1]), "oracle is not a square wave");
+
+    let result = search(&spec, 1_000_000);
+    assert!(result.stats.champions_found > 0, "no champions found");
+    assert!(!result.champion_cap_hit);
+    assert_champions_sound(&spec, &result.champions);
+    assert!(covered(&result.champions, &reference), "hand program not covered by any champion");
+    eprintln!(
+        "square_wave L2: items={} forks={} refuted={} champions={}",
+        result.stats.items, result.stats.forks, result.stats.refuted, result.stats.champions_found
+    );
+}
+
+/// Impossibility smoke: a period-3 pattern (two cycles high, one low)
+/// from a single instruction slot. One instruction can produce constant
+/// output or a symmetric toggle (via pin loopback + delay), but not an
+/// asymmetric duty cycle — expect ZERO champions, i.e. exhaustion as an
+/// impossibility proof.
+#[test]
+fn period3_l1_impossible() {
+    let config = Config {
+        pins: PinMap {
+            set_base: 0,
+            set_count: 1,
+            out_base: 0,
+            out_count: 1,
+            in_base: 0,
+            ..PinMap::default()
+        },
+        ..Config::default()
+    };
+    let cfg = cfg_for(config, 0, 0);
+
+    let mut expected = Vec::new();
+    for c in 0..18u32 {
+        let level = if c % 3 < 2 { 1 } else { 0 };
+        expected.push(level | 1 << 16);
+    }
+    let spec = EngineSpec {
+        cfg,
+        slots: 1,
+        cycles: 18,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected,
+        p1_register_symmetry: false,
+    };
+    let result = search(&spec, 10);
+    assert_eq!(
+        result.stats.champions_found, 0,
+        "a single instruction allegedly produces a period-3 duty pattern: {:?}",
+        result.champions.first().map(|c| c.value[0])
+    );
+    eprintln!(
+        "period3 L1: items={} forks={} refuted={} (exhausted, 0 champions)",
+        result.stats.items, result.stats.forks, result.stats.refuted
+    );
+}
+
+/// The shipped tx_a (rs485-eth dme_pio.rs): IRQ→DI toggler with the
+/// jmp-PIN parity absorber, `.side_set 1 opt` on DI, wrap 0..1.
+fn tx_a_words(side: &SideCfg) -> [u16; 32] {
+    words_of(
+        &[
+            // low: wait 1 irq 0 side 1
+            Insn { op: Op::Wait { polarity: true, src: WaitSrc::Irq, index: 0 }, delay: 0, sideset: Some(1) },
+            // jmp PIN high(2)
+            Insn::plain(Op::Jmp { cond: JmpCond::Pin, target: 2 }),
+            // high: wait 1 irq 0 side 0
+            Insn { op: Op::Wait { polarity: true, src: WaitSrc::Irq, index: 0 }, delay: 0, sideset: Some(0) },
+            // jmp low(0)
+            Insn::plain(Op::Jmp { cond: JmpCond::Always, target: 0 }),
+        ],
+        side,
+    )
+}
+
+/// tx_a's environment and observable: DI on pin 0 (side-set base 0,
+/// captured with OE), DE on pin 8 (external stimulus, jmp_pin), IRQ 0
+/// pulses from the "sequencer". The schedule covers: idempotent
+/// force-highs while DE is low (the parity absorber), toggling while DE
+/// is high across varied gaps, and a DE drop mid-stream.
+fn tx_a_spec(cycles: u32) -> (EngineSpec, SideCfg) {
+    let side = SideCfg { count: 2, en: true }; // .side_set 1 opt
+    let config = Config {
+        side,
+        pins: PinMap { sideset_base: 0, in_base: 16, ..PinMap::default() },
+        jmp_pin: 8,
+        ..Config::default()
+    };
+    let cfg = cfg_for(config, 0, 1);
+
+    // DE (pin 8): low, then high through the "frame", low again, high.
+    let mut stim_values = Vec::with_capacity(cycles as usize);
+    for c in 0..cycles {
+        let de_high = (60..300).contains(&c) || (340..cycles.saturating_sub(10)).contains(&c);
+        stim_values.push(if de_high { 1u32 << 8 } else { 0 });
+    }
+    // IRQ pulses: parity-absorber hits while DE low, then bit-ish
+    // cadence while high (varied gaps), one stray after the DE drop.
+    let mut irq_sets = Vec::new();
+    for c in [10u32, 25, 40, 70, 82, 90, 102, 118, 126, 140, 160, 168, 190, 210, 240, 265, 290, 310, 350, 365, 380, 400, 430] {
+        if c < cycles {
+            irq_sets.push((c, 1u8));
+        }
+    }
+
+    let spec = EngineSpec {
+        cfg,
+        slots: 4,
+        cycles,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0, 8],
+        stim: Stim { mask: 1 << 8, values: stim_values },
+        irq_sets,
+        expected: vec![],
+        p1_register_symmetry: false,
+    };
+    (spec, side)
+}
+
+/// The oracle must show real toggling (not a constant line) or the
+/// search below proves nothing.
+#[test]
+fn tx_a_oracle_sanity() {
+    let (mut spec, side) = tx_a_spec(460);
+    let reference = tx_a_words(&side);
+    spec.expected = run_spec(&spec, reference);
+    let toggles = spec.expected.windows(2).filter(|w| (w[0] ^ w[1]) & 1 != 0).count();
+    assert!(toggles >= 10, "DI toggled only {toggles} times — schedule too weak");
+}
+
+/// The main event: rediscover tx_a from its trace at L=4 and prove
+/// footprint <= 3 impossible. Long-running; #[ignore]d from CI.
+#[test]
+#[ignore]
+fn tx_a_rediscovery_and_optimality() {
+    let (mut spec4, side) = tx_a_spec(460);
+    let reference = tx_a_words(&side);
+    spec4.expected = run_spec(&spec4, reference);
+
+    // Optimality: exhaust every shorter footprint (all wrap choices).
+    for slots in 1..=3u8 {
+        for wb in 0..slots {
+            for wt in wb..slots {
+                let (mut s, _) = tx_a_spec(460);
+                s.slots = slots;
+                s.cfg.wrap_bottom = wb;
+                s.cfg.wrap_top = wt;
+                s.expected = spec4.expected.clone();
+                let r = search(&s, 5);
+                eprintln!(
+                    "L={slots} wrap {wb}..{wt}: items={} forks={} refuted={} champions={}",
+                    r.stats.items, r.stats.forks, r.stats.refuted, r.stats.champions_found
+                );
+                assert_eq!(
+                    r.stats.champions_found, 0,
+                    "L={slots} wrap {wb}..{wt} unexpectedly matches tx_a's trace: {:04x?}",
+                    r.champions.first().map(|c| &c.value[..slots as usize])
+                );
+            }
+        }
+    }
+
+    // Rediscovery at tx_a's own shape (L=4, wrap 0..1).
+    let r = search(&spec4, 100_000);
+    eprintln!(
+        "L=4 wrap 0..1: items={} forks={} refuted={} champions={} cap_hit={}",
+        r.stats.items, r.stats.forks, r.stats.refuted, r.stats.champions_found, r.champion_cap_hit
+    );
+    assert!(r.stats.champions_found > 0, "tx_a's own shape found no champions");
+    assert_champions_sound(&spec4, &r.champions);
+    assert!(covered(&r.champions, &reference), "tx_a itself is not covered by any champion");
+}

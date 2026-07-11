@@ -18,6 +18,8 @@
 use crate::program::{Program, ShiftDir};
 use crate::run::RunSpec;
 
+pub mod engine;
+
 /// FIFO with configurable depth (4 normal, 8 joined, 0 joined-away).
 /// `Copy` twin of the vendored `PioFifo` (same observable behavior).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
