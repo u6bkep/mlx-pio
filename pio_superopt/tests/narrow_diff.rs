@@ -80,6 +80,49 @@ fn random_programs_match_sideset() {
     }
 }
 
+/// RX-flavored configs: autopush ON across push thresholds, both IN
+/// shift directions, and both FIFO joins — the IN/autopush semantics
+/// (pre-shift flush, post-shift push, RX-full stall) and depth-0/8
+/// FIFOs that the TX-shaped spaces above never reach. RX is never
+/// drained mid-run, so the full-FIFO stall arms are hit too.
+#[test]
+fn random_programs_match_rx_flavors() {
+    use pio_superopt::program::ShiftDir as SD;
+    let mut vi = 0;
+    for push_threshold in [1u8, 5, 8, 32] {
+        for in_dir in [SD::Left, SD::Right] {
+            for (fjoin_rx, fjoin_tx) in [(false, false), (true, false), (false, true)] {
+                let mut cfg = dme_cfg();
+                cfg.pins.in_base = 8;
+                cfg.jmp_pin = 9;
+                cfg.shift.autopush = true;
+                cfg.shift.push_threshold = push_threshold;
+                cfg.shift.in_dir = in_dir;
+                cfg.shift.fjoin_rx = fjoin_rx;
+                cfg.shift.fjoin_tx = fjoin_tx;
+                let space =
+                    Space { slots: 16, side: SideCfg::NONE, search_wrap: true, genes: Genes::default() };
+                let template = Program::empty(cfg);
+                let sp = RunSpec {
+                    capture_pins: vec![0, 1, 8],
+                    ..dme_spec(200)
+                };
+                let mut rng = Rng::new(0x5EED_0100 + vi as u64);
+                for i in 0..60 {
+                    let p = random_program(&template, &space, &mut rng);
+                    assert_eq!(
+                        narrow::run(&p, &sp),
+                        run::run(&p, &sp),
+                        "flavor {vi} (pt {push_threshold} {in_dir:?} rx{fjoin_rx} tx{fjoin_tx}) program {i}: {}",
+                        p.brief()
+                    );
+                }
+                vi += 1;
+            }
+        }
+    }
+}
+
 /// Long input lists exercise the streaming refill path (and autopull's
 /// word-boundary behavior against a fed FIFO).
 #[test]
