@@ -161,8 +161,9 @@ rotate) starting at `base`.
   x≠0, decrement ONLY when taken); !Y; Y--; X≠Y; PIN (gpio_in[jmp_pin]);
   !OSRE (osr_count < pull_threshold). Taken ⇒ pc := target (pc_set).
 - **WAIT pol src idx** — GPIO: absolute pin; PIN: in_base-relative;
-  IRQ: idx resolved (§rel), met ⇒ AUTO-CLEAR the flag, unmet ⇒ stall;
-  src 3 (JMPPIN): no-op (vendored stub).
+  IRQ: idx resolved (§rel), met ⇒ AUTO-CLEAR the flag, unmet ⇒ stall —
+  the stall record stores the RESOLVED index (rel already applied), and
+  §7's re-check uses it as-is; src 3 (JMPPIN): no-op (vendored stub).
 - **IN src count** — pre-shift: if autopush ∧ isr_count ≥ push_threshold:
   rx full ⇒ stall(Push) and return; else push isr, isr := 0, count := 0.
   Then shift `count` bits of src into ISR (right: into MSBs; left: into
@@ -173,8 +174,9 @@ rotate) starting at `base`.
   refill from tx or stall(Pull) and return. Shift `count` bits out of
   OSR (right: from LSBs; left: from MSBs); osr_count := min(32, +count).
   dst: PINS (out_base/out_count-clipped: count_eff = min(out_count,
-  count)); X; Y; NULL; PINDIRS (same clip); PC (pc_set); ISR (:= data;
-  count NOT set — vendored); EXEC (pending_exec := data).
+  count)); X; Y; NULL; PINDIRS (same clip); PC (:= data & 0x1F, pc_set);
+  ISR (:= data; count NOT set — vendored); EXEC (pending_exec :=
+  data & 0xFFFF — the shifted-out word truncates to 16 bits).
 - **PUSH iffull block** — rx full: iffull ⇒ no-op; block ⇒ stall(Push);
   else DROP (push discarded). Then push isr; isr := 0; isr_count := 0.
 - **PULL ifempty block** — tx empty: ifempty ⇒ osr := x, count := 0;
@@ -184,9 +186,10 @@ rotate) starting at `base`.
   when 1..=31), X, Y, NULL, — , STATUS (level(sel ? rx : tx) < status_n
   ? all-ones : 0), ISR, OSR. op: none | invert | bit-reverse. dst:
   PINS (out_base/out_count via write_pin_field — full out_count, no
-  clip by a bit count), X, Y, PINDIRS (out range), EXEC (pending_exec),
-  PC (pc_set), ISR (:= val, isr_count := 0? — NO: vendored sets value
-  only, counts untouched), OSR (same).
+  clip by a bit count), X, Y, PINDIRS (out range), EXEC (pending_exec
+  := val & 0xFFFF), PC (:= val & 0x1F, pc_set), ISR (:= val,
+  isr_count := 0? — NO: vendored sets value only, counts untouched),
+  OSR (same).
 - **IRQ clear wait idx** — idx resolved: bit4 set ⇒ rel: `(((idx&3)+
   sm_id)%4) | (idx&4)`, else idx&7. clear ⇒ clear flag. Else set flag;
   wait ⇒ stall(IrqWait) until someone clears it.
@@ -197,7 +200,26 @@ MOV ISR/OSR **do not touch the shift counters**, and OUT ISR does not
 set isr_count — these mirror the vendored emulator (fuzz-pinned) and
 are flagged for datasheet re-audit if a hardware divergence ever shows.
 
-## 9. Trust chain
+## 9. The driver/harness contract
+
+The layer between a test vector and the cycle loop, previously implicit
+in `run_with_stim` / `narrow_diff.rs` (surfaced by the shard twin):
+
+- **Autopull pad**: when the config has autopull ON, `autopull_pad`
+  zero words are appended to `inputs` before anything else.
+- **Preload vs streaming**: if the PADDED input list has <= 4 words, it
+  is pushed into the TX FIFO once before cycle 0; otherwise it streams —
+  before EACH cycle, refill the TX FIFO to full from the remaining
+  words, in order. (The threshold is the unjoined hardware FIFO depth,
+  applied regardless of the candidate's actual join config.)
+- **Output pins**: each listed pin's `dir_latch` bit is set before
+  cycle 0 (the register path's exec'd `SET PINDIRS, 1` reduces to this).
+- **Stimulus latching**: the external value at cycle i is
+  `stim_values[min(i, len-1)]` (empty list = 0) — the last value holds.
+- **Capture word**: after the cycle, bit j = level of
+  `capture_pins[j]` from §4's compose, bit 16+j = its `dir_latch` bit.
+
+## 10. Trust chain
 
     shard twin  ==spec==  Rust evaluator  ==diff-fuzz==  vendored emulator
                                                           ==certified==  hardware (bench)
