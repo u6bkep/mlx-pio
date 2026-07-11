@@ -109,6 +109,9 @@ pub struct Stats {
     pub cycles_run: u64,
     /// Fork values killed by the pin-write pre-filter (never pushed).
     pub prefiltered: u64,
+    /// Fork values killed by the canonicity filters P2/P3/P4 (duplicate
+    /// spellings whose representative is generated elsewhere).
+    pub canon_pruned: u64,
 }
 
 pub struct SearchResult {
@@ -129,6 +132,12 @@ struct Item {
     next_input: u32,
     /// Any register-naming field decided yet? (Gates the P1 prune.)
     named: bool,
+    /// P3 run state: the last completed instruction was a canonical nop
+    /// whose delay was FRESHLY forked this pass and is below max. Set
+    /// only at fork time (never for seeded/revisited delays, whose
+    /// front-loaded representative may not exist in the space); any
+    /// other completion resets it.
+    prev_nop_submax: bool,
     /// True while no binding-asymmetric event has executed: the item
     /// stands for both its words AND their register-mirror (whose true
     /// machine state is the x/y-swap of this item's — equal until an
@@ -396,6 +405,12 @@ fn side_value_consistent(
     true
 }
 
+/// The canonical no-op spelling: `mov osr, osr` (op none). Chosen
+/// register-free so it never sets `named` and leaves the P1 prune armed.
+/// Bits 8..12 (delay/side) excluded from the pattern.
+pub const NOP_CANON: u16 = 0xA0E7;
+const NOP_CANON_MASK: u16 = 0xE0FF;
+
 /// Swap every X/Y register naming in a (possibly partially decided)
 /// word: JMP conds !X/X-- <-> !Y/Y--, IN/OUT/MOV/SET register codes
 /// 1 <-> 2. Undecided fields are 0 and map to 0. PUSH/PULL/WAIT/IRQ
@@ -529,6 +544,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
         cycle: 0,
         next_input: 0,
         named: false,
+        prev_nop_submax: false,
         unbound: true,
     };
     for s in spec.slots as usize..32 {
@@ -577,11 +593,12 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
         stats.items += 1;
         if last_beat.elapsed().as_secs() >= 10 {
             eprintln!(
-                "narrow-search: items={} forks={} refuted={} prefilt={} champions={} stack={}",
+                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} champions={} stack={}",
                 stats.items,
                 stats.forks,
                 stats.refuted,
                 stats.prefiltered,
+                stats.canon_pruned,
                 stats.champions_found,
                 stack.len()
             );
@@ -638,6 +655,36 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                         // both spellings must be enumerated.
                         if !it.named && it.unbound && ny && !nx {
                             continue;
+                        }
+                        // P2 canonical nop: MOV self-moves with op none
+                        // (x,x / y,y / isr,isr) are pure no-ops; the one
+                        // kept spelling is `mov osr,osr` (NOP_CANON).
+                        if field.kind == FieldKind::MovSrc {
+                            let dst = (it.value[fetch_pc] >> 5) & 0x7;
+                            let mov_op = (it.value[fetch_pc] >> 3) & 0x3;
+                            if mov_op == 0 && raw == dst && matches!(dst, 1 | 2 | 6) {
+                                stats.canon_pruned += 1;
+                                continue;
+                            }
+                        }
+                        // P4 vacuous control: a JMP to its own
+                        // fallthrough with a non-writing condition
+                        // (everything but X--/Y--) is another no-op
+                        // spelling; the canonical nop lives in the
+                        // sibling MOV branch of this same fork tree.
+                        if field.kind == FieldKind::JmpTarget {
+                            let cond = (it.value[fetch_pc] >> 5) & 0x7;
+                            if cond != 2 && cond != 4 {
+                                let ft = if fetch_pc as u8 == cfg.wrap_top {
+                                    cfg.wrap_bottom
+                                } else {
+                                    (fetch_pc as u8 + 1) & 0x1F
+                                };
+                                if raw == ft as u16 {
+                                    stats.canon_pruned += 1;
+                                    continue;
+                                }
+                            }
                         }
                         // Pin-write pre-filter, an exact one-cycle
                         // lookahead: once this value completes the fetch's
@@ -724,7 +771,9 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                 }
             }
 
-            if clock_tick(&mut it.st, &cfg) {
+            let pre_delay = it.st.delay_count;
+            let ticked = clock_tick(&mut it.st, &cfg);
+            if ticked {
                 super::step(&mut it.st, &cfg, gpio_in);
             }
             stats.cycles_run += 1;
@@ -736,6 +785,17 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
             }
             it.cycle += 1;
 
+            // Did an instruction COMPLETE this cycle (not a delay tick,
+            // not left stalled)? Only then is delay consulted, and only
+            // then does the P3 nop-run state advance.
+            let completed = ticked && pre_delay == 0 && it.st.stall == Stall::None;
+            // A FETCHED canonical nop (P3 only applies without side-set,
+            // whose assertion would make delay splits observable).
+            let nop_run = completed
+                && fetching
+                && cfg.side_count == 0
+                && cfg.code[fetch_pc] & NOP_CANON_MASK == NOP_CANON;
+
             // Delay post-fork: delay is consulted only at COMPLETION, so
             // it is forked only for instructions that actually completed
             // (no stall) on an already-survived cycle. Refuted items
@@ -744,16 +804,39 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
             if fetching && it.st.stall == Stall::None && delay_mask != 0 {
                 let undecided = it.decided[fetch_pc] & delay_mask != delay_mask;
                 if undecided && it.cycle < spec.cycles {
-                    for v in 0..(1u16 << delay_bits) {
+                    let max = (1u16 << delay_bits) - 1;
+                    // P3 delay-normal form: consecutive freshly-forked
+                    // canonical nops carry front-loaded delays — once a
+                    // run nop chose below max, every later nop in the
+                    // run contributes 0 (one spelling per total; the
+                    // representative differs only in how the same idle
+                    // cycles split across pure no-ops).
+                    if nop_run && it.prev_nop_submax {
+                        let mut child = it;
+                        child.decided[fetch_pc] |= delay_mask;
+                        child.st.delay_count = 0;
+                        child.prev_nop_submax = true;
+                        stack.push(child);
+                        stats.forks += 1;
+                        stats.canon_pruned += max as u64;
+                        continue 'items;
+                    }
+                    for v in 0..=max {
                         let mut child = it;
                         child.decided[fetch_pc] |= delay_mask;
                         child.value[fetch_pc] |= v << 8;
                         child.st.delay_count = v as u8;
+                        child.prev_nop_submax = nop_run && v < max;
                         stack.push(child);
                         stats.forks += 1;
                     }
                     continue 'items;
                 }
+            }
+            if completed {
+                // Seeded/revisited delays break the run: their
+                // front-loaded representative may not exist in-space.
+                it.prev_nop_submax = false;
             }
         }
 

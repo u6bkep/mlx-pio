@@ -64,35 +64,87 @@ fn covered(champions: &[pio_superopt::narrow::engine::Champion], words: &[u16; 3
     champions.iter().any(|ch| (0..32).all(|s| words[s] & ch.decided[s] == ch.value[s]))
 }
 
+/// Is this word inside the engine's enumerated space? The exclusions
+/// are DOCUMENTED space choices (footprint semantics, stubbed or
+/// reserved encodings whose behavior aliases an in-space spelling), not
+/// soundness claims: JMP targets >= slots, WAIT src 3 (JMPPIN stub),
+/// IN src 4/5 and MOV src 4 (reserved, alias src 3), MOV op 3 (reserved,
+/// alias op 0), IRQ index bit 3 (dead), SET reserved dsts (no-ops).
+fn in_l1_space(w: u16, slots: u8) -> bool {
+    let f = (w >> 5) & 0x7;
+    match (w >> 13) & 0x7 {
+        0 => (w & 0x1F) < slots as u16,
+        1 => (w >> 5) & 0x3 != 3,
+        2 => !matches!(f, 4 | 5),
+        5 => (w & 0x7) != 4 && (w >> 3) & 0x3 != 3,
+        6 => w & 0x8 == 0,
+        7 => matches!(f, 0 | 1 | 2 | 4),
+        _ => true,
+    }
+}
+
+/// The canonical respelling of a word under P2/P4 (L=1, so the JMP
+/// fallthrough of slot 0 is `wrap_bottom`): pure-no-op spellings map to
+/// NOP_CANON with delay preserved.
+fn canon_l1_word(w: u16, spec: &EngineSpec) -> u16 {
+    use pio_superopt::narrow::engine::NOP_CANON;
+    let delay = w & 0x1F00;
+    match (w >> 13) & 0x7 {
+        0 => {
+            let cond = (w >> 5) & 0x7;
+            let ft = if 0 == spec.cfg.wrap_top { spec.cfg.wrap_bottom } else { 1 } as u16;
+            if cond != 2 && cond != 4 && (w & 0x1F) == ft {
+                return NOP_CANON | delay;
+            }
+            w
+        }
+        5 => {
+            let (dst, op, src) = ((w >> 5) & 0x7, (w >> 3) & 0x3, w & 0x7);
+            if op == 0 && dst == src && matches!(dst, 1 | 2 | 6 | 7) {
+                return NOP_CANON | delay;
+            }
+            w
+        }
+        _ => w,
+    }
+}
+
 /// The strong soundness gate for every generation-pruning lever: brute
 /// force all 65,536 words in slot 0 of an L=1 space and check, both
-/// directions, that a word reproduces the trace IFF some champion
-/// subspace covers it. An unsound pre-filter (kills a survivor) fails
+/// directions, that an in-space word reproduces the trace IFF some
+/// champion subspace covers it — directly, via its register-mirror (P1,
+/// binding-free champions only), or via its canonical respelling
+/// (P2/P4). An unsound filter (kills a survivor) fails
 /// `matches && !covered`; a broken don't-care claim fails the converse.
-/// Only valid for specs where no out-of-space word (JMP target >= slots,
-/// WAIT src 3, dead IRQ index bit) can match the trace — true for the
-/// specs below, whose traces require actively toggling a pin.
 fn census_l1(spec: &EngineSpec, side: &SideCfg, champions: &[pio_superopt::narrow::engine::Champion]) {
-    let mut code = words_of(&[], side);
+    let base = words_of(&[], side);
+    let mut code = base;
+    let covered_q = |w: u16| {
+        let mut c = base;
+        c[0] = w;
+        if covered(champions, &c) {
+            return true;
+        }
+        c[0] = mirror_word(w);
+        champions
+            .iter()
+            .any(|ch| ch.binding_free && (0..32).all(|s| c[s] & ch.decided[s] == ch.value[s]))
+    };
     let mut n_match = 0u32;
     for w in 0..=0xFFFFu16 {
         code[0] = w;
         let matches = run_spec(spec, code) == spec.expected;
         n_match += matches as u32;
-        // P1 quotient: a word is covered directly, or (its canonical
-        // respelling having ended binding-free) via its mirror.
-        let cov = covered(champions, &code) || {
-            let mirrored = mirror_program(&code, spec.slots);
-            champions.iter().any(|ch| {
-                ch.binding_free && (0..32).all(|s| mirrored[s] & ch.decided[s] == ch.value[s])
-            })
-        };
+        if matches && !in_l1_space(w, spec.slots) {
+            continue; // documented space exclusion, not a claim
+        }
+        let cov = covered_q(w) || covered_q(canon_l1_word(w, spec));
         assert_eq!(
             matches, cov,
             "census mismatch at word {w:04x}: reproduces-trace={matches} covered-by-champion={cov}"
         );
     }
-    eprintln!("census_l1: {n_match} of 65536 words reproduce the trace (exact champion coverage)");
+    eprintln!("census_l1: {n_match} of 65536 words reproduce the trace (exact quotient coverage)");
 }
 
 /// A 2-slot square wave: `set pins,1 / set pins,0`, wrap 0..1. The
@@ -241,6 +293,124 @@ fn mov_toggle_l1_census_exact() {
         result.stats.refuted,
         result.stats.prefiltered,
         result.stats.champions_found
+    );
+}
+
+/// The canonicity gate: a constant-HIGH trace is matched by EVERY
+/// effect-free word — all nop spellings (P2 self-moves, P4 vacuous
+/// jumps), met/never-met WAITs, IRQ sets, FIFO ops, register writes —
+/// so the census exercises the P2/P4 quotient maps and the don't-care
+/// machinery at full width.
+#[test]
+fn nop_l1_census_exact() {
+    let config = Config {
+        pins: PinMap {
+            set_base: 0,
+            set_count: 1,
+            out_base: 0,
+            out_count: 1,
+            in_base: 0,
+            ..PinMap::default()
+        },
+        ..Config::default()
+    };
+    let cfg = cfg_for(config, 0, 0);
+    let side = SideCfg::NONE;
+    let reference = words_of(&[], &side);
+
+    let mut spec = EngineSpec {
+        cfg,
+        slots: 1,
+        cycles: 8,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![],
+    };
+    spec.expected = run_spec(&spec, reference);
+    assert!(spec.expected.iter().all(|&w| w == (1 | 1 << 16)), "oracle is not constant HIGH");
+
+    let result = search(&spec, 1_000_000);
+    assert!(!result.champion_cap_hit);
+    assert_champions_sound(&spec, &result.champions);
+    assert!(result.stats.canon_pruned > 0, "canonicity filters never fired");
+    // The engine must NOT emit pruned spellings: no champion may decide
+    // a MOV self-move other than the canonical nop, nor a vacuous JMP.
+    use pio_superopt::narrow::engine::NOP_CANON;
+    for ch in &result.champions {
+        let w = ch.value[0];
+        if ch.decided[0] & 0xE0FF == 0xE0FF && (w >> 13) == 5 {
+            let (dst, op, src) = ((w >> 5) & 7, (w >> 3) & 3, w & 7);
+            if op == 0 && dst == src && matches!(dst, 1 | 2 | 6 | 7) {
+                assert_eq!(w & 0xE0FF, NOP_CANON, "non-canonical self-move emitted: {w:04x}");
+            }
+        }
+    }
+    census_l1(&spec, &side, &result.champions);
+    eprintln!(
+        "nop_l1: items={} forks={} refuted={} prefilt={} canon={} champions={}",
+        result.stats.items,
+        result.stats.forks,
+        result.stats.refuted,
+        result.stats.prefiltered,
+        result.stats.canon_pruned,
+        result.stats.champions_found
+    );
+}
+
+/// P3 delay-normal form, targeted: seed slot 0 to the MOV opcode (so
+/// the space stays small) on a constant trace and check nop-pair delay
+/// distributions: the front-loaded spelling is covered, the equivalent
+/// non-front-loaded one is not (its behavior is identical — asserted —
+/// so only the spelling was pruned).
+#[test]
+fn p3_delay_normal_form() {
+    use pio_superopt::narrow::engine::NOP_CANON;
+    let config = Config {
+        pins: PinMap { out_base: 0, out_count: 1, in_base: 0, ..PinMap::default() },
+        ..Config::default()
+    };
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config, 0, 1),
+        slots: 2,
+        cycles: 5,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        // Both slots pinned to the MOV family to keep the space small;
+        // delays remain fully searchable, which is what P3 quotients.
+        seed: vec![(0, 0xE000, 0xA000), (1, 0xE000, 0xA000)],
+    };
+    let reference = words_of(&[], &SideCfg::NONE);
+    spec.expected = run_spec(&spec, reference);
+
+    let result = search(&spec, 1_000_000);
+    assert!(!result.champion_cap_hit);
+    assert_champions_sound(&spec, &result.champions);
+
+    let pair = |d0: u16, d1: u16| {
+        let mut c = reference;
+        c[0] = NOP_CANON | d0 << 8;
+        c[1] = NOP_CANON | d1 << 8;
+        c
+    };
+    // Same behavior, two spellings: only the front-loaded one covered.
+    assert_eq!(run_spec(&spec, pair(1, 1)), run_spec(&spec, pair(2, 0)));
+    assert!(covered(&result.champions, &pair(2, 0)), "front-loaded nop pair not covered");
+    assert!(covered(&result.champions, &pair(1, 0)), "sum-1 front-loaded pair not covered");
+    assert!(
+        !covered(&result.champions, &pair(1, 1)),
+        "non-front-loaded nop pair covered — P3 not pruning"
+    );
+    eprintln!(
+        "p3_delay_normal_form: items={} canon={} champions={}",
+        result.stats.items, result.stats.canon_pruned, result.stats.champions_found
     );
 }
 
