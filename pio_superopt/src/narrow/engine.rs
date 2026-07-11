@@ -22,6 +22,13 @@
 //!   expected trace at the fetch cycle (an asserted side-set overwrites
 //!   the op's writes on its pins, so it is refutable before the opcode
 //!   is forked — see `side_value_consistent` for the OE soundness rule).
+//! - A third lever, the PIN-WRITE PRE-FILTER: when a fork value completes
+//!   the fetch's consulted fields and the instruction writes a pin latch
+//!   (SET/OUT PINS/PINDIRS, MOV PINS/PINDIRS), the cycle is evaluated on
+//!   a scratch state and refuted against the trace before the child is
+//!   ever pushed — an exact one-cycle lookahead reusing `step` itself, so
+//!   champion sets are provably identical (the killed child would have
+//!   been refuted on this cycle before forking anything).
 //! - Canonicality filter P1-lite (OFF by default): register-symmetry
 //!   breaking — while no scratch register has been named, field values
 //!   whose only register is Y are pruned (the X-renamed twin lives in a
@@ -85,6 +92,8 @@ pub struct Stats {
     pub refuted: u64,
     pub champions_found: u64,
     pub cycles_run: u64,
+    /// Fork values killed by the pin-write pre-filter (never pushed).
+    pub prefiltered: u64,
 }
 
 pub struct SearchResult {
@@ -365,6 +374,36 @@ fn side_value_consistent(
     true
 }
 
+/// Does this (fully fetch-decided) word write a pin latch when it
+/// executes? SET/OUT to PINS or PINDIRS, MOV to PINS or PINDIRS. These
+/// are the only instructions whose OPERAND value can change the current
+/// cycle's capture — the pre-filter's scratch step is spent nowhere else.
+fn writes_pin_latch(word: u16) -> bool {
+    let dst = (word >> 5) & 0x7;
+    match (word >> 13) & 0x7 {
+        3 | 7 => dst == 0 || dst == 4, // OUT/SET: PINS, PINDIRS
+        5 => dst == 0 || dst == 3,     // MOV: PINS, PINDIRS
+        _ => false,
+    }
+}
+
+/// The trace word one cycle produces: levels of `capture_pins` in the
+/// low half, their output-enables in the high half (trace_pads format).
+#[inline]
+fn capture_word(st: &NState, capture_pins: &[u8], stim_mask: u32, ext: u32) -> u32 {
+    let levels = compose(st, stim_mask, ext);
+    let mut w = 0u32;
+    for (j, &p) in capture_pins.iter().enumerate() {
+        if (levels >> p) & 1 != 0 {
+            w |= 1 << j;
+        }
+        if (st.dir_latch >> p) & 1 != 0 {
+            w |= 1 << (16 + j);
+        }
+    }
+    w
+}
+
 /// Peek whether the divider fires this system clock, without mutating.
 fn peek_tick(st: &NState, cfg: &NCfg) -> bool {
     let threshold = if cfg.clkdiv_int == 0 {
@@ -432,8 +471,13 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
         stats.items += 1;
         if last_beat.elapsed().as_secs() >= 10 {
             eprintln!(
-                "narrow-search: items={} forks={} refuted={} champions={} stack={}",
-                stats.items, stats.forks, stats.refuted, stats.champions_found, stack.len()
+                "narrow-search: items={} forks={} refuted={} prefilt={} champions={} stack={}",
+                stats.items,
+                stats.forks,
+                stats.refuted,
+                stats.prefiltered,
+                stats.champions_found,
+                stack.len()
             );
             last_beat = std::time::Instant::now();
         }
@@ -484,6 +528,35 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                         if spec.p1_register_symmetry && !it.seen_x && !it.seen_y && ny && !nx {
                             continue;
                         }
+                        // Pin-write pre-filter, an exact one-cycle
+                        // lookahead: once this value completes the fetch's
+                        // consulted fields AND the decoded instruction
+                        // writes a pin latch, the cycle is fully concrete
+                        // (undecided delay is consulted only at completion
+                        // and cannot move this cycle's capture) — run it on
+                        // a scratch state and refute against the expected
+                        // trace before ever paying the child push/pop. A
+                        // killed value's child would be refuted on this
+                        // very cycle before forking anything (delay forks
+                        // only after the trace check), so champion sets are
+                        // untouched. `cfg.code` needs no restore: every
+                        // path out of this fork loop abandons the item.
+                        let child_value = it.value[fetch_pc] | v;
+                        if writes_pin_latch(child_value)
+                            && demand(it.decided[fetch_pc] | field.mask, child_value, &cfg)
+                                .is_none()
+                        {
+                            cfg.code[fetch_pc] = child_value;
+                            let mut scratch = it.st;
+                            if clock_tick(&mut scratch, &cfg) {
+                                super::step(&mut scratch, &cfg, gpio_in);
+                            }
+                            let w = capture_word(&scratch, &spec.capture_pins, spec.stim.mask, ext);
+                            if w != spec.expected[it.cycle as usize] {
+                                stats.prefiltered += 1;
+                                continue;
+                            }
+                        }
                         let mut child = it;
                         child.decided[fetch_pc] |= field.mask;
                         child.value[fetch_pc] |= v;
@@ -501,16 +574,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
             }
             stats.cycles_run += 1;
 
-            let levels = compose(&it.st, spec.stim.mask, ext);
-            let mut w = 0u32;
-            for (j, &p) in spec.capture_pins.iter().enumerate() {
-                if (levels >> p) & 1 != 0 {
-                    w |= 1 << j;
-                }
-                if (it.st.dir_latch >> p) & 1 != 0 {
-                    w |= 1 << (16 + j);
-                }
-            }
+            let w = capture_word(&it.st, &spec.capture_pins, spec.stim.mask, ext);
             if w != spec.expected[it.cycle as usize] {
                 stats.refuted += 1;
                 continue 'items;

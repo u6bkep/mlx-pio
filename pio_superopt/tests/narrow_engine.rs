@@ -46,6 +46,30 @@ fn covered(champions: &[pio_superopt::narrow::engine::Champion], words: &[u16; 3
     champions.iter().any(|ch| (0..32).all(|s| words[s] & ch.decided[s] == ch.value[s]))
 }
 
+/// The strong soundness gate for every generation-pruning lever: brute
+/// force all 65,536 words in slot 0 of an L=1 space and check, both
+/// directions, that a word reproduces the trace IFF some champion
+/// subspace covers it. An unsound pre-filter (kills a survivor) fails
+/// `matches && !covered`; a broken don't-care claim fails the converse.
+/// Only valid for specs where no out-of-space word (JMP target >= slots,
+/// WAIT src 3, dead IRQ index bit) can match the trace — true for the
+/// specs below, whose traces require actively toggling a pin.
+fn census_l1(spec: &EngineSpec, side: &SideCfg, champions: &[pio_superopt::narrow::engine::Champion]) {
+    let mut code = words_of(&[], side);
+    let mut n_match = 0u32;
+    for w in 0..=0xFFFFu16 {
+        code[0] = w;
+        let matches = run_spec(spec, code) == spec.expected;
+        n_match += matches as u32;
+        let cov = covered(champions, &code);
+        assert_eq!(
+            matches, cov,
+            "census mismatch at word {w:04x}: reproduces-trace={matches} covered-by-champion={cov}"
+        );
+    }
+    eprintln!("census_l1: {n_match} of 65536 words reproduce the trace (exact champion coverage)");
+}
+
 /// A 2-slot square wave: `set pins,1 / set pins,0`, wrap 0..1. The
 /// search must terminate, find champions, and one of them must cover
 /// the hand-written program.
@@ -86,9 +110,15 @@ fn square_wave_l2_rediscovered() {
     assert!(!result.champion_cap_hit);
     assert_champions_sound(&spec, &result.champions);
     assert!(covered(&result.champions, &reference), "hand program not covered by any champion");
+    // The pin-write pre-filter must actually fire on a SET-data space.
+    assert!(result.stats.prefiltered > 0, "pin-write pre-filter never fired");
     eprintln!(
-        "square_wave L2: items={} forks={} refuted={} champions={}",
-        result.stats.items, result.stats.forks, result.stats.refuted, result.stats.champions_found
+        "square_wave L2: items={} forks={} refuted={} prefilt={} champions={}",
+        result.stats.items,
+        result.stats.forks,
+        result.stats.refuted,
+        result.stats.prefiltered,
+        result.stats.champions_found
     );
 }
 
@@ -135,9 +165,57 @@ fn period3_l1_impossible() {
         "a single instruction allegedly produces a period-3 duty pattern: {:?}",
         result.champions.first().map(|c| c.value[0])
     );
+    // Brute-force cross-validation of the impossibility itself.
+    census_l1(&spec, &SideCfg::NONE, &result.champions);
     eprintln!(
-        "period3 L1: items={} forks={} refuted={} (exhausted, 0 champions)",
-        result.stats.items, result.stats.forks, result.stats.refuted
+        "period3 L1: items={} forks={} refuted={} prefilt={} (exhausted, 0 champions)",
+        result.stats.items, result.stats.forks, result.stats.refuted, result.stats.prefiltered
+    );
+}
+
+/// A satisfiable L=1 space with exact-coverage census: `mov pins, !pins`
+/// on a loopback pin toggles every cycle; the engine must find champions
+/// whose coverage is EXACTLY the set of matching words.
+#[test]
+fn mov_toggle_l1_census_exact() {
+    let config = Config {
+        pins: PinMap { out_base: 0, out_count: 1, in_base: 0, ..PinMap::default() },
+        ..Config::default()
+    };
+    let cfg = cfg_for(config, 0, 0);
+    let side = SideCfg::NONE;
+    // MOV (op 5) dst=PINS(0) op=INVERT(1) src=PINS(0) = 0xA008.
+    let mut reference = words_of(&[], &side);
+    reference[0] = 0xA008;
+
+    let mut spec = EngineSpec {
+        cfg,
+        slots: 1,
+        cycles: 12,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        p1_register_symmetry: false,
+    };
+    spec.expected = run_spec(&spec, reference);
+    assert!(spec.expected.windows(2).all(|w| (w[0] ^ w[1]) & 1 != 0), "oracle is not a toggle");
+
+    let result = search(&spec, 100_000);
+    assert!(result.stats.champions_found > 0, "no champions found");
+    assert!(!result.champion_cap_hit);
+    assert_champions_sound(&spec, &result.champions);
+    assert!(covered(&result.champions, &reference), "mov pins,!pins not covered");
+    census_l1(&spec, &side, &result.champions);
+    eprintln!(
+        "mov_toggle L1: items={} forks={} refuted={} prefilt={} champions={}",
+        result.stats.items,
+        result.stats.forks,
+        result.stats.refuted,
+        result.stats.prefiltered,
+        result.stats.champions_found
     );
 }
 
