@@ -685,6 +685,112 @@ fn duty_robust_candidate_search() {
     }
 }
 
+/// Post-ground-fix signal (ro_sampled2_*): the ±20ns skew was the Saleae
+/// ground clip on one differential leg. Residual: lows 4-5/9-10, highs
+/// 5-6/10-11 (~±4-8ns, opposite sign). Find timing that decodes the NEW
+/// signal bit-perfect, and report robustness on the old distorted set.
+#[test]
+#[ignore]
+fn ground_fixed_candidate_search() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/");
+    let new_files: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| {
+            let n = e.unwrap().file_name().into_string().unwrap();
+            n.starts_with("ro_sampled2_").then_some(n)
+        })
+        .collect();
+    let old_files: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| {
+            let n = e.unwrap().file_name().into_string().unwrap();
+            (n.starts_with("ro_sampled_cap")).then_some(n)
+        })
+        .collect();
+    let load_all = |files: &[String]| -> Vec<Vec<bool>> {
+        files.iter().map(|f| load_sampled(&format!("{dir}{f}"))).collect()
+    };
+    let new_s = load_all(&new_files);
+    let old_s = load_all(&old_files);
+    let perfect = |code: &(Vec<u16>, u8, u8), set: &[Vec<bool>]| -> (usize, f64) {
+        let mut p = 0;
+        let mut tot = 0.0;
+        for s in set {
+            let syms = replay_sampled(code, s);
+            let fr = FrameResult { syms, first_sym_us: None, burst_len_us: 0.0 };
+            let best = (0..5).map(|o| fr.frac(o)).fold(0.0f64, f64::max);
+            tot += best;
+            if best >= 0.999 {
+                p += 1;
+            }
+        }
+        (p, tot / set.len() as f64)
+    };
+    println!("baselines on NEW signal ({} fixtures):", new_s.len());
+    for (name, code) in [
+        ("shipped [1][2][5][5]", slow_rx_code()),
+        ("aperture [2][3][5][5]", flashed_code()),
+        ("duty-old [4][1][9][4]", candidate(4, 1, 9, 4)),
+    ] {
+        let (p, m) = perfect(&code, &new_s);
+        println!("  {name}: perfect {p}/{}, mean {m:.4}", new_s.len());
+    }
+    let mut scored = Vec::new();
+    for d13 in 1u16..=5 {
+        for d18 in 0u16..=4 {
+            for d23 in 4u16..=8 {
+                for d25 in 3u16..=7 {
+                    let code = candidate(d13, d18, d23, d25);
+                    let (p_new, m_new) = perfect(&code, &new_s);
+                    if p_new == new_s.len() {
+                        let (p_old, m_old) = perfect(&code, &old_s);
+                        scored.push((p_old, m_old, m_new, (d13, d18, d23, d25)));
+                    } else if p_new + 1 >= new_s.len() {
+                        scored.push((0, 0.0, m_new, (d13, d18, d23, d25)));
+                    }
+                }
+            }
+        }
+    }
+    scored.sort_by(|a, b| (b.0, b.1).partial_cmp(&(a.0, a.1)).unwrap());
+    println!("candidates perfect on NEW (ranked by old-signal robustness):");
+    for (p_old, m_old, m_new, (a, b, c, d)) in scored.iter().take(12) {
+        println!(
+            "  [{a}][{b}][{c}][{d}]: new mean {m_new:.4}, old perfect {p_old}/7 mean {m_old:.4}"
+        );
+    }
+}
+
+/// Tie-break finalists on the wire capture: phase sweep x duty sweep
+/// including NEGATIVE duty (rising early — the post-ground-fix sign).
+#[test]
+#[ignore]
+fn finalist_wire_battery() {
+    let (wire, burst_len) = fixture_current();
+    for (d13, d18, d23, d25) in
+        [(1u16, 4u16, 4u16, 7u16), (2, 4, 4, 7), (3, 4, 4, 4), (2, 4, 8, 6)]
+    {
+        let code = candidate(d13, d18, d23, d25);
+        let mut ok = 0;
+        let mut tot = 0;
+        let mut fail_at: Vec<(f64, f64)> = Vec::new();
+        for duty_ns in [-12.0f64, -8.0, -4.0, 0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0] {
+            let e = distort(&wire, duty_ns * 1e-9);
+            for phase4 in (0..32).step_by(2) {
+                let phase = phase4 as f64 * 0.25;
+                let frames = replay_frames(&code, &e, burst_len, 1, phase, 0, 0.0, 1, 200.0, 0.0);
+                tot += 1;
+                if decoded(&frames[0].syms) {
+                    ok += 1;
+                } else if fail_at.len() < 6 {
+                    fail_at.push((duty_ns, phase));
+                }
+            }
+        }
+        println!("[{d13}][{d18}][{d23}][{d25}]: {ok}/{tot} wire trials; first fails {fail_at:?}");
+    }
+}
+
 /// Per-fixture detail for a specific candidate.
 #[test]
 #[ignore]
