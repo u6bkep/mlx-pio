@@ -1,0 +1,880 @@
+;;; emulator.shard — the shard twin of the narrowing engine's PIO evaluator.
+;;;
+;;; Contract: docs/evaluator-spec.md (pio_optimization). This file implements
+;;; the NState/NCfg records, total decode, one PIO cycle (`step`), the clock
+;;; divider (`clock_tick`), GPIO compose, and the per-vector driver loop that
+;;; replays a certified test vector (docs/shard_vectors.jsonl) and counts
+;;; per-cycle trace mismatches. Everything is 32-bit wraparound arithmetic:
+;;; every value that models a u32 is masked with mask32 after add/shift.
+;;;
+;;; Self-contained: declares its own List/Option/Pair so the file runs under
+;;; `eval direct` (flat closure, no std imports) and checks unchanged. Flags
+;;; are Int 0/1 rather than Bool throughout — the bootstrap's prim
+;;; comparisons return the CORE Bool, and a locally-declared Bool twin would
+;;; clash with it at the type gate; spec Bool fields are Int 0/1 here.
+
+(type (List T)
+  (Nil)
+  (Cons T (List T)))
+
+(type (Option T)
+  (None)
+  (Some T))
+
+(type (Pair A B)
+  (Pair A B))
+
+;; --- small helpers ----------------------------------------------------------
+
+(fn imin ((a Int) (b Int)) Int
+  (if (lt a b) a b))
+
+(fn mask32 ((v Int)) Int
+  (band v 4294967295))
+
+;; (1 << n) - 1 for n in 0..=32 (bshl by 32 is fine: shifts < 64 are defined).
+(fn bit_lo ((n Int)) Int
+  (- (bshl 1 n) 1))
+
+;; bit i of v, as 0/1.
+(fn bit_at ((v Int) (i Int)) Int
+  (band (bshr v i) 1))
+
+;; rotate a u32 left/right by k in 0..=31 (k = 0 degenerates cleanly: the
+;; complementary shift is by 32, which zeroes a u32 operand).
+(fn rotl32 ((v Int) (k Int)) Int
+  (mask32 (bor (bshl v k) (bshr v (- 32 k)))))
+
+(fn rotr32 ((v Int) (k Int)) Int
+  (mask32 (bor (bshr v k) (bshl v (- 32 k)))))
+
+;; bit-reverse a u32 (MOV op 2) — the 5-stage butterfly network.
+(fn rev_bits ((v Int)) Int
+  (let ((a (bor (band (bshr v 1) 1431655765) (mask32 (bshl (band v 1431655765) 1)))))
+    (let ((b (bor (band (bshr a 2) 858993459) (mask32 (bshl (band a 858993459) 2)))))
+      (let ((c (bor (band (bshr b 4) 252645135) (mask32 (bshl (band b 252645135) 4)))))
+        (let ((d (bor (band (bshr c 8) 16711935) (mask32 (bshl (band c 16711935) 8)))))
+          (mask32 (bor (bshr d 16) (bshl d 16))))))))
+
+;; --- integer lists ----------------------------------------------------------
+
+(fn ilist_len ((xs (List Int))) Int
+  (measure (struct xs))
+  (match xs
+    (Nil 0)
+    ((Cons _ t) (+ 1 (ilist_len t)))))
+
+(fn ilist_at ((xs (List Int)) (i Int)) Int
+  (measure (struct xs))
+  (match xs
+    (Nil 0)
+    ((Cons h t) (if (int_eq i 0) h (ilist_at t (- i 1))))))
+
+(fn ilist_snoc ((xs (List Int)) (v Int)) (List Int)
+  (measure (struct xs))
+  (match xs
+    (Nil (Cons v Nil))
+    ((Cons h t) (Cons h (ilist_snoc t v)))))
+
+(fn blist_app ((a (List Int)) (b (List Int))) (List Int)
+  (measure (struct a))
+  (match a
+    (Nil b)
+    ((Cons h t) (Cons h (blist_app t b)))))
+
+;; --- FIFO (spec §1: buf/head/count/depth — modeled as a front-first queue
+;; list plus cached count; observable behavior identical) ---------------------
+
+(type Fifo
+  (Fifo (List Int) Int Int))
+
+(fn fifo_new ((depth Int)) Fifo
+  (Fifo Nil 0 depth))
+
+;; push: value DROPPED when full or depth 0 (vendored PioFifo behavior).
+(fn fifo_push ((f Fifo) (v Int)) Fifo
+  (match f
+    ((Fifo items cnt depth)
+      (if (le depth cnt)
+        f
+        (Fifo (ilist_snoc items v) (+ cnt 1) depth)))))
+
+(fn fifo_pop ((f Fifo)) (Pair (Option Int) Fifo)
+  (match f
+    ((Fifo items cnt depth)
+      (match items
+        (Nil (Pair None f))
+        ((Cons h t) (Pair (Some h) (Fifo t (- cnt 1) depth)))))))
+
+(fn fifo_empty ((f Fifo)) Int
+  (match f
+    ((Fifo _ cnt _) (if (int_eq cnt 0) 1 0))))
+
+(fn fifo_full ((f Fifo)) Int
+  (match f
+    ((Fifo _ cnt depth) (if (lt 0 depth) (if (le depth cnt) 1 0) 0))))
+
+(fn fifo_level ((f Fifo)) Int
+  (match f
+    ((Fifo _ cnt _) cnt)))
+
+;; --- Stall (spec §1/§7); polarity carried as 0/1 ------------------------------
+
+(type Stall
+  (StNone)
+  (StWaitGpio Int Int)
+  (StWaitPin Int Int)
+  (StWaitIrq Int Int)
+  (StPull)
+  (StPush)
+  (StIrqWait Int))
+
+;; --- NCfg (spec §2), grouped so ctor matches stay small; spec bools are 0/1 ---
+
+(type CfgWrap
+  (CfgWrap Int Int)) ; wrap_bottom wrap_top
+
+(type CfgSide
+  (CfgSide Int Int Int Int)) ; side_count side_en side_pindir sideset_base
+
+(type CfgPins
+  (CfgPins Int Int Int Int Int Int Int)) ; jmp_pin in_base out_base out_count set_base set_count in_count
+
+(type CfgShift
+  (CfgShift Int Int Int Int Int Int)) ; autopush autopull push_threshold pull_threshold in_shift_right out_shift_right
+
+(type CfgClk
+  (CfgClk Int Int)) ; clkdiv_int clkdiv_frac
+
+(type CfgMisc
+  (CfgMisc Int Int Int Int Int)) ; status_sel status_n sm_id tx_depth rx_depth
+
+(type NCfg
+  (NCfg (List Int) CfgWrap CfgSide CfgPins CfgShift CfgClk CfgMisc))
+
+(fn cfg_code ((c NCfg)) (List Int)
+  (match c
+    ((NCfg code _ _ _ _ _ _) code)))
+
+(fn cfg_wrap_bottom ((c NCfg)) Int
+  (match c
+    ((NCfg _ w _ _ _ _ _) (match w ((CfgWrap b _) b)))))
+
+(fn cfg_wrap_top ((c NCfg)) Int
+  (match c
+    ((NCfg _ w _ _ _ _ _) (match w ((CfgWrap _ t) t)))))
+
+(fn cfg_side_count ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ s _ _ _ _) (match s ((CfgSide n _ _ _) n)))))
+
+(fn cfg_side_en ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ s _ _ _ _) (match s ((CfgSide _ e _ _) e)))))
+
+(fn cfg_side_pindir ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ s _ _ _ _) (match s ((CfgSide _ _ p _) p)))))
+
+(fn cfg_sideset_base ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ s _ _ _ _) (match s ((CfgSide _ _ _ b) b)))))
+
+(fn cfg_jmp_pin ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ p _ _ _) (match p ((CfgPins j _ _ _ _ _ _) j)))))
+
+(fn cfg_in_base ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ p _ _ _) (match p ((CfgPins _ i _ _ _ _ _) i)))))
+
+(fn cfg_out_base ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ p _ _ _) (match p ((CfgPins _ _ o _ _ _ _) o)))))
+
+(fn cfg_out_count ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ p _ _ _) (match p ((CfgPins _ _ _ n _ _ _) n)))))
+
+(fn cfg_set_base ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ p _ _ _) (match p ((CfgPins _ _ _ _ b _ _) b)))))
+
+(fn cfg_set_count ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ p _ _ _) (match p ((CfgPins _ _ _ _ _ n _) n)))))
+
+(fn cfg_in_count ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ p _ _ _) (match p ((CfgPins _ _ _ _ _ _ n) n)))))
+
+(fn cfg_autopush ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ _ s _ _) (match s ((CfgShift a _ _ _ _ _) a)))))
+
+(fn cfg_autopull ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ _ s _ _) (match s ((CfgShift _ a _ _ _ _) a)))))
+
+(fn cfg_push_threshold ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ _ s _ _) (match s ((CfgShift _ _ t _ _ _) t)))))
+
+(fn cfg_pull_threshold ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ _ s _ _) (match s ((CfgShift _ _ _ t _ _) t)))))
+
+(fn cfg_in_shift_right ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ _ s _ _) (match s ((CfgShift _ _ _ _ r _) r)))))
+
+(fn cfg_out_shift_right ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ _ s _ _) (match s ((CfgShift _ _ _ _ _ r) r)))))
+
+(fn cfg_clkdiv_int ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ _ _ k _) (match k ((CfgClk i _) i)))))
+
+(fn cfg_clkdiv_frac ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ _ _ k _) (match k ((CfgClk _ f) f)))))
+
+(fn cfg_status_sel ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ _ _ _ m) (match m ((CfgMisc s _ _ _ _) s)))))
+
+(fn cfg_status_n ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ _ _ _ m) (match m ((CfgMisc _ n _ _ _) n)))))
+
+(fn cfg_sm_id ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ _ _ _ m) (match m ((CfgMisc _ _ i _ _) i)))))
+
+(fn cfg_tx_depth ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ _ _ _ m) (match m ((CfgMisc _ _ _ d _) d)))))
+
+(fn cfg_rx_depth ((c NCfg)) Int
+  (match c
+    ((NCfg _ _ _ _ _ _ m) (match m ((CfgMisc _ _ _ _ d) d)))))
+
+(fn code_at ((c NCfg) (i Int)) Int
+  (ilist_at (cfg_code c) i))
+
+;; --- NState (spec §1) --------------------------------------------------------
+;; fields: pc x y isr osr isr_count osr_count delay_count stall pending_exec
+;;         irq_flags out_latch dir_latch clk_acc tx rx
+
+(type NState
+  (NState Int Int Int Int Int Int Int Int Stall (Option Int) Int Int Int Int Fifo Fifo))
+
+;; Reset state (spec §1): out_latch ALL-ONES, osr_count 32, everything else 0.
+(fn nstate_new ((cfg NCfg)) NState
+  (NState 0 0 0 0 0 0 32 0 StNone None 0 4294967295 0 0
+    (fifo_new (cfg_tx_depth cfg)) (fifo_new (cfg_rx_depth cfg))))
+
+(fn st_pc ((s NState)) Int
+  (match s
+    ((NState v _ _ _ _ _ _ _ _ _ _ _ _ _ _ _) v)))
+
+(fn st_x ((s NState)) Int
+  (match s
+    ((NState _ v _ _ _ _ _ _ _ _ _ _ _ _ _ _) v)))
+
+(fn st_y ((s NState)) Int
+  (match s
+    ((NState _ _ v _ _ _ _ _ _ _ _ _ _ _ _ _) v)))
+
+(fn st_isr ((s NState)) Int
+  (match s
+    ((NState _ _ _ v _ _ _ _ _ _ _ _ _ _ _ _) v)))
+
+(fn st_osr ((s NState)) Int
+  (match s
+    ((NState _ _ _ _ v _ _ _ _ _ _ _ _ _ _ _) v)))
+
+(fn st_isr_count ((s NState)) Int
+  (match s
+    ((NState _ _ _ _ _ v _ _ _ _ _ _ _ _ _ _) v)))
+
+(fn st_osr_count ((s NState)) Int
+  (match s
+    ((NState _ _ _ _ _ _ v _ _ _ _ _ _ _ _ _) v)))
+
+(fn st_delay ((s NState)) Int
+  (match s
+    ((NState _ _ _ _ _ _ _ v _ _ _ _ _ _ _ _) v)))
+
+(fn st_stall ((s NState)) Stall
+  (match s
+    ((NState _ _ _ _ _ _ _ _ v _ _ _ _ _ _ _) v)))
+
+(fn st_pending ((s NState)) (Option Int)
+  (match s
+    ((NState _ _ _ _ _ _ _ _ _ v _ _ _ _ _ _) v)))
+
+(fn st_irq ((s NState)) Int
+  (match s
+    ((NState _ _ _ _ _ _ _ _ _ _ v _ _ _ _ _) v)))
+
+(fn st_out_latch ((s NState)) Int
+  (match s
+    ((NState _ _ _ _ _ _ _ _ _ _ _ v _ _ _ _) v)))
+
+(fn st_dir_latch ((s NState)) Int
+  (match s
+    ((NState _ _ _ _ _ _ _ _ _ _ _ _ v _ _ _) v)))
+
+(fn st_clk_acc ((s NState)) Int
+  (match s
+    ((NState _ _ _ _ _ _ _ _ _ _ _ _ _ v _ _) v)))
+
+(fn st_tx ((s NState)) Fifo
+  (match s
+    ((NState _ _ _ _ _ _ _ _ _ _ _ _ _ _ v _) v)))
+
+(fn st_rx ((s NState)) Fifo
+  (match s
+    ((NState _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ v) v)))
+
+(fn set_pc ((s NState) (v Int)) NState
+  (match s
+    ((NState _ x y isr osr ic oc dl stl pe irq ol dr ck tx rx)
+      (NState v x y isr osr ic oc dl stl pe irq ol dr ck tx rx))))
+
+(fn set_x ((s NState) (v Int)) NState
+  (match s
+    ((NState pc _ y isr osr ic oc dl stl pe irq ol dr ck tx rx)
+      (NState pc v y isr osr ic oc dl stl pe irq ol dr ck tx rx))))
+
+(fn set_y ((s NState) (v Int)) NState
+  (match s
+    ((NState pc x _ isr osr ic oc dl stl pe irq ol dr ck tx rx)
+      (NState pc x v isr osr ic oc dl stl pe irq ol dr ck tx rx))))
+
+(fn set_isr ((s NState) (v Int)) NState
+  (match s
+    ((NState pc x y _ osr ic oc dl stl pe irq ol dr ck tx rx)
+      (NState pc x y v osr ic oc dl stl pe irq ol dr ck tx rx))))
+
+(fn set_osr ((s NState) (v Int)) NState
+  (match s
+    ((NState pc x y isr _ ic oc dl stl pe irq ol dr ck tx rx)
+      (NState pc x y isr v ic oc dl stl pe irq ol dr ck tx rx))))
+
+(fn set_isr_count ((s NState) (v Int)) NState
+  (match s
+    ((NState pc x y isr osr _ oc dl stl pe irq ol dr ck tx rx)
+      (NState pc x y isr osr v oc dl stl pe irq ol dr ck tx rx))))
+
+(fn set_osr_count ((s NState) (v Int)) NState
+  (match s
+    ((NState pc x y isr osr ic _ dl stl pe irq ol dr ck tx rx)
+      (NState pc x y isr osr ic v dl stl pe irq ol dr ck tx rx))))
+
+(fn set_delay ((s NState) (v Int)) NState
+  (match s
+    ((NState pc x y isr osr ic oc _ stl pe irq ol dr ck tx rx)
+      (NState pc x y isr osr ic oc v stl pe irq ol dr ck tx rx))))
+
+(fn set_stall ((s NState) (v Stall)) NState
+  (match s
+    ((NState pc x y isr osr ic oc dl _ pe irq ol dr ck tx rx)
+      (NState pc x y isr osr ic oc dl v pe irq ol dr ck tx rx))))
+
+(fn set_pending ((s NState) (v (Option Int))) NState
+  (match s
+    ((NState pc x y isr osr ic oc dl stl _ irq ol dr ck tx rx)
+      (NState pc x y isr osr ic oc dl stl v irq ol dr ck tx rx))))
+
+(fn set_irq ((s NState) (v Int)) NState
+  (match s
+    ((NState pc x y isr osr ic oc dl stl pe _ ol dr ck tx rx)
+      (NState pc x y isr osr ic oc dl stl pe v ol dr ck tx rx))))
+
+(fn set_out ((s NState) (v Int)) NState
+  (match s
+    ((NState pc x y isr osr ic oc dl stl pe irq _ dr ck tx rx)
+      (NState pc x y isr osr ic oc dl stl pe irq v dr ck tx rx))))
+
+(fn set_dir ((s NState) (v Int)) NState
+  (match s
+    ((NState pc x y isr osr ic oc dl stl pe irq ol _ ck tx rx)
+      (NState pc x y isr osr ic oc dl stl pe irq ol v ck tx rx))))
+
+(fn set_clk ((s NState) (v Int)) NState
+  (match s
+    ((NState pc x y isr osr ic oc dl stl pe irq ol dr _ tx rx)
+      (NState pc x y isr osr ic oc dl stl pe irq ol dr v tx rx))))
+
+(fn set_tx ((s NState) (v Fifo)) NState
+  (match s
+    ((NState pc x y isr osr ic oc dl stl pe irq ol dr ck _ rx)
+      (NState pc x y isr osr ic oc dl stl pe irq ol dr ck v rx))))
+
+(fn set_rx ((s NState) (v Fifo)) NState
+  (match s
+    ((NState pc x y isr osr ic oc dl stl pe irq ol dr ck tx _)
+      (NState pc x y isr osr ic oc dl stl pe irq ol dr ck tx v))))
+
+;; --- pin-field write / compose / clock (spec §3, §4, §8 preamble) -------------
+
+;; Replace `count` bits of `field` starting at `base` (mod-32 rotate); no-op
+;; when count = 0; count >= 32 means the full word.
+(fn write_pin_field ((field Int) (value Int) (base Int) (count Int)) Int
+  (if (int_eq count 0)
+    field
+    (let ((m (if (le 32 count) 4294967295 (bit_lo count))))
+      (let ((pm (rotl32 m base))
+            (pv (rotl32 (band value m) base)))
+        (bor (band field (bxor pm 4294967295)) pv)))))
+
+;; gpio compose (spec §4): PIO drive where OE, stimulus overrides, else 0.
+(fn compose ((st NState) (emask Int) (extv Int)) Int
+  (bor (band (band (st_out_latch st) (st_dir_latch st)) (bxor emask 4294967295))
+       (band extv emask)))
+
+;; clock divider (spec §3): acc += 256; fire iff acc >= T (then subtract).
+;; Returns (Pair state fired) with fired 0/1.
+(fn clock_tick ((st NState) (cfg NCfg)) (Pair NState Int)
+  (let ((t (if (int_eq (cfg_clkdiv_int cfg) 0)
+             16777216
+             (+ (* (cfg_clkdiv_int cfg) 256) (cfg_clkdiv_frac cfg))))
+        (acc (+ (st_clk_acc st) 256)))
+    (if (le t acc)
+      (Pair (set_clk st (- acc t)) 1)
+      (Pair (set_clk st acc) 0))))
+
+;; --- stall re-check (spec §7); returns 0/1 -------------------------------------
+
+(fn still_stalled ((st NState) (cfg NCfg) (gpio Int)) Int
+  (match (st_stall st)
+    (StNone 0)
+    ((StWaitGpio pol idx) (if (int_eq (bit_at gpio (band idx 31)) pol) 0 1))
+    ((StWaitPin pol idx)
+      (if (int_eq (bit_at gpio (band (+ (cfg_in_base cfg) idx) 31)) pol) 0 1))
+    ((StWaitIrq pol idx) (if (int_eq (bit_at (st_irq st) (band idx 7)) pol) 0 1))
+    (StPull (fifo_empty (st_tx st)))
+    (StPush (fifo_full (st_rx st)))
+    ((StIrqWait idx) (bit_at (st_irq st) (band idx 7)))))
+
+;; --- decode helpers (spec §6) --------------------------------------------------
+
+;; Split the 5-bit delay/side-set field: (Pair side-set delay). None side-set
+;; = pins HOLD this cycle.
+(fn split_side_delay ((field Int) (cfg NCfg)) (Pair (Option Int) Int)
+  (let ((count (cfg_side_count cfg)))
+    (if (int_eq count 0)
+      (Pair None (band field 31))
+      (let ((delay_bits (- 5 count)))
+        (let ((ss_raw (bshr field delay_bits))
+              (delay (band field (bit_lo delay_bits))))
+          (Pair
+            (if (int_eq (cfg_side_en cfg) 1)
+              (if (int_eq (bit_at ss_raw (- count 1)) 1)
+                (Some (band ss_raw (bit_lo (- count 1))))
+                None)
+              (Some ss_raw))
+            delay))))))
+
+(fn resolve_irq ((idx Int) (sm Int)) Int
+  (if (int_eq (band idx 16) 0)
+    (band idx 7)
+    (bor (mod (+ (band idx 3) sm) 4) (band idx 4))))
+
+;; --- instruction semantics (spec §8) -------------------------------------------
+
+;; JMP condition: may mutate X/Y (post-decrement). (Pair state taken), 0/1.
+(fn jmp_take ((st NState) (cfg NCfg) (cond Int) (gpio Int)) (Pair NState Int)
+  (match cond
+    (0 (Pair st 1))
+    (1 (Pair st (if (int_eq (st_x st) 0) 1 0)))
+    (2 (if (int_eq (st_x st) 0)
+         (Pair st 0)
+         (Pair (set_x st (- (st_x st) 1)) 1)))
+    (3 (Pair st (if (int_eq (st_y st) 0) 1 0)))
+    (4 (if (int_eq (st_y st) 0)
+         (Pair st 0)
+         (Pair (set_y st (- (st_y st) 1)) 1)))
+    (5 (Pair st (if (int_eq (st_x st) (st_y st)) 0 1)))
+    (6 (Pair st (bit_at gpio (band (cfg_jmp_pin cfg) 31))))
+    (_ (Pair st (if (lt (st_osr_count st) (cfg_pull_threshold cfg)) 1 0)))))
+
+(fn exec_jmp ((st NState) (cfg NCfg) (operand Int) (gpio Int)) (Pair NState Int)
+  (let ((cond (band (bshr operand 5) 7))
+        (addr (band operand 31)))
+    (match (jmp_take st cfg cond gpio)
+      ((Pair st1 take)
+        (if (int_eq take 1) (Pair (set_pc st1 addr) 1) (Pair st1 0))))))
+
+(fn exec_wait ((st NState) (cfg NCfg) (operand Int) (gpio Int)) (Pair NState Int)
+  (let ((source (band (bshr operand 5) 3))
+        (idx (band operand 31))
+        (pol (bit_at operand 7)))
+    (Pair
+      (match source
+        (0 (if (int_eq (bit_at gpio (band idx 31)) pol)
+             st
+             (set_stall st (StWaitGpio pol idx))))
+        (1 (if (int_eq (bit_at gpio (band (+ (cfg_in_base cfg) idx) 31)) pol)
+             st
+             (set_stall st (StWaitPin pol idx))))
+        (2 (let ((iq (resolve_irq idx (cfg_sm_id cfg))))
+             (if (int_eq (bit_at (st_irq st) (band iq 7)) pol)
+               (set_irq st (band (st_irq st) (bxor (bshl 1 (band iq 7)) 255)))
+               (set_stall st (StWaitIrq pol iq)))))
+        (_ st))
+      0)))
+
+;; push ISR to RX (drops if full), clear ISR and its count.
+(fn isr_flush ((st NState)) NState
+  (set_isr_count (set_isr (set_rx st (fifo_push (st_rx st) (st_isr st))) 0) 0))
+
+(fn exec_in_shift ((st NState) (cfg NCfg) (source Int) (bc Int) (gpio Int)) (Pair NState Int)
+  (let ((src (match source
+               (0 (rotr32 gpio (cfg_in_base cfg)))
+               (1 (st_x st))
+               (2 (st_y st))
+               (6 (st_isr st))
+               (7 (st_osr st))
+               (_ 0))))
+    (let ((data (if (le 32 bc) src (band src (bit_lo bc)))))
+      (let ((nisr (if (int_eq (cfg_in_shift_right cfg) 1)
+                    (if (le 32 bc)
+                      data
+                      (mask32 (bor (bshr (st_isr st) bc) (bshl data (- 32 bc)))))
+                    (if (le 32 bc)
+                      data
+                      (mask32 (bor (bshl (st_isr st) bc) data))))))
+        (let ((st1 (set_isr_count (set_isr st nisr)
+                     (imin (+ (st_isr_count st) bc) 32))))
+          (Pair
+            (if (int_eq (cfg_autopush cfg) 1)
+              (if (le (cfg_push_threshold cfg) (st_isr_count st1))
+                (if (int_eq (fifo_full (st_rx st1)) 1) st1 (isr_flush st1))
+                st1)
+              st1)
+            0))))))
+
+(fn exec_in ((st NState) (cfg NCfg) (operand Int) (gpio Int)) (Pair NState Int)
+  (let ((source (band (bshr operand 5) 7))
+        (bc (let ((b (band operand 31))) (if (int_eq b 0) 32 b))))
+    (if (int_eq (cfg_autopush cfg) 1)
+      (if (le (cfg_push_threshold cfg) (st_isr_count st))
+        (if (int_eq (fifo_full (st_rx st)) 1)
+          (Pair (set_stall st StPush) 0)
+          (exec_in_shift (isr_flush st) cfg source bc gpio))
+        (exec_in_shift st cfg source bc gpio))
+      (exec_in_shift st cfg source bc gpio))))
+
+(fn exec_out_shift ((st NState) (cfg NCfg) (dest Int) (bc Int)) (Pair NState Int)
+  (let ((osr (st_osr st)))
+    (let ((nosr (if (int_eq (cfg_out_shift_right cfg) 1)
+                  (if (le 32 bc) 0 (bshr osr bc))
+                  (if (le 32 bc) 0 (mask32 (bshl osr bc)))))
+          (data (if (int_eq (cfg_out_shift_right cfg) 1)
+                  (if (le 32 bc) osr (band osr (bit_lo bc)))
+                  (if (le 32 bc) osr (bshr osr (- 32 bc))))))
+      (let ((st1 (set_osr_count (set_osr st nosr)
+                   (imin (+ (st_osr_count st) bc) 32))))
+        (match dest
+          (0 (Pair (set_out st1 (write_pin_field (st_out_latch st1) data
+                                  (cfg_out_base cfg) (imin (cfg_out_count cfg) bc)))
+                   0))
+          (1 (Pair (set_x st1 data) 0))
+          (2 (Pair (set_y st1 data) 0))
+          (3 (Pair st1 0))
+          (4 (Pair (set_dir st1 (write_pin_field (st_dir_latch st1) data
+                                  (cfg_out_base cfg) (imin (cfg_out_count cfg) bc)))
+                   0))
+          (5 (Pair (set_pc st1 (band data 31)) 1))
+          (6 (Pair (set_isr st1 data) 0))
+          (_ (Pair (set_pending st1 (Some (band data 65535))) 0)))))))
+
+(fn exec_out ((st NState) (cfg NCfg) (operand Int)) (Pair NState Int)
+  (let ((dest (band (bshr operand 5) 7))
+        (bc (let ((b (band operand 31))) (if (int_eq b 0) 32 b))))
+    (if (int_eq (cfg_autopull cfg) 1)
+      (if (le (cfg_pull_threshold cfg) (st_osr_count st))
+        (match (fifo_pop (st_tx st))
+          ((Pair popped ntx)
+            (match popped
+              (None (Pair (set_stall st StPull) 0))
+              ((Some v)
+                (exec_out_shift (set_osr_count (set_osr (set_tx st ntx) v) 0)
+                  cfg dest bc)))))
+        (exec_out_shift st cfg dest bc))
+      (exec_out_shift st cfg dest bc))))
+
+(fn do_pull ((st NState) (if_x Int) (block Int)) NState
+  (if (int_eq (fifo_empty (st_tx st)) 1)
+    (if (int_eq if_x 1)
+      (set_osr_count (set_osr st (st_x st)) 0)
+      (if (int_eq block 1)
+        (set_stall st StPull)
+        (set_osr_count (set_osr st (st_x st)) 0)))
+    (match (fifo_pop (st_tx st))
+      ((Pair popped ntx)
+        (match popped
+          (None st)
+          ((Some v) (set_osr_count (set_osr (set_tx st ntx) v) 0)))))))
+
+(fn do_push ((st NState) (if_x Int) (block Int)) NState
+  (if (int_eq (fifo_full (st_rx st)) 1)
+    (if (int_eq if_x 1)
+      st
+      (if (int_eq block 1)
+        (set_stall st StPush)
+        (isr_flush st)))
+    (isr_flush st)))
+
+(fn exec_pushpull ((st NState) (operand Int)) (Pair NState Int)
+  (let ((is_pull (bit_at operand 7))
+        (if_x (bit_at operand 6))
+        (block (bit_at operand 5)))
+    (Pair (if (int_eq is_pull 1) (do_pull st if_x block) (do_push st if_x block))
+          0)))
+
+(fn mov_status ((st NState) (cfg NCfg)) Int
+  (let ((lvl (if (int_eq (cfg_status_sel cfg) 1)
+              (fifo_level (st_rx st))
+              (fifo_level (st_tx st)))))
+    (if (lt lvl (cfg_status_n cfg)) 4294967295 0)))
+
+(fn exec_mov ((st NState) (cfg NCfg) (operand Int) (gpio Int)) (Pair NState Int)
+  (let ((source (band operand 7))
+        (op (band (bshr operand 3) 3))
+        (dest (band (bshr operand 5) 7)))
+    (let ((raw (match source
+                 (0 (let ((r (rotr32 gpio (cfg_in_base cfg))))
+                      (if (int_eq (cfg_in_count cfg) 0)
+                        r
+                        (if (le 32 (cfg_in_count cfg))
+                          r
+                          (band r (bit_lo (cfg_in_count cfg)))))))
+                 (1 (st_x st))
+                 (2 (st_y st))
+                 (5 (mov_status st cfg))
+                 (6 (st_isr st))
+                 (7 (st_osr st))
+                 (_ 0))))
+      (let ((val (match op
+                   (1 (bxor raw 4294967295))
+                   (2 (rev_bits raw))
+                   (_ raw))))
+        (match dest
+          (0 (Pair (set_out st (write_pin_field (st_out_latch st) val
+                                 (cfg_out_base cfg) (cfg_out_count cfg)))
+                   0))
+          (1 (Pair (set_x st val) 0))
+          (2 (Pair (set_y st val) 0))
+          (3 (Pair (set_dir st (write_pin_field (st_dir_latch st) val
+                                 (cfg_out_base cfg) (cfg_out_count cfg)))
+                   0))
+          (4 (Pair (set_pending st (Some (band val 65535))) 0))
+          (5 (Pair (set_pc st (band val 31)) 1))
+          (6 (Pair (set_isr st val) 0))
+          (_ (Pair (set_osr st val) 0)))))))
+
+(fn exec_irq ((st NState) (cfg NCfg) (operand Int)) (Pair NState Int)
+  (let ((clear (bit_at operand 6))
+        (iq (resolve_irq (band operand 31) (cfg_sm_id cfg)))
+        (wait (bit_at operand 5)))
+    (Pair
+      (if (int_eq clear 1)
+        (set_irq st (band (st_irq st) (bxor (bshl 1 (band iq 7)) 255)))
+        (let ((st1 (set_irq st (bor (st_irq st) (bshl 1 (band iq 7))))))
+          (if (int_eq wait 1) (set_stall st1 (StIrqWait iq)) st1)))
+      0)))
+
+(fn exec_set ((st NState) (cfg NCfg) (operand Int)) (Pair NState Int)
+  (let ((dest (band (bshr operand 5) 7))
+        (data (band operand 31)))
+    (Pair
+      (match dest
+        (0 (set_out st (write_pin_field (st_out_latch st) data
+                         (cfg_set_base cfg) (cfg_set_count cfg))))
+        (1 (set_x st data))
+        (2 (set_y st data))
+        (4 (set_dir st (write_pin_field (st_dir_latch st) data
+                         (cfg_set_base cfg) (cfg_set_count cfg))))
+        (_ st))
+      0)))
+
+;; Total decode + dispatch (spec §6/§8). (Pair state pc_set), pc_set 0/1.
+(fn exec_op ((st NState) (cfg NCfg) (opcode Int) (operand Int) (gpio Int)) (Pair NState Int)
+  (match opcode
+    (0 (exec_jmp st cfg operand gpio))
+    (1 (exec_wait st cfg operand gpio))
+    (2 (exec_in st cfg operand gpio))
+    (3 (exec_out st cfg operand))
+    (4 (exec_pushpull st operand))
+    (5 (exec_mov st cfg operand gpio))
+    (6 (exec_irq st cfg operand))
+    (_ (exec_set st cfg operand))))
+
+;; --- the cycle (spec §5) --------------------------------------------------------
+
+(fn advance_pc ((st NState) (cfg NCfg)) NState
+  (if (int_eq (st_pc st) (cfg_wrap_top cfg))
+    (set_pc st (cfg_wrap_bottom cfg))
+    (set_pc st (band (+ (st_pc st) 1) 31))))
+
+;; Side-set applies ALWAYS (even under stall), AFTER the op's own pin writes.
+(fn apply_sideset ((st NState) (cfg NCfg) (ss (Option Int))) NState
+  (match ss
+    (None st)
+    ((Some v)
+      (let ((vb (if (int_eq (cfg_side_en cfg) 1)
+                  (- (cfg_side_count cfg) 1)
+                  (cfg_side_count cfg))))
+        (if (lt 0 vb)
+          (if (int_eq (cfg_side_pindir cfg) 1)
+            (set_dir st (write_pin_field (st_dir_latch st) v (cfg_sideset_base cfg) vb))
+            (set_out st (write_pin_field (st_out_latch st) v (cfg_sideset_base cfg) vb)))
+          st)))))
+
+;; fetch: pending_exec overrides code[pc] (and is consumed). (state insn forced).
+(type Fetch
+  (Fetch NState Int Int))
+
+(fn fetch ((st NState) (cfg NCfg)) Fetch
+  (match (st_pending st)
+    (None (Fetch st (code_at cfg (st_pc st)) 0))
+    ((Some w) (Fetch (set_pending st None) w 1))))
+
+(fn step_exec ((st0 NState) (cfg NCfg) (gpio Int)) NState
+  (match (fetch st0 cfg)
+    ((Fetch st1 insn forced)
+      (let ((opcode (band (bshr insn 13) 7))
+            (operand (band insn 255)))
+        (match (split_side_delay (band (bshr insn 8) 31) cfg)
+          ((Pair sideset delay)
+            (match (exec_op st1 cfg opcode operand gpio)
+              ((Pair st2 pc_set)
+                (let ((st3 (apply_sideset st2 cfg sideset)))
+                  (match (st_stall st3)
+                    (StNone
+                      (let ((st4 (set_delay st3 delay)))
+                        (if (int_eq forced 1)
+                          st4
+                          (if (int_eq pc_set 1) st4 (advance_pc st4 cfg)))))
+                    (_ st3)))))))))))
+
+;; One PIO cycle (divided clock already fired): delay countdown, stall
+;; re-check (a resolved stall falls through and RE-EXECUTES code[pc]),
+;; fetch/execute, side-set, delay latch + PC advance when unstalled.
+(fn step ((st NState) (cfg NCfg) (gpio Int)) NState
+  (if (lt 0 (st_delay st))
+    (set_delay st (- (st_delay st) 1))
+    (match (st_stall st)
+      (StNone (step_exec st cfg gpio))
+      (_ (if (int_eq (still_stalled st cfg gpio) 1)
+           st
+           (step_exec (set_stall st StNone) cfg gpio))))))
+
+;; force_exec (spec §5 setup path): clear stall+delay, run the word once,
+;; outside the clock divider.
+(fn force_exec ((st NState) (cfg NCfg) (insn Int) (gpio Int)) NState
+  (step (set_pending (set_delay (set_stall st StNone) 0) (Some insn)) cfg gpio))
+
+;; --- the vector driver -----------------------------------------------------------
+;; Driver semantics (dump_shard_vectors / narrow::run_with_stim):
+;;   - output_pins set dir_latch bits before cycle 0;
+;;   - inputs (already autopull-padded by the generator) pre-load the TX FIFO
+;;     when <= 4 words, else stream: refill the FIFO to full from the
+;;     remaining inputs at the START of each cycle;
+;;   - stim value at cycle i = stim_values[min(i, len-1)] (empty = 0);
+;;   - per cycle: gpio := compose; if clock_tick fires, step; then observe
+;;     levels := compose and OE := dir_latch on the capture pins.
+
+(type RunCtx
+  (RunCtx NCfg Int Int (List Int))) ; cfg streaming stim_mask capture_pins
+
+(fn stim_head ((svs (List Int))) Int
+  (match svs
+    (Nil 0)
+    ((Cons v _) v)))
+
+(fn stim_next ((svs (List Int))) (List Int)
+  (match svs
+    (Nil Nil)
+    ((Cons _ t)
+      (match t
+        (Nil svs)
+        ((Cons _ _) t)))))
+
+(fn refill ((f Fifo) (ins (List Int))) (Pair Fifo (List Int))
+  (measure (struct ins))
+  (match ins
+    (Nil (Pair f Nil))
+    ((Cons h t)
+      (if (int_eq (fifo_full f) 1)
+        (Pair f ins)
+        (refill (fifo_push f h) t)))))
+
+(fn preload_f ((f Fifo) (ins (List Int))) Fifo
+  (measure (struct ins))
+  (match ins
+    (Nil f)
+    ((Cons h t) (preload_f (fifo_push f h) t))))
+
+(fn pins_to_mask ((pins (List Int)) (acc Int)) Int
+  (measure (struct pins))
+  (match pins
+    (Nil acc)
+    ((Cons p t) (pins_to_mask t (bor acc (bshl 1 p))))))
+
+;; trace word: bit j = level of capture_pins[j], bit 16+j = its OE.
+(fn capture_word ((levels Int) (dir Int) (pins (List Int)) (j Int) (acc Int)) Int
+  (measure (struct pins))
+  (match pins
+    (Nil acc)
+    ((Cons p rest)
+      (capture_word levels dir rest (+ j 1)
+        (bor acc (bor (if (int_eq (bit_at levels p) 1) (bshl 1 j) 0)
+                      (if (int_eq (bit_at dir p) 1) (bshl 1 (+ 16 j)) 0)))))))
+
+;; Run one system-clock cycle per expected-trace word; count mismatches.
+(fn run_cycles ((st NState) (ctx RunCtx) (ins (List Int)) (svs (List Int)) (expect (List Int)) (bad Int)) Int
+  (measure (struct expect))
+  (match expect
+    (Nil bad)
+    ((Cons want rest)
+      (match ctx
+        ((RunCtx cfg streaming smask cpins)
+          (match (if (int_eq streaming 1) (refill (st_tx st) ins) (Pair (st_tx st) ins))
+            ((Pair ntx nins)
+              (let ((st1 (set_tx st ntx))
+                    (extv (stim_head svs)))
+                (let ((gpio (compose st1 smask extv)))
+                  (match (clock_tick st1 cfg)
+                    ((Pair st2 fire)
+                      (let ((st3 (if (int_eq fire 1) (step st2 cfg gpio) st2)))
+                        (let ((w (capture_word (compose st3 smask extv)
+                                   (st_dir_latch st3) cpins 0 0)))
+                          (run_cycles st3 ctx nins (stim_next svs) rest
+                            (if (int_eq w want) bad (+ bad 1))))))))))))))))
+
+;; A test vector: name cfg inputs output_pins capture_pins stim_mask
+;; stim_values trace. `inputs` arrive already autopull-padded.
+(type Vec
+  (Vec (List Int) NCfg (List Int) (List Int) (List Int) Int (List Int) (List Int)))
+
+(fn vec_name ((v Vec)) (List Int)
+  (match v
+    ((Vec n _ _ _ _ _ _ _) n)))
+
+;; Replay one vector; returns the number of mismatched trace words (0 = PASS).
+(fn run_vector ((v Vec)) Int
+  (match v
+    ((Vec _ cfg ins opins cpins smask svs trace)
+      (let ((streaming (if (lt 4 (ilist_len ins)) 1 0))
+            (st0 (set_dir (nstate_new cfg) (pins_to_mask opins 0))))
+        (match (if (int_eq streaming 1)
+                 (Pair st0 ins)
+                 (Pair (set_tx st0 (preload_f (st_tx st0) ins)) Nil))
+          ((Pair st1 ins1)
+            (run_cycles st1 (RunCtx cfg streaming smask cpins) ins1 svs trace 0)))))))
