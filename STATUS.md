@@ -70,10 +70,17 @@ at a time. `ro_sampler` diagnostic: `cargo run --bin ro_sampler`.
 Saleae automation on 127.0.0.1:10430; offline decoder
 `tools/logic2-dme-decoder/decode_csv.py` (FCS-validated).
 
-## Next
+## Next (user decision 2026-07-10 close: exit the hardware rabbit hole)
 
-1. User: analog check (ground clip / termination), then rerun sampler.
-2. Resynthesis spec + narrowing evaluator with duty/vanish model;
-   iterate candidates against `rx_bench_repro.rs` fixtures.
-3. After bench green: single-SM TX ping-through finale.
-4. Paused: SMT len-4 probe, compress2, len-5 fleet (benchmark tier).
+1. **Resume the optimizer: the needed-narrowing engine** (bit-field
+   search over 32x16 instruction space, own evaluator — see
+   [[narrowing-engine-design]] memory + docs/architecture.md). The
+   bench detour's payoff feeds straight in: the evaluator MUST model
+   duty skew and parked sub-cycle phase (aperture-only certified wrong
+   fixes twice), and `rx_bench_repro.rs` + ro_sampled fixtures are the
+   certification battery. Flagship objective: phase-invariant RX.
+2. Hardware validation DEFERRED: single-SM TX accepted as functionally
+   identical on wire evidence (emulator edge-identical + Saleae).
+   Ping-through demo + 1-vs-2-SM comparison waits until phase-invariant
+   RX makes clean N/N runs possible.
+3. Paused: SMT len-4 probe, compress2, len-5 fleet (benchmark tier).
