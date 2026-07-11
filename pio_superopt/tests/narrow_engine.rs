@@ -177,6 +177,7 @@ fn square_wave_l2_rediscovered() {
         irq_sets: vec![],
         expected: vec![],
         seed: vec![],
+        memo_cap: 1 << 20,
     };
     spec.expected = run_spec(&spec, reference);
     // Sanity of the oracle itself: a strict square wave after the first edge.
@@ -235,6 +236,7 @@ fn period3_l1_impossible() {
         irq_sets: vec![],
         expected,
         seed: vec![],
+        memo_cap: 1 << 20,
     };
     let result = search(&spec, 10);
     assert_eq!(
@@ -276,6 +278,7 @@ fn mov_toggle_l1_census_exact() {
         irq_sets: vec![],
         expected: vec![],
         seed: vec![],
+        memo_cap: 1 << 20,
     };
     spec.expected = run_spec(&spec, reference);
     assert!(spec.expected.windows(2).all(|w| (w[0] ^ w[1]) & 1 != 0), "oracle is not a toggle");
@@ -329,6 +332,7 @@ fn nop_l1_census_exact() {
         irq_sets: vec![],
         expected: vec![],
         seed: vec![],
+        memo_cap: 1 << 20,
     };
     spec.expected = run_spec(&spec, reference);
     assert!(spec.expected.iter().all(|&w| w == (1 | 1 << 16)), "oracle is not constant HIGH");
@@ -386,6 +390,7 @@ fn p3_delay_normal_form() {
         // Both slots pinned to the MOV family to keep the space small;
         // delays remain fully searchable, which is what P3 quotients.
         seed: vec![(0, 0xE000, 0xA000), (1, 0xE000, 0xA000)],
+        memo_cap: 1 << 20,
     };
     let reference = words_of(&[], &SideCfg::NONE);
     spec.expected = run_spec(&spec, reference);
@@ -412,6 +417,115 @@ fn p3_delay_normal_form() {
         "p3_delay_normal_form: items={} canon={} champions={}",
         result.stats.items, result.stats.canon_pruned, result.stats.champions_found
     );
+}
+
+/// The memo must be invisible in results: identical champion LISTS (set
+/// and order) with the memo on and off, across satisfiable and
+/// impossible spaces, including one with register naming and pull-empty
+/// binding forks in play.
+#[test]
+fn memo_on_off_equivalence() {
+    let mut specs: Vec<EngineSpec> = Vec::new();
+    // Square wave (satisfiable L=2).
+    {
+        let config = Config {
+            pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 1, ..PinMap::default() },
+            ..Config::default()
+        };
+        let mut s = EngineSpec {
+            cfg: cfg_for(config, 0, 1),
+            slots: 2,
+            cycles: 17,
+            inputs: vec![],
+            output_pins: vec![0],
+            capture_pins: vec![0],
+            stim: Stim::default(),
+            irq_sets: vec![],
+            expected: vec![],
+            seed: vec![],
+            memo_cap: 0,
+        };
+        let reference = words_of(
+            &[
+                Insn::plain(Op::Set { dst: SetDst::Pins, data: 1 }),
+                Insn::plain(Op::Set { dst: SetDst::Pins, data: 0 }),
+            ],
+            &SideCfg::NONE,
+        );
+        s.expected = run_spec(&s, reference);
+        specs.push(s);
+    }
+    // Period-3 (impossible L=1, loopback reads in play).
+    {
+        let config = Config {
+            pins: PinMap {
+                set_base: 0,
+                set_count: 1,
+                out_base: 0,
+                out_count: 1,
+                in_base: 0,
+                ..PinMap::default()
+            },
+            ..Config::default()
+        };
+        let expected =
+            (0..18u32).map(|c| if c % 3 < 2 { 1 | 1 << 16 } else { 1 << 16 }).collect();
+        specs.push(EngineSpec {
+            cfg: cfg_for(config, 0, 0),
+            slots: 1,
+            cycles: 18,
+            inputs: vec![],
+            output_pins: vec![0],
+            capture_pins: vec![0],
+            stim: Stim::default(),
+            irq_sets: vec![],
+            expected,
+            seed: vec![],
+            memo_cap: 0,
+        });
+    }
+    // Pull-empty binding forks (seeded L=3).
+    {
+        let config = Config {
+            pins: PinMap { out_base: 0, out_count: 1, ..PinMap::default() },
+            ..Config::default()
+        };
+        let mut s = EngineSpec {
+            cfg: cfg_for(config, 0, 2),
+            slots: 3,
+            cycles: 6,
+            inputs: vec![],
+            output_pins: vec![0],
+            capture_pins: vec![0],
+            stim: Stim::default(),
+            irq_sets: vec![],
+            expected: vec![],
+            seed: vec![(0, 0xFFFF, 0xE043), (1, 0xFFFF, 0x8080)],
+            memo_cap: 0,
+        };
+        let mut w = words_of(&[], &SideCfg::NONE);
+        w[0] = 0xE043;
+        w[1] = 0x8080;
+        w[2] = 0x6001;
+        s.expected = run_spec(&s, w);
+        specs.push(s);
+    }
+    for (i, spec) in specs.iter_mut().enumerate() {
+        spec.memo_cap = 0;
+        let off = search(spec, 1_000_000);
+        spec.memo_cap = 1 << 20;
+        let on = search(spec, 1_000_000);
+        assert_eq!(
+            off.champions, on.champions,
+            "spec {i}: champion lists diverge between memo off/on"
+        );
+        assert_eq!(off.stats.champions_found, on.stats.champions_found, "spec {i}");
+        assert_eq!(off.champion_cap_hit, on.champion_cap_hit, "spec {i}");
+        eprintln!(
+            "memo_equivalence spec {i}: off items={} on items={} hits={} entries={}",
+            off.stats.items, on.stats.items, on.stats.memo_hits, on.stats.memo_entries
+        );
+    }
 }
 
 /// The P1 binding fork, exercised end to end. PULL nonblocking on an
@@ -450,6 +564,7 @@ fn pull_empty_binding_fork() {
             irq_sets: vec![],
             expected: vec![],
             seed: vec![(0, 0xFFFF, SET_Y_3), (1, 0xFFFF, PULL_NOBLOCK)],
+            memo_cap: 1 << 20,
         }
     };
     let mut w_seeded = words_of(&[], &side);
@@ -543,6 +658,7 @@ fn tx_a_spec(cycles: u32) -> (EngineSpec, SideCfg) {
         irq_sets,
         expected: vec![],
         seed: vec![],
+        memo_cap: 1 << 20,
     };
     (spec, side)
 }

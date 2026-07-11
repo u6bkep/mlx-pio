@@ -80,6 +80,12 @@ pub struct EngineSpec {
     /// binding fork executes — post-filter if the seed spelling is
     /// load-bearing.
     pub seed: Vec<(u8, u16, u16)>,
+    /// Consulted-set memo capacity in entries (0 disables). Records are
+    /// FAILURE-ONLY (an exhausted, champion-free subtree keyed by its
+    /// fork state + the decided fields it consulted), so hitting the
+    /// cap just freezes insertion — pruning power is lost, soundness
+    /// is not.
+    pub memo_cap: usize,
 }
 
 /// A surviving candidate subspace: decided fields plus don't-cares.
@@ -112,6 +118,10 @@ pub struct Stats {
     /// Fork values killed by the canonicity filters P2/P3/P4 (duplicate
     /// spellings whose representative is generated elsewhere).
     pub canon_pruned: u64,
+    /// Items refuted by a consulted-set memo hit (subtree skipped).
+    pub memo_hits: u64,
+    /// Failure records currently in the memo.
+    pub memo_entries: u64,
 }
 
 pub struct SearchResult {
@@ -525,8 +535,128 @@ fn peek_tick(st: &NState, cfg: &NCfg) -> bool {
     st.clk_acc + 256 >= threshold
 }
 
+/// A memo key: everything a subtree's behavior depends on besides the
+/// program fields it consults. `next_input` covers the streamed-input
+/// driver position (preloaded inputs live in the FIFO already).
+type MemoKey = (u32, u32, NState);
+
+/// Per-slot consulted-condition set: `(mask, value)` of the DECIDED
+/// fields a subtree's evaluation read. The failure claim quantifies
+/// over everything else.
+type Conds = Vec<(u8, u16, u16)>;
+
+/// One frame of the fork tree, mirroring the DFS stack (LIFO makes each
+/// subtree contiguous). Accumulates the subtree's consulted set for the
+/// failure record at finalize.
+struct Frame {
+    key: MemoKey,
+    /// Decided masks at fork time — the filter that keeps only
+    /// at-or-above-decided fields as record conditions (fields forked
+    /// below drop out here: all their values were explored).
+    decided: [u16; 32],
+    /// Children pushed and not yet accounted.
+    children_left: u32,
+    /// Union of consulted (mask, value) per slot across the subtree.
+    consulted_mask: [u16; 32],
+    consulted_value: [u16; 32],
+    any_champion: bool,
+    /// False when a record would be unsound: a binding fork below mixes
+    /// runs from two root states (identity S, twin sigma(S)) under one
+    /// key, or a value conflict surfaced in the consulted union.
+    recordable: bool,
+}
+
+impl Frame {
+    /// Union a consulted (mask, value) into this frame's subtree set.
+    /// A value conflict (possible when a binding fork's identity and
+    /// twin sides consult the same slot under different spellings)
+    /// makes the frame unrecordable — the union no longer describes
+    /// one consistent condition set.
+    fn merge(&mut self, slot: usize, mask: u16, value: u16) {
+        if mask == 0 {
+            return;
+        }
+        let overlap = self.consulted_mask[slot] & mask;
+        if self.consulted_value[slot] & overlap != value & overlap {
+            self.recordable = false;
+        }
+        self.consulted_mask[slot] |= mask;
+        self.consulted_value[slot] = (self.consulted_value[slot] & !mask) | (value & mask);
+    }
+}
+
+/// Merge a finished pop-segment's consulted fields into the open frame.
+fn merge_segment(fr: &mut Frame, seg_mask: &[u16; 32], value: &[u16; 32]) {
+    for s in 0..32 {
+        if seg_mask[s] != 0 {
+            fr.merge(s, seg_mask[s], value[s] & seg_mask[s]);
+        }
+    }
+}
+
+/// Account one completed child of the open frame; finalize frames whose
+/// subtrees are done — recording champion-free ones — and merge their
+/// (decided-filtered) conditions upward.
+fn close_child(
+    frames: &mut Vec<Frame>,
+    memo: &mut std::collections::HashMap<MemoKey, Vec<Conds>>,
+    memo_cap: usize,
+    stats: &mut Stats,
+    champion: bool,
+) {
+    let mut champ = champion;
+    loop {
+        let top = frames.last_mut().expect("frame stack underflow");
+        top.any_champion |= champ;
+        top.children_left -= 1;
+        if top.children_left > 0 || frames.len() == 1 {
+            return;
+        }
+        let f = frames.pop().expect("root frame is never popped");
+        // Conditions = consulted fields decided at-or-above the fork;
+        // fields forked below drop out (all their values explored).
+        let mut conds: Conds = Vec::new();
+        for s in 0..32 {
+            let m = f.consulted_mask[s] & f.decided[s];
+            if m != 0 {
+                conds.push((s as u8, m, f.consulted_value[s] & m));
+            }
+        }
+        if !f.any_champion && f.recordable && (stats.memo_entries as usize) < memo_cap {
+            memo.entry(f.key).or_default().push(conds.clone());
+            stats.memo_entries += 1;
+        }
+        let parent = frames.last_mut().expect("synthetic root below every frame");
+        for &(s, m, v) in &conds {
+            parent.merge(s as usize, m, v);
+        }
+        champ = f.any_champion;
+    }
+}
+
+/// The program bits an executing instruction consults at fetch: side +
+/// opcode + the (decided) opcode's operand fields. Delay is consulted
+/// separately at completion. Over-approximating consultation only adds
+/// record conditions — weaker matching, never unsoundness.
+fn fetch_footprint(decided: u16, value: u16, cfg: &NCfg) -> u16 {
+    let mut m = 0xE000u16;
+    if cfg.side_count > 0 {
+        m |= (((1u16 << cfg.side_count) - 1) << (5 - cfg.side_count)) << 8;
+    }
+    if decided & 0xE000 == 0xE000 {
+        m |= match (value >> 13) & 0x7 {
+            4 => 0x00E0,
+            6 => 0x007F,
+            _ => 0x00FF,
+        };
+    }
+    m
+}
+
 /// Exhaustive needed-narrowing search. Deterministic: DFS order is fixed
-/// by field order and value enumeration order.
+/// by field order and value enumeration order (memo hits only skip
+/// subtrees that would have been fully refuted, so champions and
+/// verdicts are unchanged).
 pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
     let nop = crate::ir::Insn::nop_for(&crate::ir::SideCfg {
         count: spec.cfg.side_count,
@@ -589,22 +719,69 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
     let mut values = Vec::with_capacity(32);
     let mut last_beat = std::time::Instant::now();
 
+    // Consulted-set memo (failure-only): frames mirror the DFS stack —
+    // LIFO makes every subtree contiguous — with a synthetic,
+    // never-recorded root frame absorbing top-level merges.
+    let memo_on = spec.memo_cap > 0;
+    let mut memo: std::collections::HashMap<MemoKey, Vec<Conds>> = std::collections::HashMap::new();
+    let mut frames: Vec<Frame> = vec![Frame {
+        key: (0, 0, root.st),
+        decided: [0u16; 32],
+        children_left: 1,
+        consulted_mask: [0u16; 32],
+        consulted_value: [0u16; 32],
+        any_champion: false,
+        recordable: false,
+    }];
+
     'items: while let Some(mut it) = stack.pop() {
         stats.items += 1;
         if last_beat.elapsed().as_secs() >= 10 {
             eprintln!(
-                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} champions={} stack={}",
+                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} memo_hit={} memo_ent={} champions={} stack={}",
                 stats.items,
                 stats.forks,
                 stats.refuted,
                 stats.prefiltered,
                 stats.canon_pruned,
+                stats.memo_hits,
+                stats.memo_entries,
                 stats.champions_found,
                 stack.len()
             );
             last_beat = std::time::Instant::now();
         }
         cfg.code = it.value;
+
+        // Memo probe: a recorded failure at this exact (cycle,
+        // input-position, state) whose conditions this item's decided
+        // fields satisfy refutes the item outright. An UNBOUND item
+        // with x != y also stands for its mirror twin rooted at the
+        // SWAPPED state, about which the record says nothing — no hit.
+        if memo_on && (!it.unbound || it.st.x == it.st.y) {
+            let hit: Option<Conds> =
+                memo.get(&(it.cycle, it.next_input, it.st)).and_then(|entries| {
+                    entries
+                        .iter()
+                        .find(|conds| {
+                            conds.iter().all(|&(s, m, v)| {
+                                it.decided[s as usize] & m == m && it.value[s as usize] & m == v
+                            })
+                        })
+                        .cloned()
+                });
+            if let Some(conds) = hit {
+                stats.memo_hits += 1;
+                let top = frames.last_mut().expect("root frame");
+                for &(s, m, v) in &conds {
+                    top.merge(s as usize, m, v);
+                }
+                close_child(&mut frames, &mut memo, spec.memo_cap, &mut stats, false);
+                continue 'items;
+            }
+        }
+        // This pop's run segment: which decided program fields it reads.
+        let mut seg_mask = [0u16; 32];
 
         while it.cycle < spec.cycles {
             // Deterministic per-cycle environment (idempotent, so a fork
@@ -624,9 +801,15 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
             let fetching = peek_tick(&it.st, &cfg) && will_fetch(&it.st, &cfg, gpio_in);
             let fetch_pc = it.st.pc as usize;
             if fetching {
+                if memo_on {
+                    seg_mask[fetch_pc] |=
+                        fetch_footprint(it.decided[fetch_pc], it.value[fetch_pc], &cfg)
+                            & it.decided[fetch_pc];
+                }
                 if let Some(field) = demand(it.decided[fetch_pc], it.value[fetch_pc], &cfg) {
                     values.clear();
                     field.values_into(&cfg, spec.slots, &mut values);
+                    let mut pushed = 0u32;
                     for &v in &values {
                         let raw = v >> field.shift();
                         // Side-set pre-filter: an ASSERTED side-set is
@@ -721,6 +904,24 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                         child.named |= nx | ny;
                         stack.push(child);
                         stats.forks += 1;
+                        pushed += 1;
+                    }
+                    if memo_on {
+                        merge_segment(frames.last_mut().expect("root frame"), &seg_mask, &it.value);
+                        if pushed > 0 {
+                            frames.push(Frame {
+                                key: (it.cycle, it.next_input, it.st),
+                                decided: it.decided,
+                                children_left: pushed,
+                                consulted_mask: [0u16; 32],
+                                consulted_value: [0u16; 32],
+                                any_champion: false,
+                                recordable: true,
+                            });
+                        } else {
+                            // Every value filtered: this fork is a leaf.
+                            close_child(&mut frames, &mut memo, spec.memo_cap, &mut stats, false);
+                        }
                     }
                     continue 'items;
                 }
@@ -762,10 +963,24 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                     }
                     stack.push(it);
                     stats.forks += 1;
+                    let mut pushed = 1;
                     if twin_differs {
                         std::mem::swap(&mut twin.st.x, &mut twin.st.y);
                         stack.push(twin);
                         stats.forks += 1;
+                        pushed = 2;
+                    }
+                    if memo_on {
+                        merge_segment(frames.last_mut().expect("root frame"), &seg_mask, &it.value);
+                        frames.push(Frame {
+                            key: (it.cycle, it.next_input, it.st),
+                            decided: it.decided,
+                            children_left: pushed,
+                            consulted_mask: [0u16; 32],
+                            consulted_value: [0u16; 32],
+                            any_champion: false,
+                            recordable: true,
+                        });
                     }
                     continue 'items;
                 }
@@ -781,6 +996,10 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
             let w = capture_word(&it.st, &spec.capture_pins, spec.stim.mask, ext);
             if w != spec.expected[it.cycle as usize] {
                 stats.refuted += 1;
+                if memo_on {
+                    merge_segment(frames.last_mut().expect("root frame"), &seg_mask, &it.value);
+                    close_child(&mut frames, &mut memo, spec.memo_cap, &mut stats, false);
+                }
                 continue 'items;
             }
             it.cycle += 1;
@@ -805,6 +1024,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                 let undecided = it.decided[fetch_pc] & delay_mask != delay_mask;
                 if undecided && it.cycle < spec.cycles {
                     let max = (1u16 << delay_bits) - 1;
+                    let pushed;
                     // P3 delay-normal form: consecutive freshly-forked
                     // canonical nops carry front-loaded delays — once a
                     // run nop chose below max, every later nop in the
@@ -819,18 +1039,36 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                         stack.push(child);
                         stats.forks += 1;
                         stats.canon_pruned += max as u64;
-                        continue 'items;
+                        pushed = 1;
+                    } else {
+                        for v in 0..=max {
+                            let mut child = it;
+                            child.decided[fetch_pc] |= delay_mask;
+                            child.value[fetch_pc] |= v << 8;
+                            child.st.delay_count = v as u8;
+                            child.prev_nop_submax = nop_run && v < max;
+                            stack.push(child);
+                            stats.forks += 1;
+                        }
+                        pushed = max as u32 + 1;
                     }
-                    for v in 0..=max {
-                        let mut child = it;
-                        child.decided[fetch_pc] |= delay_mask;
-                        child.value[fetch_pc] |= v << 8;
-                        child.st.delay_count = v as u8;
-                        child.prev_nop_submax = nop_run && v < max;
-                        stack.push(child);
-                        stats.forks += 1;
+                    if memo_on {
+                        merge_segment(frames.last_mut().expect("root frame"), &seg_mask, &it.value);
+                        frames.push(Frame {
+                            key: (it.cycle, it.next_input, it.st),
+                            decided: it.decided,
+                            children_left: pushed,
+                            consulted_mask: [0u16; 32],
+                            consulted_value: [0u16; 32],
+                            any_champion: false,
+                            recordable: true,
+                        });
                     }
                     continue 'items;
+                }
+                if memo_on && !undecided {
+                    // Completion consults the (already decided) delay.
+                    seg_mask[fetch_pc] |= delay_mask;
                 }
             }
             if completed {
@@ -850,7 +1088,12 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
         } else {
             champion_cap_hit = true;
         }
+        if memo_on {
+            merge_segment(frames.last_mut().expect("root frame"), &seg_mask, &it.value);
+            close_child(&mut frames, &mut memo, spec.memo_cap, &mut stats, true);
+        }
     }
+    debug_assert!(frames.len() == 1, "unbalanced frame accounting");
 
     SearchResult { champions, stats, champion_cap_hit }
 }

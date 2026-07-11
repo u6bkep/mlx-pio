@@ -22,7 +22,10 @@ pub mod engine;
 
 /// FIFO with configurable depth (4 normal, 8 joined, 0 joined-away).
 /// `Copy` twin of the vendored `PioFifo` (same observable behavior).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// NOTE for hashing (the memo key): stale `buf` slots and the `head`
+/// rotation are hashed as-is, so observably-equal FIFOs can hash
+/// differently — that only costs memo sharing, never soundness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fifo {
     buf: [u32; 8],
     head: u8,
@@ -64,7 +67,7 @@ impl Fifo {
 }
 
 /// Why the SM is stalled (re-evaluated each cycle until it clears).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stall {
     None,
     WaitGpio { polarity: bool, index: u8 },
@@ -77,7 +80,7 @@ pub enum Stall {
 
 /// All per-cycle-varying evaluator state — flat and `Copy`, so the
 /// narrowing engine can checkpoint it with a memcpy at a fork point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NState {
     pub pc: u8,
     pub x: u32,
