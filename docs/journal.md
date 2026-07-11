@@ -4,6 +4,37 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-10 (post-midnight wrap) — ground clip was the monster; bench truth
+
+Continuation: user moved the Saleae ground clip off the differential leg
+onto chassis ground. Re-measured with ro_sampler: skew collapsed from
+±20ns to ~±4-8ns opposite sign, no vanishing pulses (lows 4-5/9-10,
+highs 5-6/10-11; identical both boards; fixtures ro_sampled2_*). The
+harness then found timings bit-perfect on BOTH regimes (the first grid
+had capped d18 too low): flashed [3][4][4][4] to both boards (raven
+350ede86).
+
+Bench truth after the dust settled:
+- Boards accept ~85-87% of the MAIN module's production traffic (its
+  clkdiv-1.2 TX jitter smears parking per frame — friendly to receive).
+- Parked-phase 125<->125 peer frames: ~10% at tonight's parking. The
+  NS->NA exchange now works in BOTH directions (observed fd85bc52 ->
+  NA len=86 twice in 60s), but pings stay red — lossy neighbor
+  discovery never converges. Mechanism: 8ns sample grid vs ±6ns
+  residual duty = ~1-cycle margins at some parked phases. That is the
+  phase-invariant RX resynthesis spec, now with real fixtures.
+- Production main (shipped fast RX) answered 0 of ~70 board NS —
+  production firmware needs this fix class in both RX variants.
+- Ops lessons: host tshark cannot arbitrate this bus (lan865x MAC
+  filter); `pkill -f probe-rs` matches its own wrapper shell (exit 144)
+  — use pgrep -x; defmt attach needs the EXACT flashed ELF (feature
+  rebuilds shift the table).
+
+Commits: raven 5a06f0eb + 350ede86; pio_optimization bfab6f2, ac3e3b0,
+1c5de8c. Bench left: -0 duty-robust pinger -> -1 (detached), -1
+duty-robust responder (attach bjoly1gxj).
+
+
 ## 2026-07-10 (late night) — duty distortion found: the RX mystery closed
 
 Continuation of the "both RX fixes" bench session. Chain of discoveries:
