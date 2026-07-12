@@ -221,7 +221,6 @@ enum FieldKind {
     Side,
     Opcode,
     JmpCond,
-    JmpTarget,
     WaitPol,
     WaitSrc,
     WaitIdx,
@@ -263,7 +262,7 @@ impl Field {
     }
 
     /// Push every legal raw value (already positioned under `mask`).
-    fn values_into(&self, cfg: &NCfg, slots: u8, out: &mut Vec<u16>) {
+    fn values_into(&self, cfg: &NCfg, out: &mut Vec<u16>) {
         let put = |out: &mut Vec<u16>, v: u16| out.push(v << self.shift());
         match self.kind {
             FieldKind::Side => {
@@ -288,13 +287,6 @@ impl Field {
             }
             FieldKind::JmpCond | FieldKind::MovDst => {
                 for v in 0..8 {
-                    put(out, v);
-                }
-            }
-            // Targets outside the searched length would execute NOP-land
-            // and count as larger footprint — not part of this space.
-            FieldKind::JmpTarget => {
-                for v in 0..slots as u16 {
                     put(out, v);
                 }
             }
@@ -390,7 +382,10 @@ fn demand(decided: u16, value: u16, cfg: &NCfg) -> Option<Field> {
 
     let opcode = (value >> 13) & 0x7;
     let operand_fields: &[(u16, FieldKind)] = match opcode {
-        0 => &[(0x00E0, FieldKind::JmpCond), (0x001F, FieldKind::JmpTarget)],
+        // JMP's target is consulted only by a TAKEN execution — like
+        // delay, it is demanded at consult time (deferred target fork
+        // in the cycle loop), never at fetch.
+        0 => &[(0x00E0, FieldKind::JmpCond)],
         1 => &[(0x0080, FieldKind::WaitPol), (0x0060, FieldKind::WaitSrc), (0x001F, FieldKind::WaitIdx)],
         2 => &[(0x00E0, FieldKind::InSrc), (0x001F, FieldKind::BitCount)],
         3 => &[(0x00E0, FieldKind::OutDst), (0x001F, FieldKind::BitCount)],
@@ -665,6 +660,23 @@ fn is_pull_empty_read(w: u16, st: &NState, cfg: &NCfg) -> bool {
         return false;
     }
     st.tx.is_empty() && !block
+}
+
+/// Pre-step peek: would this JMP (opcode + cond decided) take its
+/// branch in this state? Mirrors exec_op's condition table exactly,
+/// minus the X--/Y-- decrements (the peek must not mutate).
+fn jmp_taken(w: u16, st: &NState, cfg: &NCfg, gpio_in: u32) -> bool {
+    debug_assert_eq!(w >> 13, 0);
+    match (w >> 5) & 0x7 {
+        0 => true,
+        1 => st.x == 0,
+        2 => st.x != 0,
+        3 => st.y == 0,
+        4 => st.y != 0,
+        5 => st.x != st.y,
+        6 => (gpio_in >> (cfg.jmp_pin & 0x1F)) & 1 != 0,
+        _ => st.osr_count < cfg.pull_threshold,
+    }
 }
 
 /// Would the next `step` EXECUTE an instruction (fetched or pending)?
@@ -1726,6 +1738,9 @@ fn fetch_footprint(decided: u16, value: u16, cfg: &NCfg) -> u16 {
     }
     if decided & 0xE000 == 0xE000 {
         m |= match (value >> 13) & 0x7 {
+            // JMP consults its target only when TAKEN — the deferred
+            // target fork in the cycle loop owns those bits' seg_mask.
+            0 => 0x00E0,
             4 => 0x00E0,
             6 => 0x007F,
             // SET to X/Y: the 5-bit immediate is NOT consulted at
@@ -2042,7 +2057,7 @@ fn search_impl(
                 }
                 if let Some(field) = demand(it.decided[fetch_pc], it.value[fetch_pc], &cfg) {
                     values.clear();
-                    field.values_into(&cfg, spec.slots, &mut values);
+                    field.values_into(&cfg, &mut values);
                     sib_ids.clear();
                     let qtab = wq.table(it.decided[fetch_pc] | field.mask);
                     let mut pushed = 0u32;
@@ -2086,25 +2101,6 @@ fn search_impl(
                             if mov_op == 0 && raw == dst && dst == 2 {
                                 stats.canon_pruned += 1;
                                 continue;
-                            }
-                        }
-                        // P4 vacuous control: a JMP to its own
-                        // fallthrough with a non-writing condition
-                        // (everything but X--/Y--) is another no-op
-                        // spelling; the canonical nop lives in the
-                        // sibling MOV branch of this same fork tree.
-                        if field.kind == FieldKind::JmpTarget {
-                            let cond = (it.value[fetch_pc] >> 5) & 0x7;
-                            if cond != 2 && cond != 4 {
-                                let ft = if fetch_pc as u8 == cfg.wrap_top {
-                                    cfg.wrap_bottom
-                                } else {
-                                    (fetch_pc as u8 + 1) & 0x1F
-                                };
-                                if raw == ft as u16 {
-                                    stats.canon_pruned += 1;
-                                    continue;
-                                }
                             }
                         }
                         // 009 word-quotient sibling dedup: skip a
@@ -2185,6 +2181,70 @@ fn search_impl(
                         }
                     }
                     continue 'items;
+                }
+                // 008 deferred target demand: a JMP consults its target
+                // only on a TAKEN execution (exec_op writes pc from it
+                // iff `take`). Fork the target here, at consult time —
+                // an untaken execution leaves it undecided, and a JMP
+                // that never takes keeps a plain don't-care target and
+                // memo records free of target conds. Targets outside
+                // the searched length would execute foreign ROM — not
+                // part of this space (see the OOB refutation above).
+                let w = it.value[fetch_pc];
+                if w >> 13 == 0 && jmp_taken(w, &it.st, &cfg, gpio_in) {
+                    if it.decided[fetch_pc] & 0x001F == 0x001F {
+                        if memo_on {
+                            // Taken with a decided target: consulted.
+                            seg_mask[fetch_pc] |= 0x001F;
+                        }
+                    } else {
+                        let cond = (w >> 5) & 0x7;
+                        let ft = if fetch_pc as u8 == cfg.wrap_top {
+                            cfg.wrap_bottom
+                        } else {
+                            (fetch_pc as u8 + 1) & 0x1F
+                        };
+                        let mut pushed = 0u32;
+                        for t in 0..spec.slots as u16 {
+                            // P4 vacuous control (relocated from the
+                            // fetch fork): a JMP to its own fallthrough
+                            // with a non-writing condition is a no-op
+                            // respelling; the canonical spelling lives
+                            // in the MOV sibling of the opcode fork.
+                            if cond != 2 && cond != 4 && t == ft as u16 {
+                                stats.canon_pruned += 1;
+                                continue;
+                            }
+                            let mut child = it;
+                            child.decided[fetch_pc] |= 0x001F;
+                            child.value[fetch_pc] |= t;
+                            stack.push(child);
+                            stats.forks += 1;
+                            pushed += 1;
+                        }
+                        if memo_on {
+                            merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
+                            if pushed > 0 {
+                                frames.push(Frame {
+                                    key: (it.cycle, it.next_input, it.st),
+                                    decided: it.decided,
+                                    children_left: pushed,
+                                    consulted_mask: [0u16; 32],
+                                    consulted_value: [0u16; 32],
+                                    any_champion: false,
+                                    recordable: true,
+                                    state_reads: 0,
+                                    items_at_open: stats.items,
+                                });
+                            } else {
+                                // Every target filtered (single-slot
+                                // jmp-to-self): leaf, covered by the
+                                // canonical nop sibling.
+                                close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
+                            }
+                        }
+                        continue 'items;
+                    }
                 }
             }
 
