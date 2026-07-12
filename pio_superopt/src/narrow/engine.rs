@@ -1743,14 +1743,20 @@ fn fetch_footprint(decided: u16, value: u16, cfg: &NCfg) -> u16 {
 /// subtrees that would have been fully refuted, so champions and
 /// verdicts are unchanged).
 pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
-    search_impl(spec, champion_cap, true)
+    search_impl(spec, champion_cap, true, None, None)
 }
 
 /// `instrument: false` silences the heartbeat and disables the
 /// env-driven dump/probe-log/snapshot channels — the split driver's
 /// phase-1 and worker searches must not each open the dump files or
 /// spam stderr; the coordinator reports aggregate progress instead.
-fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> SearchResult {
+fn search_impl(
+    spec: &EngineSpec,
+    champion_cap: usize,
+    instrument: bool,
+    progress: Option<&std::sync::atomic::AtomicU64>,
+    quotient: Option<&mut WordQuotient>,
+) -> SearchResult {
     let nop = crate::ir::Insn::nop_for(&crate::ir::SideCfg {
         count: spec.cfg.side_count,
         en: spec.cfg.side_en,
@@ -1811,7 +1817,17 @@ fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> Sear
     let mut cfg = spec.cfg.clone();
     let mut values = Vec::with_capacity(32);
     let mut sib_ids: Vec<u32> = Vec::with_capacity(32);
-    let mut wq = WordQuotient::build(&cfg);
+    // The quotient depends only on the config, so a split worker builds
+    // it once and lends it to every unit it runs (1.7M-unit frontiers
+    // made per-search builds a real fixed cost).
+    let mut wq_local: WordQuotient;
+    let wq: &mut WordQuotient = match quotient {
+        Some(w) => w,
+        None => {
+            wq_local = WordQuotient::build(&cfg);
+            &mut wq_local
+        }
+    };
     let mut last_beat = std::time::Instant::now();
 
     // Consulted-set memo (failure-only): frames mirror the DFS stack —
@@ -1841,6 +1857,14 @@ fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> Sear
 
     'items: while let Some(mut it) = stack.pop() {
         stats.items += 1;
+        // Cheap live-progress export for the split coordinator (a
+        // masked test per item; the counter is monotonic and shared by
+        // every unit this worker runs).
+        if stats.items & 0xF_FFFF == 0 {
+            if let Some(p) = progress {
+                p.fetch_add(1 << 20, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if instrument && last_beat.elapsed().as_secs() >= 10 {
             eprintln!(
                 "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
@@ -2430,7 +2454,13 @@ fn merge_stats(into: &mut Stats, s: &Stats) {
 /// driver's job.
 pub fn search_split(spec: &EngineSpec, champion_cap: usize, threads: usize) -> SearchResult {
     let threads = threads.max(1);
-    let target = (threads * 16).max(64);
+    // 128x threads, not 16x: a shallow frontier makes units that are
+    // individually near-unconstrained, and on hard brackets EVERY unit
+    // is then hours deep (L=3 0..2 sat at 0/1520 settled for 16min+ at
+    // 25 busy cores). More, deeper-truncated units cost phase-1 a few
+    // extra cheap passes and bound both the head and the straggler
+    // tail; the 4M-cap fallback still guards the frontier explosion.
+    let target = (threads * 128).max(512);
 
     // Phase 1: widen the frontier until it feeds every thread. The
     // frontier can leap orders of magnitude between adjacent cycles
@@ -2443,12 +2473,12 @@ pub fn search_split(spec: &EngineSpec, champion_cap: usize, threads: usize) -> S
         if c >= spec.cycles {
             // Never got wide enough — the sequential search IS the
             // cheapest correct answer.
-            return search_impl(spec, champion_cap, true);
+            return search_impl(spec, champion_cap, true, None, None);
         }
         let mut spec_t = spec.clone();
         spec_t.cycles = c;
         spec_t.expected.truncate(c as usize);
-        let r = search_impl(&spec_t, 1 << 22, false);
+        let r = search_impl(&spec_t, 1 << 22, false, None, None);
         if r.champion_cap_hit {
             // A truncated frontier is an incomplete cover — unusable.
             // Parallelize on the widest sound frontier we saw instead.
@@ -2504,33 +2534,44 @@ pub fn search_split(spec: &EngineSpec, champion_cap: usize, threads: usize) -> S
 
     // Phase 2: dynamic pull off a shared counter; per-unit results are
     // scheduling-independent, merged in unit order.
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
+    let live = AtomicU64::new(0);
     let results: std::sync::Mutex<Vec<(usize, SearchResult)>> =
         std::sync::Mutex::new(Vec::with_capacity(seeds.len()));
     std::thread::scope(|sc| {
         for _ in 0..threads {
-            sc.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(seed) = seeds.get(i) else { break };
-                let mut spec_w = spec.clone();
-                spec_w.seed = seed.clone();
-                let r = search_impl(&spec_w, champion_cap, false);
-                results.lock().unwrap().push((i, r));
-                done.fetch_add(1, Ordering::Relaxed);
+            sc.spawn(|| {
+                // Config-only state: build once per worker, lend to
+                // every unit (per-unit builds were a real fixed cost on
+                // million-unit frontiers).
+                let mut wq = WordQuotient::build(&spec.cfg);
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(seed) = seeds.get(i) else { break };
+                    let mut spec_w = spec.clone();
+                    spec_w.seed = seed.clone();
+                    let r = search_impl(&spec_w, champion_cap, false, Some(&live), Some(&mut wq));
+                    results.lock().unwrap().push((i, r));
+                    done.fetch_add(1, Ordering::Relaxed);
+                }
             });
         }
         // Coordinator heartbeat, replacing the workers' silenced ones.
+        // `live` counts in-flight work too (in 2^20 chunks), so a wall
+        // of long-running units still shows visible progress.
         let mut last = std::time::Instant::now();
         while done.load(Ordering::Relaxed) < seeds.len() {
             std::thread::sleep(std::time::Duration::from_millis(200));
             if last.elapsed().as_secs() >= 10 {
-                let (d, items): (usize, u64) = {
-                    let rs = results.lock().unwrap();
-                    (rs.len(), rs.iter().map(|(_, r)| r.stats.items).sum())
-                };
-                eprintln!("narrow-split: {}/{} units settled, {items} worker items", d, seeds.len());
+                let d = done.load(Ordering::Relaxed);
+                eprintln!(
+                    "narrow-split: {}/{} units settled, ~{} worker items (live)",
+                    d,
+                    seeds.len(),
+                    live.load(Ordering::Relaxed)
+                );
                 last = std::time::Instant::now();
             }
         }
