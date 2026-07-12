@@ -2,10 +2,13 @@
 
 **Status:** CORE LANDED (a687b45, 2026-07-12): `word_canon` lemma
 quotient + per-mask partial-word tables + fork-time sibling dedup;
-~1.9x on tx_a brackets, battery + census gated. Remaining: memo cond
-canonicalization (measure the census first — generation dedup may
-have made it moot) and lemmas for battery-suggested-but-unproven
-classes (e.g. STATUS with status_n > fifo depth ≡ !NULL, cross-field).
+~1.9x on tx_a brackets, battery + census gated. **Memo cond
+canonicalization: CLOSED — measured dead** (L=3 probe census
+2026-07-12: only 0.97% of sampled full-mask cond-value conflicts are
+quotient-class-equal; the misses are genuinely different slot-0/1
+programs → ticket 008's outcome-level records are the lever).
+Remaining: lemmas for battery-suggested-but-unproven classes (e.g.
+STATUS with status_n > fifo depth ≡ !NULL, cross-field).
 En route, the design's first lemma exposed the emulator-fidelity bug
 (journal 2026-07-12 eve). · **Source:** playground factorization (45,878
 compile spellings → 13,335 probe-observable classes via 128-bit

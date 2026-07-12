@@ -4,6 +4,38 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-12 (night) — THE L=3 WALL FELL + census analysis picks the next lever
+
+**L=3 wrap 0..0 REFUTED**: 5,332,269,770 items exhausted in 1567s at
+28 threads (search_split + 009 quotient, corrected semantics) — the
+bracket that killed v1 at 5.67B (overnight), v4 at 1.42B, v5 at 230M
+is a proven impossibility. Remaining five L=3 brackets launched
+(txa_l3_rest.log). Straggler anatomy from the two attempts: 2044/2052
+units settle in ~10s, the tail is a handful of deep units (playground
+lesson holds); recursive unit splitting is the next driver lever.
+
+**009 landed mid-wait** (a687b45): lemma word quotient (word_canon +
+exact per-mask partial tables + fork sibling dedup) — tx_a folds
+23,584/65,536 words, frontier 2052→1520 units, L=2 brackets ~1.9x
+(195M→102.6M items, 20s→11.3s). Battery gate + censuses green.
+
+**Census/snapshot analysis** (8GB probe samples, 8.4M-record purge
+snapshot from the old-semantics instrumented run) — three verdicts:
+(1) cond misses are 90.2% of core-matched probes; 97% of sampled
+fails are value conflicts on DECIDED bits of slots 0/1 — genuinely
+different programs. Quotient headroom measured at 0.97% ⇒ **memo cond
+canonicalization is dead; ticket 008 (outcome-level records) owns the
+deep-memo wall**. (2) 88.2% of all cond storage was always-match
+filler-walk conds (mean 21.8/24.7 conds per record; deep subtrees
+walk 29 nop slots after falling off the program) ⇒ stripped
+spec-constant-slot conds (sound: filler is never forked NOR
+twin-mirrored — the binding fork mirrors searched slots only).
+(3) state misses are 94% single-component: RX 44% (contents are
+ISA-unreadable ⇒ patterns now project level only), ISR_CNT 35%
+(real reads; provenance chain queued into 008). Both levers landed
+as 05c3303; L=1/L=2 verdicts + item counts byte-identical, wins are
+memory (~8x smaller records) + scan cost + deep-region sharing.
+
 ## 2026-07-12 (eve) — EMULATOR FIDELITY: shift-counter semantics wrong in all 3 layers; fixed; verdicts re-established
 
 Ticket 009's first lemma ("which words are no-ops") forced a datasheet

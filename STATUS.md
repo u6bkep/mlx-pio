@@ -28,28 +28,34 @@ L=1 censuses pass with it active. Brackets: L=1 13,501 items; L=2
 009: memo cond canonicalization (measure census first), lemmas for
 battery-suggested-but-unproven classes.
 
-## L=3 0..0 IN FLIGHT — two runs
+## L=3 0..0 WALL FELL — REFUTED, 5.33B items in 26 min (28 threads)
 
-- **Verdict run** (corrected semantics + quotient): `tx_a_l3_00_split`,
-  search_split(28); quotient shrank the frontier 2052 → 1520 units.
-  First (pre-quotient) attempt settled 2044 units in 10s then spent
-  30min on 6 stragglers → relaunched on the quotient binary.
-  `/data/pio_optimization/runs/txa_l3_split_run.log` (pre-quotient
-  attempt kept as *.prequotient.log). Straggler-tail lesson: recursive
-  unit splitting is the next driver lever if tails persist.
-- **Census run** (OLD semantics, verdict tainted): instrumented
-  sequential run, now past 3.78B items / 2 purges, snapshots written —
-  `/data/pio_optimization/runs/txa_l3_run.log` + txa_l3_snaps/.
+The bracket that killed every overnight run (v1 5.67B killed, v4
+1.42B, v5 230M) is a PROVEN impossibility under corrected semantics
+(quotient binary, txa_l3_split_run.log). **Remaining five L=3
+brackets in flight** (`tx_a_l3_rest`, txa_l3_rest.log, monitored) on
+the newest binary — all six refuted ⇒ tx_a footprint ≤ 3 impossible;
+then L=4 rediscovery is the frontier.
+
+## Census/snapshot analysis DONE (05c3303) — verdicts on next levers
+
+From the old instrumented run (8GB probe samples + 8.4M-record purge
+snapshot): cond misses = 90.2% of core-matched probes, 97% value
+conflicts on genuinely different slot-0/1 words → **008 owns the
+deep-memo wall; memo cond canonicalization measured DEAD (0.97%)**.
+Landed immediately: filler-slot cond strip (88.2% of all cond
+storage was always-match filler-walk bloat) + RX level-only patterns
+(RX contents unreadable by the ISA; was 44% of state-miss diffs).
+ISR_CNT provenance (35% of state-misses) queued into 008. Old census
+run still grinding (1 core) for its end-of-run exact census.
 
 ## Next (in expected-value order)
 
-1. **Read the L=3 split verdict**; if refuted, ladder to L=4
-   rediscovery.
-2. **Read the census/snapshots** (miss composition → whether memo
-   cond canonicalization is still worth building).
-3. **Ticket 008 — outcome-grouped forking** (highest ceiling; also
-   recovers the P1 nop-naming cost).
-4. **Ticket 010 + multi-case specs** (flagship RX prereq).
+1. **L=3 rest verdicts** → L=4 rediscovery ladder.
+2. **Ticket 008 — outcome-grouped forking** (evidence section added:
+   it provably owns the 90% cond-miss class; includes ISR_CNT
+   provenance; also recovers the P1 nop-naming cost).
+3. **Ticket 010 + multi-case specs** (flagship RX prereq).
 
 ## Flagship (unchanged): phase-invariant RX
 

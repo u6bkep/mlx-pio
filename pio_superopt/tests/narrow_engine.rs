@@ -1045,6 +1045,40 @@ fn tx_a_small_brackets_split() {
     }
 }
 
+/// The remaining five L=3 wrap brackets (0..0 fell 2026-07-12: 5.33B
+/// items, 26 min at 28 threads). All six refuted = footprint <= 3
+/// impossible for tx_a under the narrow evaluator. Detached:
+/// `cargo test --release --test narrow_engine -- --ignored
+/// tx_a_l3_rest --nocapture`
+#[test]
+#[ignore]
+fn tx_a_l3_rest_brackets() {
+    use pio_superopt::narrow::engine::search_split;
+    let (mut spec4, side) = tx_a_spec(460);
+    let reference = tx_a_words(&side);
+    spec4.expected = run_spec(&spec4, reference);
+    for (wb, wt) in [(0u8, 1u8), (0, 2), (1, 1), (1, 2), (2, 2)] {
+        let (mut s, _) = tx_a_spec(460);
+        s.slots = 3;
+        s.cfg.wrap_bottom = wb;
+        s.cfg.wrap_top = wt;
+        s.expected = spec4.expected.clone();
+        s.memo_cap = 1 << 21;
+        let t = std::time::Instant::now();
+        let r = search_split(&s, 5, 28);
+        eprintln!(
+            "L=3 wrap {wb}..{wt} split(28): items={} refuted={} memo_hit={} champions={} in {:.0}s",
+            r.stats.items,
+            r.stats.refuted,
+            r.stats.memo_hits,
+            r.stats.champions_found,
+            t.elapsed().as_secs_f64()
+        );
+        assert_eq!(r.stats.champions_found, 0, "L=3 wrap {wb}..{wt} unexpectedly satisfiable");
+    }
+    eprintln!("L=3 COMPLETE: all six brackets refuted");
+}
+
 /// The L=3 0..0 bracket under the split driver — the corrected-
 /// semantics verdict run. Detached:
 /// `cargo test --release --test narrow_engine -- --ignored

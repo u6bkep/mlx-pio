@@ -47,3 +47,16 @@ One equivalence-class machinery serves both; do them together.
 Multiplicative fork-width reduction down the whole tree on JMP-heavy
 spaces; directly attacks the L=3+ fan. Highest-ceiling engine change
 known. Big surgery — item/champion/memo representation all touched.
+
+## Evidence (L=3 probe census + snapshot, 2026-07-12)
+
+Direct measurement says this ticket owns the deep-memo wall: of 798M
+core-matched probes, 90.2% were COND misses, and 97% of sampled cond
+fails are value conflicts on decided bits — probers and records hold
+genuinely different slot-0/1 words (quotient respelling covers only
+0.97%; filler slots never conflict). Sharing across different words
+requires conditioning on the OUTCOME the subtree tested, exactly this
+ticket's record side. Also queued here: **ISR_CNT provenance** — 35%
+of state-miss near-diffs are isr_count-only; its value is usually
+program-determined (count of INs since last push), the same
+field-provenance chain that X/Y already have.
