@@ -1576,6 +1576,14 @@ fn fetch_footprint(decided: u16, value: u16, cfg: &NCfg) -> u16 {
 /// subtrees that would have been fully refuted, so champions and
 /// verdicts are unchanged).
 pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
+    search_impl(spec, champion_cap, true)
+}
+
+/// `instrument: false` silences the heartbeat and disables the
+/// env-driven dump/probe-log/snapshot channels — the split driver's
+/// phase-1 and worker searches must not each open the dump files or
+/// spam stderr; the coordinator reports aggregate progress instead.
+fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> SearchResult {
     let nop = crate::ir::Insn::nop_for(&crate::ir::SideCfg {
         count: spec.cfg.side_count,
         en: spec.cfg.side_en,
@@ -1641,9 +1649,9 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
     // LIFO makes every subtree contiguous — with a synthetic,
     // never-recorded root frame absorbing top-level merges.
     let memo_on = spec.memo_cap > 0;
-    let mut dump = if memo_on { dump_open() } else { None };
-    let mut probe_log = if memo_on { probe_log_open(spec.cycles) } else { None };
-    let mut snap = if memo_on { snapshot_open() } else { None };
+    let mut dump = if memo_on && instrument { dump_open() } else { None };
+    let mut probe_log = if memo_on && instrument { probe_log_open(spec.cycles) } else { None };
+    let mut snap = if memo_on && instrument { snapshot_open() } else { None };
     let mut memo: FxMap<KeyCore, MemoEntry> = FxMap::default();
     // Records must beat this subtree size to earn a slot; quadruples at
     // every cap purge.
@@ -1664,7 +1672,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
 
     'items: while let Some(mut it) = stack.pop() {
         stats.items += 1;
-        if last_beat.elapsed().as_secs() >= 10 {
+        if instrument && last_beat.elapsed().as_secs() >= 10 {
             eprintln!(
                 "narrow-search: items={} forks={} refuted={} prefilt={} canon={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
                 stats.items,
@@ -2161,6 +2169,178 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
     }
 
     SearchResult { champions, stats, champion_cap_hit }
+}
+
+/// Fold one worker's stats into the total: counters sum, the
+/// histogram sums elementwise, the max-tracker takes the max.
+fn merge_stats(into: &mut Stats, s: &Stats) {
+    into.items += s.items;
+    into.forks += s.forks;
+    into.refuted += s.refuted;
+    into.champions_found += s.champions_found;
+    into.cycles_run += s.cycles_run;
+    into.prefiltered += s.prefiltered;
+    into.canon_pruned += s.canon_pruned;
+    into.memo_hits += s.memo_hits;
+    into.memo_core_matches += s.memo_core_matches;
+    into.memo_state_misses += s.memo_state_misses;
+    into.memo_cond_misses += s.memo_cond_misses;
+    into.memo_rec_scans += s.memo_rec_scans;
+    into.memo_recs_scanned += s.memo_recs_scanned;
+    into.memo_max_recs = into.memo_max_recs.max(s.memo_max_recs);
+    into.memo_entries += s.memo_entries;
+    into.memo_purges += s.memo_purges;
+    for i in 0..32 {
+        into.benefit_hist[i] += s.benefit_hist[i];
+    }
+}
+
+/// Parallel exhaustive search: same refutation verdicts as [`search`],
+/// wall-clock divided across `threads` workers.
+///
+/// Phase 1 runs the sequential engine on a TRUNCATED spec (a prefix of
+/// the expected trace); its champions-with-don't-cares are exactly the
+/// surviving frontier subspaces — the work units. The truncation cycle
+/// doubles until the unit count comfortably exceeds the thread count
+/// (the playground's measured straggler lesson: a too-shallow split
+/// collapses parallelism onto a few heavy groups for hours). Phase 2
+/// workers pull units off a shared counter and run the ordinary SEEDED
+/// search over the full spec — re-deriving the cheap shared prefix
+/// inside the unit, with a per-unit memo — so the result is
+/// deterministic regardless of scheduling.
+///
+/// Champion-list semantics vs [`search`]: the covered set of
+/// trace-reproducing programs is identical, but the REPRESENTATION may
+/// differ — binding-free units that name registers are expanded into
+/// explicit identity + register-mirror units (a seeded worker cannot
+/// carry the unbound twin), and P3's fresh-fork delay canonicalization
+/// does not see across the seed boundary, so workers may emit delay
+/// spellings the sequential walk canonicalized away. Zero-champion
+/// (impossibility) verdicts are exactly equivalent — that is this
+/// driver's job.
+pub fn search_split(spec: &EngineSpec, champion_cap: usize, threads: usize) -> SearchResult {
+    let threads = threads.max(1);
+    let target = (threads * 16).max(64);
+
+    // Phase 1: widen the frontier until it feeds every thread. The
+    // frontier can leap orders of magnitude between adjacent cycles
+    // (one fetch fans every operand field), so grow the truncation
+    // cycle gently and keep the last under-target frontier as a
+    // fallback if a pass overflows the unit cap.
+    let mut c = 1u32;
+    let mut prev: Option<(Vec<Champion>, Stats)> = None;
+    let (units, phase1) = loop {
+        if c >= spec.cycles {
+            // Never got wide enough — the sequential search IS the
+            // cheapest correct answer.
+            return search_impl(spec, champion_cap, true);
+        }
+        let mut spec_t = spec.clone();
+        spec_t.cycles = c;
+        spec_t.expected.truncate(c as usize);
+        let r = search_impl(&spec_t, 1 << 22, false);
+        if r.champion_cap_hit {
+            // A truncated frontier is an incomplete cover — unusable.
+            // Parallelize on the widest sound frontier we saw instead.
+            let p = prev.expect("phase-1 frontier exceeded 4M units at its first cycle");
+            break p;
+        }
+        if r.champions.is_empty() {
+            // Refuted on the prefix: the full space is empty.
+            return SearchResult { champions: Vec::new(), stats: r.stats, champion_cap_hit: false };
+        }
+        if r.champions.len() >= target {
+            break (r.champions, r.stats);
+        }
+        prev = Some((r.champions, r.stats));
+        c += (c / 2).max(1);
+    };
+    // Phase-1 stats carry the frontier walk's work counters (last
+    // widening pass only); its "champions" are work units, not
+    // solutions.
+    let mut phase1 = phase1;
+    phase1.champions_found = 0;
+
+    // Units -> seeds; binding-free register-naming units get an
+    // explicit mirror twin.
+    let seed_of = |u: &Champion, val: &[u16; 32]| -> Vec<(u8, u16, u16)> {
+        (0..spec.slots as usize)
+            .filter(|&s| u.decided[s] != 0)
+            .map(|s| (s as u8, u.decided[s], val[s] & u.decided[s]))
+            .collect()
+    };
+    let mut seeds: Vec<Vec<(u8, u16, u16)>> = Vec::with_capacity(units.len() * 2);
+    for u in &units {
+        let id = seed_of(u, &u.value);
+        if u.binding_free {
+            let mut mv = u.value;
+            for s in 0..spec.slots as usize {
+                mv[s] = mirror_word(mv[s]);
+            }
+            let mirror = seed_of(u, &mv);
+            if mirror != id {
+                seeds.push(id);
+                seeds.push(mirror);
+                continue;
+            }
+        }
+        seeds.push(id);
+    }
+    eprintln!(
+        "narrow-split: {} units (frontier cycle {c}, {} pre-mirror) on {threads} threads",
+        seeds.len(),
+        units.len()
+    );
+
+    // Phase 2: dynamic pull off a shared counter; per-unit results are
+    // scheduling-independent, merged in unit order.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<(usize, SearchResult)>> =
+        std::sync::Mutex::new(Vec::with_capacity(seeds.len()));
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(seed) = seeds.get(i) else { break };
+                let mut spec_w = spec.clone();
+                spec_w.seed = seed.clone();
+                let r = search_impl(&spec_w, champion_cap, false);
+                results.lock().unwrap().push((i, r));
+                done.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        // Coordinator heartbeat, replacing the workers' silenced ones.
+        let mut last = std::time::Instant::now();
+        while done.load(Ordering::Relaxed) < seeds.len() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if last.elapsed().as_secs() >= 10 {
+                let (d, items): (usize, u64) = {
+                    let rs = results.lock().unwrap();
+                    (rs.len(), rs.iter().map(|(_, r)| r.stats.items).sum())
+                };
+                eprintln!("narrow-split: {}/{} units settled, {items} worker items", d, seeds.len());
+                last = std::time::Instant::now();
+            }
+        }
+    });
+
+    let mut rs = results.into_inner().unwrap();
+    rs.sort_unstable_by_key(|&(i, _)| i);
+    let mut champions = Vec::new();
+    let mut stats = phase1;
+    let mut cap_hit = false;
+    for (_, r) in &rs {
+        champions.extend(r.champions.iter().copied());
+        merge_stats(&mut stats, &r.stats);
+        cap_hit |= r.champion_cap_hit;
+    }
+    if champions.len() > champion_cap {
+        champions.truncate(champion_cap);
+        cap_hit = true;
+    }
+    SearchResult { champions, stats, champion_cap_hit: cap_hit }
 }
 
 fn stim_at(stim: &Stim, cycle: u32) -> u32 {

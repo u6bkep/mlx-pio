@@ -920,3 +920,122 @@ fn instrumentation_flags_do_not_change_search() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The split driver must agree with the sequential engine. Refutation
+/// verdicts are exactly equivalent (that is the driver's job — L=3+
+/// brackets); champion-bearing spaces agree on the COVERED SET, with
+/// representation allowed to differ (mirror expansion, seed-boundary
+/// delay spellings): every split champion must reproduce the trace and
+/// be covered by the sequential quotient, and every sequential
+/// champion's representative (and its register-mirror when
+/// binding-free) must be covered by the split set. Two same-config
+/// runs must be bit-identical (scheduling independence).
+#[test]
+fn split_agrees_with_sequential() {
+    use pio_superopt::narrow::engine::search_split;
+
+    // Refutation: the real L=2 0..0 tx_a bracket (632,537 items).
+    let (spec4, _) = tx_a_spec(460);
+    let mut expected4 = spec4.clone();
+    expected4.expected = run_spec(&spec4, tx_a_words(&tx_a_spec(460).1));
+    let (mut s, _) = tx_a_spec(460);
+    s.slots = 2;
+    s.cfg.wrap_bottom = 0;
+    s.cfg.wrap_top = 0;
+    s.expected = expected4.expected.clone();
+    let seq = search(&s, 5);
+    let par = search_split(&s, 5, 8);
+    assert_eq!(seq.stats.champions_found, 0);
+    assert_eq!(par.stats.champions_found, 0, "split found champions where sequential refuted");
+    let par2 = search_split(&s, 5, 8);
+    assert_eq!(par.champions, par2.champions);
+    assert_eq!(format!("{:?}", par.stats), format!("{:?}", par2.stats), "split not deterministic");
+
+    // Champions: the square wave.
+    let config = Config {
+        pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 1, ..PinMap::default() },
+        ..Config::default()
+    };
+    let cfg = cfg_for(config, 0, 1);
+    let side = SideCfg::NONE;
+    let reference = words_of(
+        &[
+            Insn::plain(Op::Set { dst: SetDst::Pins, data: 1 }),
+            Insn::plain(Op::Set { dst: SetDst::Pins, data: 0 }),
+        ],
+        &side,
+    );
+    let mut spec = EngineSpec {
+        cfg,
+        slots: 2,
+        cycles: 17,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![],
+        memo_cap: 1 << 20,
+    };
+    spec.expected = run_spec(&spec, reference);
+    let seq = search(&spec, 1_000_000);
+    let par = search_split(&spec, 1_000_000, 8);
+    assert!(!par.champion_cap_hit);
+    assert_champions_sound(&spec, &par.champions);
+    // Split -> sequential: every split champion's representative lives
+    // inside the sequential quotient (identity or mirror side).
+    for (i, sp) in par.champions.iter().enumerate() {
+        let w = sp.words();
+        let ok = covered(&seq.champions, &w)
+            || covered(&seq.champions, &mirror_program(&w, spec.slots));
+        assert!(ok, "split champion {i} not covered by sequential quotient");
+    }
+    // Sequential -> split: representatives (and binding-free mirrors)
+    // are covered by the split set.
+    for (i, ch) in seq.champions.iter().enumerate() {
+        let w = ch.words();
+        assert!(covered(&par.champions, &w), "sequential champion {i} not covered by split");
+        if ch.binding_free {
+            let m = mirror_program(&w, spec.slots);
+            let ok = covered(&par.champions, &m)
+                || par.champions.iter().any(|sp| {
+                    sp.binding_free
+                        && (0..32).all(|s| m[s] & sp.decided[s] == mirror_program(&sp.words(), spec.slots)[s] & sp.decided[s])
+                });
+            assert!(ok, "sequential champion {i}'s mirror not covered by split");
+        }
+    }
+    // The hand-written program must be found by both.
+    assert!(covered(&par.champions, &reference));
+    eprintln!(
+        "split gate: refutation ok; square wave seq {} champions, split {} champions",
+        seq.champions.len(),
+        par.champions.len()
+    );
+}
+
+/// Wall-clock measurement of the split driver on the L=2 0..1 bracket
+/// (sequential: ~270s). `cargo test --release --test narrow_engine --
+/// --ignored tx_a_l2_01_split --nocapture`
+#[test]
+#[ignore]
+fn tx_a_l2_01_split() {
+    use pio_superopt::narrow::engine::search_split;
+    let (spec4, side) = tx_a_spec(460);
+    let reference = tx_a_words(&side);
+    let mut expected = spec4.clone();
+    expected.expected = run_spec(&spec4, reference);
+    let (mut s, _) = tx_a_spec(460);
+    s.slots = 2;
+    s.cfg.wrap_bottom = 0;
+    s.cfg.wrap_top = 1;
+    s.expected = expected.expected.clone();
+    let t = std::time::Instant::now();
+    let r = search_split(&s, 5, 28);
+    eprintln!(
+        "L=2 0..1 split(28): items={} memo_hit={} champions={} in {:.1}s",
+        r.stats.items, r.stats.memo_hits, r.stats.champions_found, t.elapsed().as_secs_f64()
+    );
+    assert_eq!(r.stats.champions_found, 0);
+}
