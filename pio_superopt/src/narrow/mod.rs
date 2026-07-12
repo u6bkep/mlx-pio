@@ -539,7 +539,12 @@ fn exec_op(st: &mut NState, cfg: &NCfg, opcode: u8, operand: u8, gpio_in: u32) -
                     write_pin_field(&mut st.dir_latch, data, cfg.out_base, count);
                 }
                 5 => st.pc = (data & 0x1F) as u8,
-                6 => st.isr = data,
+                // OUT ISR also sets the ISR shift counter to Bit count
+                // (bit_count is normalized to 1..=32). RP2350 ch.11.
+                6 => {
+                    st.isr = data;
+                    st.isr_count = bit_count;
+                }
                 7 => st.pending_exec = Some(data as u16),
                 _ => {}
             }
@@ -623,8 +628,16 @@ fn exec_op(st: &mut NState, cfg: &NCfg, opcode: u8, operand: u8, gpio_in: u32) -
                 3 => write_pin_field(&mut st.dir_latch, val, cfg.out_base, cfg.out_count),
                 4 => st.pending_exec = Some(val as u16),
                 5 => st.pc = (val & 0x1F) as u8,
-                6 => st.isr = val,
-                7 => st.osr = val,
+                // MOV ISR resets the input shift counter to 0 (empty);
+                // MOV OSR resets the output shift counter to 0 (full). RP2350 ch.11.
+                6 => {
+                    st.isr = val;
+                    st.isr_count = 0;
+                }
+                7 => {
+                    st.osr = val;
+                    st.osr_count = 0;
+                }
                 _ => {}
             }
             pc_set
@@ -754,4 +767,97 @@ pub fn run_with_stim(program: &Program, spec: &RunSpec, stim: &Stim) -> Vec<u32>
         out.push(w);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal config: no autopush/autopull, shift-left, 4-deep FIFOs.
+    /// Only the fields consulted by the MOV/OUT arms under test matter.
+    fn base_cfg() -> NCfg {
+        NCfg {
+            code: [0u16; 32],
+            wrap_bottom: 0,
+            wrap_top: 31,
+            side_count: 0,
+            side_en: false,
+            side_pindir: false,
+            jmp_pin: 0,
+            in_base: 0,
+            out_base: 0,
+            out_count: 0,
+            set_base: 0,
+            set_count: 0,
+            sideset_base: 0,
+            in_count: 0,
+            autopush: false,
+            autopull: false,
+            push_threshold: 32,
+            pull_threshold: 32,
+            in_shift_right: false,
+            out_shift_right: false,
+            clkdiv_int: 1,
+            clkdiv_frac: 0,
+            status_sel: false,
+            status_n: 0,
+            sm_id: 0,
+            tx_depth: 4,
+            rx_depth: 4,
+        }
+    }
+
+    /// MOV ISR (dst=6, src=X) resets the ISR shift counter to 0 (empty).
+    /// RP2350 ch.11 MOV destination annotation.
+    #[test]
+    fn mov_isr_resets_isr_count() {
+        let cfg = base_cfg();
+        let mut st = NState::new(&cfg);
+        st.x = 0xABCD_1234;
+        st.isr_count = 17; // nonzero before
+        // MOV ISR, X → dst=6, op=none, src=X=1: operand = (6<<5)|1.
+        exec_op(&mut st, &cfg, 5, (6 << 5) | 1, 0);
+        assert_eq!(st.isr, 0xABCD_1234);
+        assert_eq!(st.isr_count, 0, "MOV ISR must reset isr_count to 0");
+    }
+
+    /// MOV OSR (dst=7, src=X) resets the OSR shift counter to 0 (full).
+    #[test]
+    fn mov_osr_resets_osr_count() {
+        let cfg = base_cfg();
+        let mut st = NState::new(&cfg);
+        st.x = 0xDEAD_BEEF;
+        st.osr_count = 19; // nonzero before
+        // MOV OSR, X → dst=7, op=none, src=X=1: operand = (7<<5)|1.
+        exec_op(&mut st, &cfg, 5, (7 << 5) | 1, 0);
+        assert_eq!(st.osr, 0xDEAD_BEEF);
+        assert_eq!(st.osr_count, 0, "MOV OSR must reset osr_count to 0");
+    }
+
+    /// OUT ISR with bit_count=n sets isr_count to n. RP2350 ch.11:
+    /// OUT ISR "also sets ISR shift counter to Bit count".
+    #[test]
+    fn out_isr_sets_isr_count_to_bit_count() {
+        let cfg = base_cfg(); // shift-left
+        let mut st = NState::new(&cfg);
+        st.osr = 0xFFFF_FFFF;
+        st.osr_count = 0;
+        st.isr_count = 3; // stale value, must be overwritten
+        // OUT ISR, 5 → dst=6, bit_count field=5: operand = (6<<5)|5.
+        exec_op(&mut st, &cfg, 3, (6 << 5) | 5, 0);
+        assert_eq!(st.isr_count, 5, "OUT ISR must set isr_count = bit_count");
+    }
+
+    /// OUT ISR with raw bit_count field 0 (= 32) sets isr_count to 32.
+    #[test]
+    fn out_isr_raw_zero_sets_isr_count_32() {
+        let cfg = base_cfg();
+        let mut st = NState::new(&cfg);
+        st.osr = 0xFFFF_FFFF;
+        st.osr_count = 0;
+        st.isr_count = 3;
+        // OUT ISR, 0 (field=0 → 32): operand = (6<<5)|0.
+        exec_op(&mut st, &cfg, 3, 6 << 5, 0);
+        assert_eq!(st.isr_count, 32, "OUT ISR, 0 (=32) sets isr_count = 32");
+    }
 }

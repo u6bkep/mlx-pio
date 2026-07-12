@@ -175,8 +175,10 @@ rotate) starting at `base`.
   OSR (right: from LSBs; left: from MSBs); osr_count := min(32, +count).
   dst: PINS (out_base/out_count-clipped: count_eff = min(out_count,
   count)); X; Y; NULL; PINDIRS (same clip); PC (:= data & 0x1F, pc_set);
-  ISR (:= data; count NOT set — vendored); EXEC (pending_exec :=
-  data & 0xFFFF — the shifted-out word truncates to 16 bits).
+  ISR (:= data; isr_count := count — datasheet ch.11 "OUT ISR also sets
+  ISR shift counter to Bit count", count being the 1..=32 normalized bit
+  count); EXEC (pending_exec := data & 0xFFFF — the shifted-out word
+  truncates to 16 bits).
 - **PUSH iffull block** — rx full: iffull ⇒ no-op; block ⇒ stall(Push);
   else DROP (push discarded). Then push isr; isr := 0; isr_count := 0.
 - **PULL ifempty block** — tx empty: ifempty ⇒ osr := x, count := 0;
@@ -187,18 +189,21 @@ rotate) starting at `base`.
   ? all-ones : 0), ISR, OSR. op: none | invert | bit-reverse. dst:
   PINS (out_base/out_count via write_pin_field — full out_count, no
   clip by a bit count), X, Y, PINDIRS (out range), EXEC (pending_exec
-  := val & 0xFFFF), PC (:= val & 0x1F, pc_set), ISR (:= val,
-  isr_count := 0? — NO: vendored sets value only, counts untouched),
-  OSR (same).
+  := val & 0xFFFF), PC (:= val & 0x1F, pc_set), ISR (:= val, isr_count
+  := 0 — datasheet ch.11 "input shift counter is reset to 0, i.e.
+  empty"), OSR (:= val, osr_count := 0 — ch.11 "output shift counter is
+  reset to 0, i.e. full").
 - **IRQ clear wait idx** — idx resolved: bit4 set ⇒ rel: `(((idx&3)+
   sm_id)%4) | (idx&4)`, else idx&7. clear ⇒ clear flag. Else set flag;
   wait ⇒ stall(IrqWait) until someone clears it.
 - **SET dst data** — PINS/PINDIRS via set_base/set_count; X/Y :=
   zero-extended data. Reserved dst codes: no-op.
 
-MOV ISR/OSR **do not touch the shift counters**, and OUT ISR does not
-set isr_count — these mirror the vendored emulator (fuzz-pinned) and
-are flagged for datasheet re-audit if a hardware divergence ever shows.
+MOV ISR/OSR **reset their shift counters to 0** (empty/full), and OUT
+ISR **sets isr_count to the bit count** — per RP2350 datasheet ch.11's
+MOV/OUT destination annotations. Both the vendored emulator and this
+twin were corrected to match (previously they left the counters
+untouched); the change is fuzz-pinned by `narrow_diff`.
 
 ## 9. The driver/harness contract
 

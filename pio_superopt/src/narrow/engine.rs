@@ -459,10 +459,14 @@ fn side_value_consistent(
     true
 }
 
-/// The canonical no-op spelling: `mov osr, osr` (op none). Chosen
-/// register-free so it never sets `named` and leaves the P1 prune armed.
-/// Bits 8..12 (delay/side) excluded from the pattern.
-pub const NOP_CANON: u16 = 0xA0E7;
+/// The canonical no-op spelling: `mov x, x` (op none). The only true
+/// no-ops are the X/Y self-moves — MOV to ISR/OSR resets the target's
+/// shift counter (datasheet 11.4.10), so the old canon `mov osr, osr`
+/// is a real op. Forking the nop names X and sets `named`, so P1
+/// disarms in nop-carrying unbound subtrees (the Y-spelled twin is
+/// P2-pruned everywhere and covered via the mirror). Bits 8..12
+/// (delay/side) excluded from the pattern.
+pub const NOP_CANON: u16 = 0xA021;
 const NOP_CANON_MASK: u16 = 0xE0FF;
 
 /// Swap every X/Y register naming in a (possibly partially decided)
@@ -1870,13 +1874,15 @@ fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> Sear
                         if !it.named && it.unbound && ny && !nx {
                             continue;
                         }
-                        // P2 canonical nop: MOV self-moves with op none
-                        // (x,x / y,y / isr,isr) are pure no-ops; the one
-                        // kept spelling is `mov osr,osr` (NOP_CANON).
+                        // P2 canonical nop: the X/Y self-moves with op
+                        // none are pure no-ops; the kept spelling is
+                        // `mov x,x` (NOP_CANON), so only y,y is pruned.
+                        // ISR/OSR self-moves reset the target's shift
+                        // counter (datasheet 11.4.10) — real ops, kept.
                         if field.kind == FieldKind::MovSrc {
                             let dst = (it.value[fetch_pc] >> 5) & 0x7;
                             let mov_op = (it.value[fetch_pc] >> 3) & 0x3;
-                            if mov_op == 0 && raw == dst && matches!(dst, 1 | 2 | 6) {
+                            if mov_op == 0 && raw == dst && dst == 2 {
                                 stats.canon_pruned += 1;
                                 continue;
                             }

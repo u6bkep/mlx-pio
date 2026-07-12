@@ -417,8 +417,10 @@ pub fn step(st: &SymState, prog: &SymProgram, cfg: &Config, inputs: &[u32]) -> S
     );
 
     // OSR: OUT shifts (after any refill); PULL loads the popped word or X;
-    // MOV OSR <- val overwrites (leaving osr_count untouched, like the
-    // emulator — it does NOT reset the count).
+    // MOV OSR <- val overwrites AND resets osr_count to 0 (RP2350 datasheet
+    // ch.11: MOV dst OSR "Output shift counter is reset to 0 by this
+    // operation, i.e. full").
+    let mov_osr = (&is_mov) & mdst._eq(&bvu(7, 3));
     let osr_next = sel32(
         &out_runs.clone(),
         &osr_shifted,
@@ -428,13 +430,15 @@ pub fn step(st: &SymState, prog: &SymProgram, cfg: &Config, inputs: &[u32]) -> S
             &sel32(
                 &pull_x.clone(),
                 &st.x,
-                &sel32(&((&is_mov) & mdst._eq(&bvu(7, 3))), &mval, &st.osr),
+                &sel32(&mov_osr, &mval, &st.osr),
             ),
         ),
     );
+    // MOV OSR joins PULL in zeroing the count. (The model tracks no ISR shift
+    // counter, so MOV ISR / OUT ISR have no counter to reset here.)
     let cnt_next = ((&attempt) & (&out_runs)).ite(
         &cnt_out,
-        &((&attempt) & ((&pull_pops) | (&pull_x))).ite(&bvu(0, 8), &st.osr_cnt),
+        &((&attempt) & ((&pull_pops) | (&pull_x) | (&mov_osr))).ite(&bvu(0, 8), &st.osr_cnt),
     );
     let isr_next = sel32(&((&is_mov) & mdst._eq(&bvu(6, 3))), &mval, &st.isr);
 

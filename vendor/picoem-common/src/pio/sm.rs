@@ -903,8 +903,10 @@ impl StateMachine {
                 self.pc = (data & 0x1F) as u8;
             }
             6 => {
-                // ISR
+                // ISR — RP2350 datasheet ch.11: OUT ISR "also sets ISR shift
+                // counter to Bit count" (bit_count is normalized to 1..=32).
                 self.isr = data;
+                self.isr_count = bit_count;
             }
             7 => {
                 // EXEC — store shifted value as instruction to execute next cycle
@@ -1033,8 +1035,16 @@ impl StateMachine {
                 // PC — set directly
                 self.pc = (val & 0x1F) as u8;
             }
-            6 => self.isr = val,
-            7 => self.osr = val,
+            // RP2350 datasheet ch.11: MOV ISR resets the input shift counter
+            // to 0 (empty); MOV OSR resets the output shift counter to 0 (full).
+            6 => {
+                self.isr = val;
+                self.isr_count = 0;
+            }
+            7 => {
+                self.osr = val;
+                self.osr_count = 0;
+            }
             _ => {}
         }
         pc_set
@@ -1839,6 +1849,65 @@ mod tests {
         sm.exec_mov(3, 0, 1, 0, &mut pins, &mut dirs);
         // 4 bits of value 0xF rotated into base 2 → bits[5:2] set.
         assert_eq!(dirs & (0xF << 2), 0xF << 2);
+    }
+
+    /// MOV ISR (dst=6) resets the input shift counter to 0 (empty).
+    /// RP2350 datasheet ch.11 MOV destination annotation.
+    #[test]
+    fn mov_isr_resets_isr_count() {
+        let mut sm = StateMachine::new();
+        sm.x = 0xABCD_1234;
+        sm.isr_count = 17; // nonzero before
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        // MOV ISR, X → dst=6, op=none, src=X=1.
+        sm.exec_mov(6, 0, 1, 0, &mut pins, &mut dirs);
+        assert_eq!(sm.isr, 0xABCD_1234);
+        assert_eq!(sm.isr_count, 0, "MOV ISR must reset isr_count to 0");
+    }
+
+    /// MOV OSR (dst=7) resets the output shift counter to 0 (full).
+    #[test]
+    fn mov_osr_resets_osr_count() {
+        let mut sm = StateMachine::new();
+        sm.x = 0xDEAD_BEEF;
+        sm.osr_count = 19; // nonzero before
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        // MOV OSR, X → dst=7, op=none, src=X=1.
+        sm.exec_mov(7, 0, 1, 0, &mut pins, &mut dirs);
+        assert_eq!(sm.osr, 0xDEAD_BEEF);
+        assert_eq!(sm.osr_count, 0, "MOV OSR must reset osr_count to 0");
+    }
+
+    /// OUT ISR with bit_count=n sets the ISR shift counter to n. RP2350
+    /// datasheet ch.11: OUT ISR "also sets ISR shift counter to Bit count".
+    #[test]
+    fn out_isr_sets_isr_count_to_bit_count() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = 0; // shift-left, no autopull
+        sm.osr = 0xFFFF_FFFF;
+        sm.osr_count = 0;
+        sm.isr_count = 3; // stale value, must be overwritten
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        sm.exec_out(6, 5, &mut pins, &mut dirs); // OUT ISR, 5
+        assert_eq!(sm.isr_count, 5, "OUT ISR must set isr_count = bit_count");
+    }
+
+    /// OUT ISR with bit_count=32 (raw field 0) sets the ISR counter to 32.
+    #[test]
+    fn out_isr_bit_count_32_sets_isr_count_32() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = 0;
+        sm.osr = 0xFFFF_FFFF;
+        sm.osr_count = 0;
+        sm.isr_count = 3;
+        let mut pins = 0u32;
+        let mut dirs = 0u32;
+        // bit_count is decoder-normalized; raw 0 arrives here as 32.
+        sm.exec_out(6, 32, &mut pins, &mut dirs);
+        assert_eq!(sm.isr_count, 32, "OUT ISR, 32 sets isr_count = 32");
     }
 
     /// IRQ clear bit (line 970 `clear=true` arm).

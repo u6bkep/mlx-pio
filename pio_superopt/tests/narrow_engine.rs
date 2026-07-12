@@ -99,8 +99,10 @@ fn canon_l1_word(w: u16, spec: &EngineSpec) -> u16 {
             w
         }
         5 => {
+            // Only the X/Y self-moves are true no-ops; MOV to ISR/OSR
+            // resets the shift counter (datasheet 11.4.10).
             let (dst, op, src) = ((w >> 5) & 0x7, (w >> 3) & 0x3, w & 0x7);
-            if op == 0 && dst == src && matches!(dst, 1 | 2 | 6 | 7) {
+            if op == 0 && dst == src && matches!(dst, 1 | 2) {
                 return NOP_CANON | delay;
             }
             w
@@ -348,7 +350,7 @@ fn nop_l1_census_exact() {
         let w = ch.value[0];
         if ch.decided[0] & 0xE0FF == 0xE0FF && (w >> 13) == 5 {
             let (dst, op, src) = ((w >> 5) & 7, (w >> 3) & 3, w & 7);
-            if op == 0 && dst == src && matches!(dst, 1 | 2 | 6 | 7) {
+            if op == 0 && dst == src && matches!(dst, 1 | 2) {
                 assert_eq!(w & 0xE0FF, NOP_CANON, "non-canonical self-move emitted: {w:04x}");
             }
         }
