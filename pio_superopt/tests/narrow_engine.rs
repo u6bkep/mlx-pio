@@ -1017,6 +1017,72 @@ fn split_agrees_with_sequential() {
     );
 }
 
+/// Re-establish the small tx_a bracket verdicts (L=1 0..0 and L=2
+/// 1..1; L=2 0..0 lives in `split_agrees_with_sequential`, L=2 0..1 in
+/// `tx_a_l2_01_split`). Run after any semantics change:
+/// `cargo test --release --test narrow_engine -- --ignored
+/// tx_a_small_brackets --nocapture`
+#[test]
+#[ignore]
+fn tx_a_small_brackets_split() {
+    use pio_superopt::narrow::engine::search_split;
+    let (spec4, side) = tx_a_spec(460);
+    let reference = tx_a_words(&side);
+    let mut expected = spec4.clone();
+    expected.expected = run_spec(&spec4, reference);
+    for (slots, wb, wt) in [(1u8, 0u8, 0u8), (2, 1, 1)] {
+        let (mut s, _) = tx_a_spec(460);
+        s.slots = slots;
+        s.cfg.wrap_bottom = wb;
+        s.cfg.wrap_top = wt;
+        s.expected = expected.expected.clone();
+        let t = std::time::Instant::now();
+        let r = search_split(&s, 5, 28);
+        eprintln!(
+            "L={slots} wrap {wb}..{wt} split(28): items={} champions={} in {:.1}s",
+            r.stats.items,
+            r.stats.champions_found,
+            t.elapsed().as_secs_f64()
+        );
+        assert_eq!(
+            r.stats.champions_found, 0,
+            "L={slots} wrap {wb}..{wt} unexpectedly satisfiable"
+        );
+    }
+}
+
+/// The L=3 0..0 bracket under the split driver — the corrected-
+/// semantics verdict run. Detached:
+/// `cargo test --release --test narrow_engine -- --ignored
+/// tx_a_l3_00_split --nocapture`
+#[test]
+#[ignore]
+fn tx_a_l3_00_split() {
+    use pio_superopt::narrow::engine::search_split;
+    let (mut spec4, side) = tx_a_spec(460);
+    let reference = tx_a_words(&side);
+    spec4.expected = run_spec(&spec4, reference);
+    let (mut s, _) = tx_a_spec(460);
+    s.slots = 3;
+    s.cfg.wrap_bottom = 0;
+    s.cfg.wrap_top = 0;
+    s.expected = spec4.expected.clone();
+    s.memo_cap = 1 << 21; // per-unit memos; 28 workers share RAM
+    let t = std::time::Instant::now();
+    let r = search_split(&s, 5, 28);
+    eprintln!(
+        "L=3 wrap 0..0 split(28): items={} forks={} refuted={} memo_hit={} champions={} in {:.0}s",
+        r.stats.items,
+        r.stats.forks,
+        r.stats.refuted,
+        r.stats.memo_hits,
+        r.stats.champions_found,
+        t.elapsed().as_secs_f64()
+    );
+    eprintln!("  benefit_hist: {}", r.stats.benefit_hist_compact());
+    assert_eq!(r.stats.champions_found, 0, "L=3 wrap 0..0 unexpectedly satisfiable");
+}
+
 /// Wall-clock measurement of the split driver on the L=2 0..1 bracket
 /// (sequential: ~270s). `cargo test --release --test narrow_engine --
 /// --ignored tx_a_l2_01_split --nocapture`
