@@ -298,7 +298,7 @@ fn still_stalled(st: &NState, cfg: &NCfg, gpio_in: u32) -> bool {
 }
 
 #[inline]
-fn resolve_irq_index(index: u8, sm_id: u8) -> u8 {
+pub(crate) fn resolve_irq_index(index: u8, sm_id: u8) -> u8 {
     if index & 0x10 != 0 {
         (((index & 3) + sm_id) % 4) | (index & 4)
     } else {

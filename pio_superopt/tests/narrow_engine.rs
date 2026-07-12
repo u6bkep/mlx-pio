@@ -83,27 +83,21 @@ fn in_l1_space(w: u16, slots: u8) -> bool {
     }
 }
 
-/// The canonical respelling of a word under P2/P4 (L=1, so the JMP
-/// fallthrough of slot 0 is `wrap_bottom`): pure-no-op spellings map to
-/// NOP_CANON with delay preserved.
+/// The canonical respelling of a word under the mechanized quotient
+/// (ticket 009 `word_canon`) plus the POSITIONAL P4 map (L=1, so the
+/// JMP fallthrough of slot 0 is `wrap_bottom`): vacuous-jump no-op
+/// spellings map to the config's no-op representative with delay
+/// preserved.
 fn canon_l1_word(w: u16, spec: &EngineSpec) -> u16 {
-    use pio_superopt::narrow::engine::NOP_CANON;
-    let delay = w & 0x1F00;
+    use pio_superopt::narrow::engine::word_canon;
+    let w = word_canon(w, &spec.cfg);
     match (w >> 13) & 0x7 {
         0 => {
             let cond = (w >> 5) & 0x7;
             let ft = if 0 == spec.cfg.wrap_top { spec.cfg.wrap_bottom } else { 1 } as u16;
             if cond != 2 && cond != 4 && (w & 0x1F) == ft {
-                return NOP_CANON | delay;
-            }
-            w
-        }
-        5 => {
-            // Only the X/Y self-moves are true no-ops; MOV to ISR/OSR
-            // resets the shift counter (datasheet 11.4.10).
-            let (dst, op, src) = ((w >> 5) & 0x7, (w >> 3) & 0x3, w & 0x7);
-            if op == 0 && dst == src && matches!(dst, 1 | 2) {
-                return NOP_CANON | delay;
+                // The nop representative for this config, delay kept.
+                return word_canon(0xA042 | (w & 0x1F00), &spec.cfg);
             }
             w
         }
@@ -1106,4 +1100,101 @@ fn tx_a_l2_01_split() {
         r.stats.items, r.stats.memo_hits, r.stats.champions_found, t.elapsed().as_secs_f64()
     );
     assert_eq!(r.stats.champions_found, 0);
+}
+
+/// Ticket 009 lemma gate: `word_canon` merges spellings ONLY when they
+/// are behaviorally identical. Every non-identity respelling is
+/// executed against its representative from a diverse state battery ×
+/// several gpio words, on configs chosen to arm every lemma: the tx_a
+/// config (out/set_count 0, side-set, sm_id 0), a 1-pin SET/OUT
+/// config (data masking), an autopush/autopull config (counter
+/// visibility), and an sm_id=1 variant (rel-IRQ folding must NOT
+/// collapse the same way). Also checks idempotence on all 65,536
+/// words. This is the "battery verifies, lemmas prove" contract: a
+/// lemma bug shows up here as a behavioral diff.
+#[test]
+fn word_canon_battery_sound() {
+    use pio_superopt::narrow::engine::word_canon;
+    use pio_superopt::narrow::{step, NState};
+
+    fn battery(cfg: &NCfg) -> Vec<NState> {
+        let xs = [0u32, 1, 2, 5, 31, 32, 0x8000_0000, 0xFFFF_FFFF, 0xA5A5_5A5A];
+        let mut states = Vec::new();
+        for i in 0..24usize {
+            let mut st = NState::new(cfg);
+            st.x = xs[i % xs.len()];
+            st.y = xs[(i * 7 + 3) % xs.len()];
+            st.isr = xs[(i * 3 + 1) % xs.len()];
+            st.osr = xs[(i * 5 + 2) % xs.len()];
+            st.isr_count = [0u8, 1, 4, 7, 8, 31, 32][i % 7];
+            st.osr_count = [32u8, 0, 1, 7, 8, 31, 16][i % 7];
+            st.irq_flags = [0u8, 1, 0x80, 0xFF, 2, 0x55][i % 6];
+            st.out_latch = xs[(i * 11 + 4) % xs.len()];
+            st.dir_latch = [0u32, u32::MAX, 0x0000_FFFF][i % 3];
+            st.pc = (i % 4) as u8;
+            for k in 0..(i % 5) {
+                st.tx.push(0x1111_1111u32.wrapping_mul(k as u32 + 1));
+            }
+            for k in 0..(i % 4) {
+                st.rx.push(0x2222_2222u32.wrapping_mul(k as u32 + 1));
+            }
+            states.push(st);
+        }
+        states
+    }
+
+    fn step_word(cfg: &NCfg, st0: &NState, w: u16, gpio: u32) -> NState {
+        let mut c = cfg.clone();
+        c.code = [w; 32];
+        let mut st = *st0;
+        step(&mut st, &c, gpio);
+        st
+    }
+
+    let tx_a = tx_a_spec(460).0.cfg;
+    let one_pin = cfg_for(
+        Config {
+            pins: PinMap {
+                set_base: 0,
+                set_count: 1,
+                out_base: 0,
+                out_count: 1,
+                in_base: 0,
+                ..PinMap::default()
+            },
+            ..Config::default()
+        },
+        0,
+        31,
+    );
+    let mut auto = one_pin.clone();
+    auto.autopush = true;
+    auto.autopull = true;
+    auto.push_threshold = 8;
+    auto.pull_threshold = 8;
+    let mut sm1 = tx_a.clone();
+    sm1.sm_id = 1;
+
+    for (name, cfg) in [("tx_a", &tx_a), ("one_pin", &one_pin), ("auto", &auto), ("sm1", &sm1)] {
+        let states = battery(cfg);
+        let mut merged = 0u32;
+        for w in 0..=0xFFFFu16 {
+            let c = word_canon(w, cfg);
+            assert_eq!(word_canon(c, cfg), c, "[{name}] canon not idempotent at {w:04x}");
+            if c == w {
+                continue;
+            }
+            merged += 1;
+            for st in &states {
+                for gpio in [0u32, u32::MAX, 0x0000_0101, 1 << 8] {
+                    assert_eq!(
+                        step_word(cfg, st, w, gpio),
+                        step_word(cfg, st, c, gpio),
+                        "[{name}] word_canon merged behaviorally distinct words: {w:04x} -> {c:04x}"
+                    );
+                }
+            }
+        }
+        eprintln!("word_canon[{name}]: {merged} of 65536 words respelled, battery-verified");
+    }
 }

@@ -127,6 +127,10 @@ pub struct Stats {
     /// Fork values killed by the canonicity filters P2/P3/P4 (duplicate
     /// spellings whose representative is generated elsewhere).
     pub canon_pruned: u64,
+    /// Fork values killed by the word behavioral quotient (ticket 009):
+    /// the candidate's partial word is lemma-provably interchangeable
+    /// with an already-generated sibling of the same fork.
+    pub quotient_pruned: u64,
     /// Items refuted by a consulted-set memo hit (subtree skipped).
     pub memo_hits: u64,
     /// Probes whose key CORE matched at least one record (hit or not) —
@@ -468,6 +472,129 @@ fn side_value_consistent(
 /// (delay/side) excluded from the pattern.
 pub const NOP_CANON: u16 = 0xA021;
 const NOP_CANON_MASK: u16 = 0xE0FF;
+
+/// Ticket 009: the lemma-verified behavioral word quotient. Maps a
+/// slot word to its class-canonical spelling under `cfg` — two words
+/// map together ONLY when a hand-audited, config-parameterized lemma
+/// (checked line-by-line against `exec_op`, battery-gated by
+/// `word_canon_battery_sound`) proves them interchangeable as FETCHED
+/// instructions in EVERY state. Digest batteries may SUGGEST more
+/// classes; unproven candidates stay singletons. Delay/side bits
+/// (8..12) are always preserved — side-set asserts pins even on nops.
+///
+/// Lemmas: (1) WAIT-IRQ / IRQ behavior factors through
+/// `resolve_irq_index` (rel folding is sm_id-dependent; IRQ operand
+/// bit 7 is never read); (2) OUT to PINS/PINDIRS with out_count == 0
+/// writes nothing ≡ OUT NULL; (3) MOV to PINS/PINDIRS with
+/// out_count == 0 is a pure read ≡ no-op, and the X/Y self-moves
+/// (op none) are no-ops; (4) MOV from STATUS with status_n == 0 reads
+/// constant 0 ≡ NULL source; (5) SET to PINS/PINDIRS masks data to
+/// set_count bits (count 0 ⇒ no-op); (6) PUSH/PULL never read operand
+/// bits 0..4. The no-op representative is the class minimum:
+/// `mov pins, pins` (0xA000) when out_count == 0, else NOP_CANON.
+pub fn word_canon(w: u16, cfg: &NCfg) -> u16 {
+    let ds = w & 0x1F00;
+    let nop_rep = if cfg.out_count == 0 { 0xA000 | ds } else { NOP_CANON | ds };
+    match (w >> 13) & 0x7 {
+        1 => {
+            if (w >> 5) & 0x3 == 2 {
+                let r = super::resolve_irq_index((w & 0x1F) as u8, cfg.sm_id) as u16;
+                (w & !0x001F) | r
+            } else {
+                w
+            }
+        }
+        3 => {
+            let dst = (w >> 5) & 0x7;
+            if (dst == 0 || dst == 4) && cfg.out_count == 0 {
+                (w & !0x00E0) | (3 << 5)
+            } else {
+                w
+            }
+        }
+        4 => w & !0x001F,
+        5 => {
+            let (dst, op, src) = ((w >> 5) & 0x7, (w >> 3) & 0x3, w & 0x7);
+            if (dst == 0 || dst == 3) && cfg.out_count == 0 {
+                return nop_rep;
+            }
+            if op == 0 && dst == src && (dst == 1 || dst == 2) {
+                return nop_rep;
+            }
+            if src == 5 && cfg.status_n == 0 {
+                (w & !0x0007) | 3
+            } else {
+                w
+            }
+        }
+        6 => {
+            let r = super::resolve_irq_index((w & 0x1F) as u8, cfg.sm_id) as u16;
+            (w & !0x009F) | r
+        }
+        7 => {
+            let dst = (w >> 5) & 0x7;
+            if dst == 0 || dst == 4 {
+                if cfg.set_count == 0 {
+                    return nop_rep;
+                }
+                let m = (1u16 << cfg.set_count.min(5)) - 1;
+                (w & !0x001F) | (w & m)
+            } else {
+                w
+            }
+        }
+        _ => w,
+    }
+}
+
+/// Per-config quotient state: the full-word canon table plus lazily
+/// built per-mask class-id tables for PARTIAL words. Under `mask`, two
+/// masked values share an id iff every completion of the undecided
+/// bits lands in the same full-word class — i.e. the partial words are
+/// behaviorally interchangeable wherever the search can still take
+/// them. Ids are exact (profile-interned), not hashes.
+struct WordQuotient {
+    canon: Vec<u16>,
+    tables: FxMap<u16, FxMap<u16, u32>>,
+}
+
+impl WordQuotient {
+    fn build(cfg: &NCfg) -> WordQuotient {
+        WordQuotient {
+            canon: (0..=0xFFFFu16).map(|w| word_canon(w, cfg)).collect(),
+            tables: FxMap::default(),
+        }
+    }
+
+    fn table(&mut self, mask: u16) -> &FxMap<u16, u32> {
+        let canon = &self.canon;
+        self.tables.entry(mask).or_insert_with(|| {
+            let inv = !mask;
+            let mut intern: FxMap<Vec<u16>, u32> = FxMap::default();
+            let mut out: FxMap<u16, u32> = FxMap::default();
+            let mut v = 0u16;
+            loop {
+                let mut profile = Vec::with_capacity(1usize << inv.count_ones().min(13));
+                let mut c = 0u16;
+                loop {
+                    profile.push(canon[(v | c) as usize]);
+                    if c == inv {
+                        break;
+                    }
+                    c = c.wrapping_sub(inv) & inv;
+                }
+                let next = intern.len() as u32;
+                let id = *intern.entry(profile).or_insert(next);
+                out.insert(v, id);
+                if v == mask {
+                    break;
+                }
+                v = v.wrapping_sub(mask) & mask;
+            }
+            out
+        })
+    }
+}
 
 /// Swap every X/Y register naming in a (possibly partially decided)
 /// word: JMP conds !X/X-- <-> !Y/Y--, IN/OUT/MOV/SET register codes
@@ -1665,6 +1792,8 @@ fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> Sear
     let mut stats = Stats::default();
     let mut cfg = spec.cfg.clone();
     let mut values = Vec::with_capacity(32);
+    let mut sib_ids: Vec<u32> = Vec::with_capacity(32);
+    let mut wq = WordQuotient::build(&cfg);
     let mut last_beat = std::time::Instant::now();
 
     // Consulted-set memo (failure-only): frames mirror the DFS stack —
@@ -1696,12 +1825,13 @@ fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> Sear
         stats.items += 1;
         if instrument && last_beat.elapsed().as_secs() >= 10 {
             eprintln!(
-                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
+                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
                 stats.items,
                 stats.forks,
                 stats.refuted,
                 stats.prefiltered,
                 stats.canon_pruned,
+                stats.quotient_pruned,
                 stats.memo_hits,
                 stats.memo_entries,
                 min_benefit,
@@ -1851,6 +1981,8 @@ fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> Sear
                 if let Some(field) = demand(it.decided[fetch_pc], it.value[fetch_pc], &cfg) {
                     values.clear();
                     field.values_into(&cfg, spec.slots, &mut values);
+                    sib_ids.clear();
+                    let qtab = wq.table(it.decided[fetch_pc] | field.mask);
                     let mut pushed = 0u32;
                     for &v in &values {
                         let raw = v >> field.shift();
@@ -1913,6 +2045,20 @@ fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> Sear
                                 }
                             }
                         }
+                        // 009 word-quotient sibling dedup: skip a
+                        // candidate whose partial word (this slot, child
+                        // mask) is lemma-provably interchangeable with an
+                        // already-generated sibling of this same fork —
+                        // that sibling's subtree IS this subtree. A
+                        // sibling later killed by the pin-write
+                        // pre-filter kills this value with it (class
+                        // members share every capture).
+                        let qid = qtab[&(it.value[fetch_pc] | v)];
+                        if sib_ids.contains(&qid) {
+                            stats.quotient_pruned += 1;
+                            continue;
+                        }
+                        sib_ids.push(qid);
                         // Pin-write pre-filter, an exact one-cycle
                         // lookahead: once this value completes the fetch's
                         // consulted fields AND the decoded instruction
@@ -2205,6 +2351,7 @@ fn merge_stats(into: &mut Stats, s: &Stats) {
     into.cycles_run += s.cycles_run;
     into.prefiltered += s.prefiltered;
     into.canon_pruned += s.canon_pruned;
+    into.quotient_pruned += s.quotient_pruned;
     into.memo_hits += s.memo_hits;
     into.memo_core_matches += s.memo_core_matches;
     into.memo_state_misses += s.memo_state_misses;
