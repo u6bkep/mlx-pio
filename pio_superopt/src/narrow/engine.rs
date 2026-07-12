@@ -46,8 +46,15 @@
 //!   champions materialize with register fields mirrored via
 //!   `mirror_word`). A champion still Unbound at the end covers its
 //!   mirror twin too (`Champion::binding_free`).
-//! - No memoization, plain DFS (checkpoint prefix sharing comes free:
-//!   children copy the parent's `NState` at the fork cycle).
+//! - Consulted-set memoization (failure-only): an exhausted,
+//!   champion-free subtree records — keyed on the always-read state
+//!   CORE (cycle, input position, pc, delay, stall, pending, clk_acc,
+//!   pin latches) — the program fields it consulted AND the state
+//!   components it read (per-opcode read table, `word_state_reads`),
+//!   quantifying its failure claim over everything else. A later item
+//!   matching core + read pattern + program conditions is refuted
+//!   outright. Records are benefit-gated with purge-and-raise at the
+//!   cap; dropping records only loses pruning, never soundness.
 
 use super::{clock_tick, compose, still_stalled, NCfg, NState, Stall, Stim};
 
@@ -122,6 +129,9 @@ pub struct Stats {
     pub canon_pruned: u64,
     /// Items refuted by a consulted-set memo hit (subtree skipped).
     pub memo_hits: u64,
+    /// Probes whose key CORE matched at least one record (hit or not) —
+    /// the gap to `memo_hits` is pattern/condition mismatches.
+    pub memo_core_matches: u64,
     /// Failure records currently in the memo.
     pub memo_entries: u64,
     /// Times the memo hit its cap and purged low-benefit records.
@@ -556,19 +566,234 @@ fn peek_tick(st: &NState, cfg: &NCfg) -> bool {
     st.clk_acc + 256 >= threshold
 }
 
-/// A memo key: everything a subtree's behavior depends on besides the
-/// program fields it consults. `next_input` covers the streamed-input
-/// driver position (preloaded inputs live in the FIFO already).
+/// Full fork-point identity, kept per frame for record projection and
+/// the hit dump. `next_input` covers the streamed-input driver position
+/// (preloaded inputs live in the FIFO already).
 type MemoKey = (u32, u32, NState);
+
+// --- Consulted-state components (ticket 007) -------------------------
+// The memo key splits into an always-read CORE (hashed) and PATTERN
+// components a record mentions only if its subtree actually read them.
+// A record then covers every state agreeing on the core and its read
+// components — one record where the monolithic key needed unboundedly
+// many.
+
+const SC_X: u16 = 1 << 0;
+const SC_Y: u16 = 1 << 1;
+const SC_ISR: u16 = 1 << 2;
+const SC_OSR: u16 = 1 << 3;
+const SC_ISR_CNT: u16 = 1 << 4;
+const SC_OSR_CNT: u16 = 1 << 5;
+const SC_IRQ: u16 = 1 << 6;
+const SC_TX: u16 = 1 << 7;
+const SC_RX: u16 = 1 << 8;
+
+/// The always-read key core: fetch reads pc, the divider reads clk_acc,
+/// the per-cycle capture/compose read the latches, and step's entry
+/// path consults delay/stall/pending every executing cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct KeyCore {
+    cycle: u32,
+    next_input: u32,
+    pc: u8,
+    delay_count: u8,
+    stall: Stall,
+    pending_exec: Option<u16>,
+    clk_acc: u32,
+    out_latch: u32,
+    dir_latch: u32,
+}
+
+fn key_core(cycle: u32, next_input: u32, st: &NState) -> KeyCore {
+    KeyCore {
+        cycle,
+        next_input,
+        pc: st.pc,
+        delay_count: st.delay_count,
+        stall: st.stall,
+        pending_exec: st.pending_exec,
+        clk_acc: st.clk_acc,
+        out_latch: st.out_latch,
+        dir_latch: st.dir_latch,
+    }
+}
+
+/// Append the values of `mask`'s components in canonical order. FIFOs
+/// are read-normalized (level + queued words in pop order), so
+/// observably-equal FIFOs with different buffer layouts compare equal.
+fn project_state(st: &NState, mask: u16, out: &mut Vec<u32>) {
+    if mask & SC_X != 0 {
+        out.push(st.x);
+    }
+    if mask & SC_Y != 0 {
+        out.push(st.y);
+    }
+    if mask & SC_ISR != 0 {
+        out.push(st.isr);
+    }
+    if mask & SC_OSR != 0 {
+        out.push(st.osr);
+    }
+    if mask & SC_ISR_CNT != 0 {
+        out.push(st.isr_count as u32);
+    }
+    if mask & SC_OSR_CNT != 0 {
+        out.push(st.osr_count as u32);
+    }
+    if mask & SC_IRQ != 0 {
+        out.push(st.irq_flags as u32);
+    }
+    for f in [(mask & SC_TX != 0).then_some(&st.tx), (mask & SC_RX != 0).then_some(&st.rx)]
+        .into_iter()
+        .flatten()
+    {
+        out.push(f.level() as u32);
+        for i in 0..f.level() {
+            out.push(f.peek(i));
+        }
+    }
+}
+
+/// Pattern components executing this word can READ this cycle (beyond
+/// the core). OVER-approximating reads is sound (a too-big mask only
+/// matches fewer probers); missing a read is a false impossibility —
+/// derived line-by-line from `exec_op`. Writes as such add nothing: any
+/// dataflow into a later-read component passes through a read counted
+/// here or through the core.
+fn word_state_reads(w: u16, cfg: &NCfg) -> u16 {
+    match (w >> 13) & 0x7 {
+        0 => match (w >> 5) & 0x7 {
+            1 | 2 => SC_X,
+            3 | 4 => SC_Y,
+            5 => SC_X | SC_Y,
+            7 => SC_OSR_CNT,
+            _ => 0, // always / pin (gpio is core)
+        },
+        1 => {
+            if (w >> 5) & 0x3 == 2 {
+                SC_IRQ
+            } else {
+                0
+            }
+        }
+        2 => {
+            let src = match (w >> 5) & 0x7 {
+                1 => SC_X,
+                2 => SC_Y,
+                6 => SC_ISR,
+                7 => SC_OSR,
+                _ => 0,
+            };
+            src | SC_ISR | SC_ISR_CNT | if cfg.autopush { SC_RX } else { 0 }
+        }
+        3 => SC_OSR | SC_OSR_CNT | if cfg.autopull { SC_TX } else { 0 },
+        4 => {
+            if (w >> 7) & 1 != 0 {
+                // PULL reads TX; on empty it reads X, and the binding
+                // demand compares x != y.
+                SC_TX | SC_X | SC_Y
+            } else {
+                SC_RX | SC_ISR
+            }
+        }
+        5 => match w & 0x7 {
+            1 => SC_X,
+            2 => SC_Y,
+            6 => SC_ISR,
+            7 => SC_OSR,
+            5 => {
+                if cfg.status_sel {
+                    SC_RX
+                } else {
+                    SC_TX
+                }
+            }
+            _ => 0,
+        },
+        6 => SC_IRQ,
+        _ => 0, // SET reads nothing
+    }
+}
+
+/// Segment-local provenance of a scratch register's CURRENT value —
+/// what a read of it actually depends on. Reset to `Fork` at every item
+/// pop; sound for every enclosing frame because a write and any read of
+/// it within one fork-free segment are enclosed by exactly the same
+/// frames (forks end segments).
+#[derive(Clone, Copy)]
+enum Prov {
+    /// Still the pop-time value: a read consults the state pattern.
+    Fork,
+    /// An immediate CODE field (`set x/y, imm`): a read consults that
+    /// program field instead of the state — this is what lets records
+    /// generalize over "register loaded then compared" chains.
+    Field(u8, u16),
+    /// Computed from sources that were consulted when written (register
+    /// moves, OUT data, a decrement that first read the register, exec'd
+    /// immediates — pending words are core): a read adds nothing new.
+    Accounted,
+}
+
+/// Consume a word's state reads into the segment, routing X/Y through
+/// their provenance.
+fn consume_reads(
+    r: u16,
+    x_prov: Prov,
+    y_prov: Prov,
+    seg_reads: &mut u16,
+    seg_mask: &mut [u16; 32],
+) {
+    *seg_reads |= r & !(SC_X | SC_Y);
+    for (bit, prov) in [(SC_X, x_prov), (SC_Y, y_prov)] {
+        if r & bit != 0 {
+            match prov {
+                Prov::Fork => *seg_reads |= bit,
+                Prov::Field(s, m) => seg_mask[s as usize] |= m,
+                Prov::Accounted => {}
+            }
+        }
+    }
+}
+
+/// Which scratch registers a COMPLETED execution of this word definitely
+/// writes, and whether the written value is a code-immediate (SET's
+/// 5-bit data). Conditional writes that first READ the target (JMP
+/// X--/Y--) are Accounted-safe: the read pins the branch, so matching
+/// probers evolve identically.
+fn word_reg_writes(w: u16) -> (bool, bool, bool) {
+    let f = (w >> 5) & 0x7;
+    match (w >> 13) & 0x7 {
+        0 => (f == 2, f == 4, false),
+        3 | 5 => (f == 1, f == 2, false),
+        7 => (f == 1, f == 2, true),
+        _ => (false, false, false),
+    }
+}
+
+/// Pattern components a pending stall re-check reads each cycle.
+fn stall_state_reads(stall: Stall) -> u16 {
+    match stall {
+        Stall::Pull => SC_TX,
+        Stall::Push => SC_RX,
+        Stall::WaitIrq { .. } | Stall::IrqWait { .. } => SC_IRQ,
+        _ => 0, // gpio/pin waits read the core latches + stimulus
+    }
+}
 
 /// Per-slot consulted-condition set: `(mask, value)` of the DECIDED
 /// fields a subtree's evaluation read. The failure claim quantifies
 /// over everything else.
 type Conds = Vec<(u8, u16, u16)>;
 
-/// A failure record: conditions plus the item count of the subtree it
-/// summarizes (its benefit — what one hit saves).
-type MemoRecord = (Conds, u32);
+/// A failure record: the subtree's consulted-state pattern (mask +
+/// projected fork-time values), its consulted program-field conditions,
+/// and the item count it summarizes (its benefit — what one hit saves).
+struct StateRecord {
+    mask: u16,
+    vals: Vec<u32>,
+    conds: Conds,
+    benefit: u32,
+}
 
 /// One frame of the fork tree, mirroring the DFS stack (LIFO makes each
 /// subtree contiguous). Accumulates the subtree's consulted set for the
@@ -584,6 +809,8 @@ struct Frame {
     /// Union of consulted (mask, value) per slot across the subtree.
     consulted_mask: [u16; 32],
     consulted_value: [u16; 32],
+    /// Union of pattern state components read anywhere in the subtree.
+    state_reads: u16,
     any_champion: bool,
     /// False when a record would be unsound: a binding fork below mixes
     /// runs from two root states (identity S, twin sigma(S)) under one
@@ -597,15 +824,18 @@ struct Frame {
 
 impl Frame {
     /// Union a consulted (mask, value) into this frame's subtree set.
-    /// A value conflict (possible when a binding fork's identity and
-    /// twin sides consult the same slot under different spellings)
-    /// makes the frame unrecordable — the union no longer describes
-    /// one consistent condition set.
+    /// A value conflict on a field DECIDED AT THIS FRAME (possible when
+    /// a binding fork's identity and twin sides consult the same slot
+    /// under different spellings) makes the frame unrecordable — the
+    /// union no longer describes one consistent condition set. Bits the
+    /// frame forked below are EXPECTED to differ across children (the
+    /// union over explored values) and are dropped by the decided
+    /// filter at finalize, so they never count as conflicts.
     fn merge(&mut self, slot: usize, mask: u16, value: u16) {
         if mask == 0 {
             return;
         }
-        let overlap = self.consulted_mask[slot] & mask;
+        let overlap = self.consulted_mask[slot] & mask & self.decided[slot];
         if self.consulted_value[slot] & overlap != value & overlap {
             self.recordable = false;
         }
@@ -614,8 +844,10 @@ impl Frame {
     }
 }
 
-/// Merge a finished pop-segment's consulted fields into the open frame.
-fn merge_segment(fr: &mut Frame, seg_mask: &[u16; 32], value: &[u16; 32]) {
+/// Merge a finished pop-segment's consulted fields and state reads into
+/// the open frame.
+fn merge_segment(fr: &mut Frame, seg_mask: &[u16; 32], seg_reads: u16, value: &[u16; 32]) {
+    fr.state_reads |= seg_reads;
     for s in 0..32 {
         if seg_mask[s] != 0 {
             fr.merge(s, seg_mask[s], value[s] & seg_mask[s]);
@@ -634,7 +866,7 @@ fn merge_segment(fr: &mut Frame, seg_mask: &[u16; 32], value: &[u16; 32]) {
 /// save the most work.
 fn close_child(
     frames: &mut Vec<Frame>,
-    memo: &mut std::collections::HashMap<MemoKey, Vec<MemoRecord>>,
+    memo: &mut std::collections::HashMap<KeyCore, Vec<StateRecord>>,
     memo_cap: usize,
     min_benefit: &mut u32,
     stats: &mut Stats,
@@ -668,7 +900,7 @@ fn close_child(
                 *min_benefit = min_benefit.saturating_mul(4);
                 let mut kept = 0u64;
                 memo.retain(|_, recs| {
-                    recs.retain(|&(_, b)| b >= *min_benefit);
+                    recs.retain(|r| r.benefit >= *min_benefit);
                     kept += recs.len() as u64;
                     !recs.is_empty()
                 });
@@ -676,11 +908,18 @@ fn close_child(
                 stats.memo_purges += 1;
             }
             if benefit >= *min_benefit {
-                memo.entry(f.key).or_default().push((conds.clone(), benefit));
+                // The record's state pattern: fork-time values of the
+                // components the subtree read.
+                let mut vals = Vec::new();
+                project_state(&f.key.2, f.state_reads, &mut vals);
+                memo.entry(key_core(f.key.0, f.key.1, &f.key.2)).or_default().push(
+                    StateRecord { mask: f.state_reads, vals, conds: conds.clone(), benefit },
+                );
                 stats.memo_entries += 1;
             }
         }
         let parent = frames.last_mut().expect("synthetic root below every frame");
+        parent.state_reads |= f.state_reads;
         for &(s, m, v) in &conds {
             parent.merge(s as usize, m, v);
         }
@@ -782,6 +1021,10 @@ fn fetch_footprint(decided: u16, value: u16, cfg: &NCfg) -> u16 {
         m |= match (value >> 13) & 0x7 {
             4 => 0x00E0,
             6 => 0x007F,
+            // SET to X/Y: the 5-bit immediate is NOT consulted at
+            // execution — it flows into the register's provenance and
+            // is consulted only if the register is actually read.
+            7 if decided & 0x00E0 == 0x00E0 && matches!((value >> 5) & 0x7, 1 | 2) => 0x00E0,
             _ => 0x00FF,
         };
     }
@@ -859,17 +1102,20 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
     // never-recorded root frame absorbing top-level merges.
     let memo_on = spec.memo_cap > 0;
     let mut dump = if memo_on { dump_open() } else { None };
-    let mut memo: std::collections::HashMap<MemoKey, Vec<MemoRecord>> =
+    let mut memo: std::collections::HashMap<KeyCore, Vec<StateRecord>> =
         std::collections::HashMap::new();
     // Records must beat this subtree size to earn a slot; quadruples at
     // every cap purge.
     let mut min_benefit: u32 = 4;
+    // Scratch for probe-side state projection.
+    let mut proj: Vec<u32> = Vec::new();
     let mut frames: Vec<Frame> = vec![Frame {
         key: (0, 0, root.st),
         decided: [0u16; 32],
         children_left: 1,
         consulted_mask: [0u16; 32],
         consulted_value: [0u16; 32],
+        state_reads: 0,
         any_champion: false,
         recordable: false,
         items_at_open: 0,
@@ -896,29 +1142,58 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
         }
         cfg.code = it.value;
 
-        // Memo probe: a recorded failure at this exact (cycle,
-        // input-position, state) whose conditions this item's decided
-        // fields satisfy refutes the item outright. An UNBOUND item
-        // with x != y also stands for its mirror twin rooted at the
-        // SWAPPED state, about which the record says nothing — no hit.
-        if memo_on && (!it.unbound || it.st.x == it.st.y) {
-            let hit: Option<Conds> =
-                memo.get(&(it.cycle, it.next_input, it.st)).and_then(|entries| {
+        // Apply the per-cycle environment BEFORE probing: frame keys
+        // are captured at fork time, i.e. post-env, and application is
+        // idempotent (the cycle loop re-applies it harmlessly).
+        if memo_on && it.cycle < spec.cycles {
+            if let Some(&m) = irq_at.get(&it.cycle) {
+                it.st.irq_flags |= m;
+            }
+            if !preload {
+                while (it.next_input as usize) < spec.inputs.len() && !it.st.tx.is_full() {
+                    it.st.tx.push(spec.inputs[it.next_input as usize]);
+                    it.next_input += 1;
+                }
+            }
+        }
+
+        // Memo probe: a recorded failure whose key core matches this
+        // item, whose state pattern matches on every component the
+        // recorded subtree READ, and whose program conditions this
+        // item's decided fields satisfy refutes the item outright. An
+        // UNBOUND item with x != y also stands for its mirror twin
+        // rooted at the SWAPPED state — such a hit is only valid if the
+        // record read neither X nor Y (then it covers the twin too).
+        if memo_on {
+            let hit: Option<(Conds, u16)> =
+                memo.get(&key_core(it.cycle, it.next_input, &it.st)).and_then(|entries| {
+                    stats.memo_core_matches += 1;
                     entries
                         .iter()
-                        .find(|(conds, _)| {
-                            conds.iter().all(|&(s, m, v)| {
-                                it.decided[s as usize] & m == m && it.value[s as usize] & m == v
-                            })
+                        .find(|r| {
+                            if it.unbound
+                                && it.st.x != it.st.y
+                                && r.mask & (SC_X | SC_Y) != 0
+                            {
+                                return false;
+                            }
+                            proj.clear();
+                            project_state(&it.st, r.mask, &mut proj);
+                            proj == r.vals
+                                && r.conds.iter().all(|&(s, m, v)| {
+                                    it.decided[s as usize] & m == m
+                                        && it.value[s as usize] & m == v
+                                })
                         })
-                        .map(|(conds, _)| conds.clone())
+                        .map(|r| (r.conds.clone(), r.mask))
                 });
-            if let Some(conds) = hit {
+            if let Some((conds, rmask)) = hit {
                 stats.memo_hits += 1;
                 if let Some(d) = dump.as_mut() {
                     d.hit(&(it.cycle, it.next_input, it.st), &conds, &it.decided, &it.value, spec.slots);
                 }
                 let top = frames.last_mut().expect("root frame");
+                top.state_reads |= rmask;
                 for &(s, m, v) in &conds {
                     top.merge(s as usize, m, v);
                 }
@@ -926,8 +1201,13 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                 continue 'items;
             }
         }
-        // This pop's run segment: which decided program fields it reads.
+        // This pop's run segment: which decided program fields and
+        // which state components it reads, with segment-local X/Y
+        // provenance.
         let mut seg_mask = [0u16; 32];
+        let mut seg_reads: u16 = 0;
+        let mut x_prov = Prov::Fork;
+        let mut y_prov = Prov::Fork;
 
         while it.cycle < spec.cycles {
             // Deterministic per-cycle environment (idempotent, so a fork
@@ -943,6 +1223,11 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
             }
             let ext = self::stim_at(&spec.stim, it.cycle);
             let gpio_in = compose(&it.st, spec.stim.mask, ext);
+
+            // A pending stall re-check reads its subject every cycle.
+            if memo_on && it.st.stall != Stall::None {
+                seg_reads |= stall_state_reads(it.st.stall);
+            }
 
             let fetching = peek_tick(&it.st, &cfg) && will_fetch(&it.st, &cfg, gpio_in);
             let fetch_pc = it.st.pc as usize;
@@ -1038,6 +1323,13 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                             if clock_tick(&mut scratch, &cfg) {
                                 super::step(&mut scratch, &cfg, gpio_in);
                             }
+                            // The lookahead's verdict reads whatever the
+                            // candidate word reads — those are subtree
+                            // conditions even for values never pushed.
+                            if memo_on {
+                                let r = word_state_reads(child_value, &cfg);
+                                consume_reads(r, x_prov, y_prov, &mut seg_reads, &mut seg_mask);
+                            }
                             let w = capture_word(&scratch, &spec.capture_pins, spec.stim.mask, ext);
                             if w != spec.expected[it.cycle as usize] {
                                 stats.prefiltered += 1;
@@ -1053,7 +1345,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                         pushed += 1;
                     }
                     if memo_on {
-                        merge_segment(frames.last_mut().expect("root frame"), &seg_mask, &it.value);
+                        merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                         if pushed > 0 {
                             frames.push(Frame {
                                 key: (it.cycle, it.next_input, it.st),
@@ -1063,6 +1355,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                                 consulted_value: [0u16; 32],
                                 any_champion: false,
                                 recordable: true,
+                                state_reads: 0,
                                 items_at_open: stats.items,
                             });
                         } else {
@@ -1072,6 +1365,18 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                     }
                     continue 'items;
                 }
+            }
+
+            // An instruction (fetched or pending) that can execute this
+            // cycle reads its per-opcode components; over-approximating
+            // (e.g. while a stall persists) is sound. Reads route
+            // through X/Y provenance; the word is remembered for the
+            // post-step write processing.
+            let exec_word = it.st.pending_exec.unwrap_or(cfg.code[fetch_pc]);
+            let exec_pending = it.st.pending_exec.is_some();
+            if memo_on && it.st.delay_count == 0 && peek_tick(&it.st, &cfg) {
+                let r = word_state_reads(exec_word, &cfg);
+                consume_reads(r, x_prov, y_prov, &mut seg_reads, &mut seg_mask);
             }
 
             // Binding demand: an unbound item and its mirror twin
@@ -1118,7 +1423,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                         pushed = 2;
                     }
                     if memo_on {
-                        merge_segment(frames.last_mut().expect("root frame"), &seg_mask, &it.value);
+                        merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                         frames.push(Frame {
                             key: (it.cycle, it.next_input, it.st),
                             decided: it.decided,
@@ -1127,6 +1432,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                             consulted_value: [0u16; 32],
                             any_champion: false,
                             recordable: true,
+                            state_reads: 0,
                             items_at_open: stats.items,
                         });
                     }
@@ -1145,7 +1451,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
             if w != spec.expected[it.cycle as usize] {
                 stats.refuted += 1;
                 if memo_on {
-                    merge_segment(frames.last_mut().expect("root frame"), &seg_mask, &it.value);
+                    merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                     close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut stats, false);
                 }
                 continue 'items;
@@ -1156,6 +1462,25 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
             // not left stalled)? Only then is delay consulted, and only
             // then does the P3 nop-run state advance.
             let completed = ticked && pre_delay == 0 && it.st.stall == Stall::None;
+            // A completed execution's register writes update the
+            // segment provenance (stalled executions skip their writes,
+            // so this must be post-step and completion-gated). Exec'd
+            // words come from data — their immediates are core-covered,
+            // hence Accounted.
+            if memo_on && completed {
+                let (wx, wy, imm) = word_reg_writes(exec_word);
+                let p = if imm && !exec_pending {
+                    Prov::Field(fetch_pc as u8, 0x001F)
+                } else {
+                    Prov::Accounted
+                };
+                if wx {
+                    x_prov = p;
+                }
+                if wy {
+                    y_prov = p;
+                }
+            }
             // A FETCHED canonical nop (P3 only applies without side-set,
             // whose assertion would make delay splits observable).
             let nop_run = completed
@@ -1201,7 +1526,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                         pushed = max as u32 + 1;
                     }
                     if memo_on {
-                        merge_segment(frames.last_mut().expect("root frame"), &seg_mask, &it.value);
+                        merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                         frames.push(Frame {
                             key: (it.cycle, it.next_input, it.st),
                             decided: it.decided,
@@ -1210,6 +1535,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                             consulted_value: [0u16; 32],
                             any_champion: false,
                             recordable: true,
+                            state_reads: 0,
                             items_at_open: stats.items,
                         });
                     }
@@ -1238,7 +1564,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
             champion_cap_hit = true;
         }
         if memo_on {
-            merge_segment(frames.last_mut().expect("root frame"), &seg_mask, &it.value);
+            merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
             close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut stats, true);
         }
     }

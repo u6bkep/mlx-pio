@@ -419,6 +419,62 @@ fn p3_delay_normal_form() {
     );
 }
 
+/// Ticket 007 gate: consulted-STATE generalization. Slot 0 is seeded to
+/// `set x, <data free>` (32 x-values); slot 1 is searched against an
+/// impossible period-3 duty trace. Slot-1 subtrees that never read X
+/// record state patterns without the X component, so the 31 later
+/// x-children hit records the first child wrote — sharing a monolithic
+/// state key can never exhibit (x differs at every fork state).
+#[test]
+fn consulted_state_shares_across_unread_register() {
+    let config = Config {
+        pins: PinMap {
+            set_base: 0,
+            set_count: 1,
+            out_base: 0,
+            out_count: 1,
+            in_base: 0,
+            ..PinMap::default()
+        },
+        ..Config::default()
+    };
+    let expected =
+        (0..18u32).map(|c| if c % 3 < 2 { 1 | 1 << 16 } else { 1 << 16 }).collect();
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config, 0, 1),
+        slots: 2,
+        cycles: 18,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected,
+        seed: vec![(0, 0xFFE0, 0xE020)], // set x, <data undecided>
+        memo_cap: 0,
+    };
+    let off = search(&spec, 10);
+    spec.memo_cap = 1 << 20;
+    let on = search(&spec, 10);
+    assert_eq!(off.champions, on.champions, "memo changed the verdict");
+    assert_eq!(off.stats.champions_found, 0, "period-3 unexpectedly satisfiable at L=2");
+    assert!(on.stats.memo_hits > 0, "no memo sharing at all");
+    assert!(
+        on.stats.items < off.stats.items / 2,
+        "consulted-state memo lost its cross-register sharing: on={} off={}",
+        on.stats.items,
+        off.stats.items
+    );
+    eprintln!(
+        "consulted_state gate: off items={} on items={} hits={} core_matches={} entries={}",
+        off.stats.items,
+        on.stats.items,
+        on.stats.memo_hits,
+        on.stats.memo_core_matches,
+        on.stats.memo_entries
+    );
+}
+
 /// The memo must be invisible in results: identical champion LISTS (set
 /// and order) with the memo on and off, across satisfiable and
 /// impossible spaces, including one with register naming and pull-empty

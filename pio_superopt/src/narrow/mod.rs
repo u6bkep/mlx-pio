@@ -58,6 +58,11 @@ impl Fifo {
     pub fn is_full(&self) -> bool {
         self.depth > 0 && self.count >= self.depth
     }
+    /// The i-th queued word (0 = next to pop). Caller keeps `i < level()`,
+    /// which also guarantees depth > 0.
+    pub fn peek(&self, i: u8) -> u32 {
+        self.buf[((self.head + i) % self.depth) as usize]
+    }
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
