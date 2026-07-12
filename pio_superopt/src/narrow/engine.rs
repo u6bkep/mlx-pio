@@ -1649,6 +1649,13 @@ struct DelayPair {
     demand_edge: u64,
     unconsulted: u64,
     horizon: u64,
+    unbound_skip: u64,
+    /// co_refuted sub-classification: races whose window wrote NO pin
+    /// latch on either machine (capture equality is then structural),
+    /// and races that consulted NO external input (WAIT gpio/pin/irq,
+    /// JMP PIN — the schedule-resync instructions).
+    co_latch_quiet: u64,
+    co_ext_free: u64,
     /// Summed cycles-from-probe until resolution, per class above.
     cyc_co: u64,
     cyc_ab: u64,
@@ -1659,10 +1666,12 @@ impl DelayPair {
     fn print(&self, tag: &str) {
         let avg = |s: u64, n: u64| s as f64 / n.max(1) as f64;
         eprintln!(
-            "delay-pair {tag}: checked={} co_refuted={} (avg {:.1}cy) absorbed={} (avg {:.1}cy) diverged={} (avg {:.1}cy) one_refuted={} demand_edge={} unconsulted={} horizon={}",
+            "delay-pair {tag}: checked={} co_refuted={} (avg {:.1}cy, latch_quiet={}, ext_free={}) absorbed={} (avg {:.1}cy) diverged={} (avg {:.1}cy) one_refuted={} demand_edge={} unconsulted={} horizon={} unbound_skip={}",
             self.checked,
             self.co_refuted,
             avg(self.cyc_co, self.co_refuted),
+            self.co_latch_quiet,
+            self.co_ext_free,
             self.absorbed,
             avg(self.cyc_ab, self.absorbed),
             self.diverged,
@@ -1671,6 +1680,7 @@ impl DelayPair {
             self.demand_edge,
             self.unconsulted,
             self.horizon,
+            self.unbound_skip,
         );
     }
 
@@ -1725,6 +1735,12 @@ impl DelayPair {
             }
         }
         let Some((slot, want)) = found else { return };
+        // An unbound prober stands for two programs; keep the race
+        // sample pure.
+        if it.unbound {
+            self.unbound_skip += 1;
+            return;
+        }
         self.checked += 1;
 
         let mut cfg_a = spec.cfg.clone();
@@ -1741,6 +1757,9 @@ impl DelayPair {
         // the differing delay field is actually consulted (states
         // diverge). Absorption = re-equalizing AFTER that.
         let mut differed = false;
+        // Window facts for the co_refuted sub-classification.
+        let mut wrote_latch = false;
+        let mut ext_consult = false;
         let verdict = loop {
             if cyc >= spec.cycles {
                 break if differed { "horizon" } else { "unconsulted" };
@@ -1779,11 +1798,40 @@ impl DelayPair {
             {
                 break "demand_edge";
             }
+            // Engine fork points demand() can't see: the delay
+            // post-fork (undecided delay bits at a completing fetch)
+            // and the deferred taken-JMP target fork (stage 1).
+            let fork_edge = |f: bool, st: &NState, cfg: &NCfg, g: u32| {
+                f && {
+                    let pc = st.pc as usize;
+                    it.decided[pc] & delay_mask != delay_mask
+                        || (cfg.code[pc] >> 13 == 0
+                            && it.decided[pc] & 0x001F != 0x001F
+                            && jmp_taken(cfg.code[pc], st, cfg, g))
+                }
+            };
+            if fork_edge(fa, &sa, &cfg_a, ga) || fork_edge(fb, &sb, &cfg_b, gb) {
+                break "demand_edge";
+            }
+            // External-schedule consults (WAIT any src, JMP PIN) by
+            // whichever word can execute this cycle.
+            for (st, cfg) in [(&sa, &cfg_a), (&sb, &cfg_b)] {
+                if st.delay_count == 0 && peek_tick(st, cfg) {
+                    let w = st.pending_exec.unwrap_or(cfg.code[st.pc as usize & 31]);
+                    if w >> 13 == 1 || (w >> 13 == 0 && (w >> 5) & 7 == 6) {
+                        ext_consult = true;
+                    }
+                }
+            }
+            let la = (sa.out_latch, sa.dir_latch, sb.out_latch, sb.dir_latch);
             if clock_tick(&mut sa, &cfg_a) {
                 super::step(&mut sa, &cfg_a, ga);
             }
             if clock_tick(&mut sb, &cfg_b) {
                 super::step(&mut sb, &cfg_b, gb);
+            }
+            if (sa.out_latch, sa.dir_latch, sb.out_latch, sb.dir_latch) != la {
+                wrote_latch = true;
             }
             let ca = capture_word(&sa, &spec.capture_pins, spec.stim.mask, ext);
             let cb = capture_word(&sb, &spec.capture_pins, spec.stim.mask, ext);
@@ -1806,6 +1854,12 @@ impl DelayPair {
             "co_refuted" => {
                 self.co_refuted += 1;
                 self.cyc_co += dt;
+                if !wrote_latch {
+                    self.co_latch_quiet += 1;
+                }
+                if !ext_consult {
+                    self.co_ext_free += 1;
+                }
             }
             "absorbed" => {
                 self.absorbed += 1;
