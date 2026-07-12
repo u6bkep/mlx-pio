@@ -3,17 +3,21 @@
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
 > Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-12 (late night).
 
-## L=3 ladder: 3 of 6 brackets REFUTED, rest in flight (gated unit)
+## L=3 ladder: 3 of 6 REFUTED; the other 3 await a faster engine
 
 0..0 (5.33B items/26min), 0..1 (3.43B/65s), 1..1 (3.14B/59s) proven
 under corrected semantics + OOB refutation (6b08a0b: out-of-footprint
 execution is UB; space = programs staying within their L words).
-Remaining: 2..2 (fast), then the two monsters 1..2 (52B+ items at 6%
-settled when the first attempt died) and 0..2. Running detached as
-systemd unit `pio-l3rest` (txa_l3_rest2.log), MemoryMax=48G.
-**Ops rule (post-OOM): big searches run serialized and gated —
-`systemd-run --user -p MemoryMax=48G -p MemorySwapMax=0`.** All six
-refuted ⇒ tx_a footprint ≤ 3 impossible ⇒ L=4 rediscovery next.
+The remaining three (2..2, 1..2, 0..2) are ALL monsters — they put
+all 3 slots on the straight-line path (0..1/1..1 reach slot 2 only
+via JMP); 1..2 hit 52B items at 6% settled, 2..2 extrapolated ~10h.
+**They are now the 008 benchmark, not something to grind.**
+
+**Ops rules:** (post-OOM) big searches run serialized and gated —
+`systemd-run --user -p MemoryMax=48G -p MemorySwapMax=0
+-p RuntimeMaxSec=3000`. (User policy 2026-07-12): **any run >50 min
+is too slow** — the engine must get faster instead; a long run's
+mining value is in its first minutes; session cache expires at 1h.
 
 ## Ticket 008 in progress — stage 1 of 4 landed (12ec1cb)
 
