@@ -1,49 +1,53 @@
 # STATUS — current frontier
 
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
-> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-12 (early am).
+> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-12 (midday).
 
-## Narrowing engine — ALL LEVERS LANDED; L=3 wall pushed back, not down
+## Narrowing engine — memo machinery was 87% of CPU; now 6.7x faster
 
-All four planned levers shipped, census-gated (0381fc4..fe610b3):
-pin-write pre-filter (exact one-cycle lookahead), P1-full register
-symmetry (always-on, binding forks; seeding added), P2/P3/P4 canon
-filters, and the consulted-set memo — upgraded mid-session to
-consulted-STATE keys (ticket 007, done): core + read-masked patterns,
-segment-local X/Y provenance, two-level index. A conflict-scope bug
-that had silently poisoned EVERY fork-frame record since the memo
-landed was found via a measurement gate and fixed (389bbfa).
+perf (100s L=3 slices) found the probe's record-list rescan at ~55%
+CPU, SipHash ~25%, insert dedup ~7%. Fixed (5807b93): contiguous
+packed-conds RecList, FxHash maps, insert-side subsumption +
+REC_LIST_CAP=32 (swept 32/64/256; equal hit density, 32 fastest
+everywhere). Same-slice L=3 throughput 257K → **1.72M items/s**;
+L=2 0..1 40min → 4.5min (within 1.35x of plain DFS, was 12x);
+L=2 1..1 ~5min → 76s. All verdicts reproduce; L=1 / L=2 0..0 item
+counts byte-identical. New stats: recs_avg/recs_max in heartbeat.
 
-**tx_a ladder (460-cycle oracle), all verdicts reproduce (0 champions):**
-- L=1: 14,141 items (was 16,735) · L=2 0..0: 632,537 (was 1,080,991)
-- L=2 0..1: 153.3M (was 220.4M) · **L=2 1..1: 23.9M (was 220.4M — 9.2x,
-  memo-driven; wrap-invariance is dead, the memo sees structure DFS can't)**
-- **L=3 0..0 STILL OPEN.** v4 (1M-entry memo) killed at 1.42B items,
-  hits flatlined at 2.57M once purges hit bar 1024; v5 (8M entries, x2
-  purge) tripled hit density (7.4M hits @ 230M items) but ALSO
-  flatlined ~200M and ran at 17K items/s. Verdict: capacity is not the
-  lever — deep regions stop matching under value-exact patterns.
+**Implication: v4's L=3 kill point (1.42B items) is now ~15 min of
+wall-clock. An overnight run plausibly finishes the 0..0 bracket —
+or shows whether deep-region throughput decay survives capped lists.**
+
+## Instrumentation flags — landed (95710db), for the next long run
+
+Env-driven, search-behavior-free (gated), big dumps →
+`/data/pio_optimization/runs/` (2nd SSD, 1.3T free):
+- `PIO_NARROW_PROBE_LOG=<path>` (+`_BYTES`, default 8GiB): per-cycle
+  probe-outcome census (nocore/state_miss/cond_miss/hit) + sampled
+  miss diagnostics (nearest-record component diff / first failing
+  cond). Stride-doubles past half budget.
+- `PIO_NARROW_SNAPSHOT=<dir>` (+`_MAX`): full memo-table JSONL dump
+  before each purge + at end.
 
 ## Next (in expected-value order)
 
-1. **Mine the dumps** — runs/txa_l3_v5_hits.jsonl + v4 (309K hit-pair
-   lines): which components/fields block sharing in hot clusters.
-2. **Predicate-valued patterns** — records condition on x's VALUE where
-   the subtree only zero-tested it (`jmp !x`); condition on the
-   predicate class. Same soundness shape as consulted-state.
-3. **Probe throughput** — 64-165K items/s vs 800K plain; fast hasher,
-   projection reuse. Memo must also stop LOSING wall-clock at L=2 0..1.
-4. **ISR/OSR provenance; cond-lazy JMP targets** (fork-width lever,
-   tx_a is JMP-heavy).
-5. **Multi-case specs** (sequential trace concatenation + state reset)
-   — the engine feature the flagship RX resynthesis needs.
+1. **Overnight instrumented L=3 0..0** with both flags — either the
+   bracket closes, or the probe census + snapshots say exactly which
+   state components block deep sharing.
+2. **Predicate-valued patterns** (condition on the predicate class the
+   subtree tested, e.g. `x==0` vs x's exact value) — build informed by
+   the near-miss data.
+3. **Wrap-bracket verdict-equivalence** — L=2's 0..1/1..1 theorem
+   generalized could skip whole L=3 brackets; probe empirically first.
+4. **ISR/OSR provenance; cond-lazy JMP targets** (fork-width lever).
+5. **Multi-case specs** (sequential trace concat + reset) — needed by
+   the flagship RX resynthesis.
 
 ## Flagship (unchanged): phase-invariant RX
 
 Spec/oracle must quantify duty skew (±8ns measured / ±24 design) ×
 parked phase; battery = pio_harness/tests/rx_bench_repro.rs +
-ro_sampled fixtures. Engine now has seeding + impossibility proofs;
-needs multi-case specs (above) before it can attack this.
+ro_sampled fixtures. Engine needs multi-case specs (above) first.
 
 ## Shard twin — COMPLETE (2a3a2e7); hand shard_pio/ to Christian
 

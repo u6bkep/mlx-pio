@@ -4,6 +4,53 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-12 (midday) — mining flags + perf-guided memo rework: 6.7x
+
+**Instrumentation flags (95710db).** Two env channels, both provably
+search-behavior-free (`instrumentation_flags_do_not_change_search`:
+champions + stats bit-identical flags-on/off): `PIO_NARROW_PROBE_LOG`
+(per-cycle probe-outcome census nocore/state_miss/cond_miss/hit +
+byte-budgeted sampled miss diagnostics — nearest-record component-diff
+bitmask on a state miss, first failing cond on a cond miss; stride
+doubles each time half the REMAINING budget spends, so deep regions
+thin rather than truncate) and `PIO_NARROW_SNAPSHOT` (full memo-table
+JSONL before each purge + at end; frames stack in the meta line). New
+Stats: memo_state_misses/memo_cond_misses. Strict JSONL (the old
+PIO_NARROW_DUMP hex literals aren't). Big dumps →
+/data/pio_optimization/runs/ (2nd SSD), noted in architecture.md.
+
+**Perf profile (100s L=3 0..0 slices, F=999).** 87% of CPU was memo
+machinery, evaluator ~2%: probe-side linear rescan of per-record
+heap-allocated conds Vecs ~55% (engine.rs conds loop), SipHash ~25%
+(KeyCore + proj Vec, macros.rs compression rounds inlined), insert
+dedup ~7%. Release profile now keeps debug symbols.
+
+**Fixes (5807b93), all census/equivalence-gated:**
+1. RecList — every record at a (core, mask, projected-values) key
+   packs its conds into ONE contiguous u64 buffer (slot<<32|mask<<16|
+   value); probe streams a single allocation.
+2. FxHash for memo maps + irq_at + dump counters. No DoS surface;
+   nothing decision-bearing consults iteration order (purge retention
+   is a per-record predicate).
+3. Insert-side subsumption (implied record fires strictly more often;
+   drop the implied, fold benefits as purge priority) +
+   REC_LIST_CAP=32 highest-benefit eviction. Swept 32/64/256:
+   L=3-slice 1.72M/s vs 1.28M/s vs 0.69M/s at equal ~6.5% hit density;
+   32 also won wall-clock on both L=2 brackets. New stats
+   memo_rec_scans/recs_scanned/max_recs (heartbeat recs_avg/recs_max)
+   showed lists pinned at whatever cap they're given — list growth was
+   the old deep-region decay driver.
+
+**Results (all verdicts reproduce, 0 champions):** same-slice L=3
+throughput 257K → 1.72M items/s (6.7x, and >2x PLAIN DFS's 800K/s).
+L=2 0..1: 157.3M items in 4.5min (old memo 40min; plain 3.3min — gap
+now 1.35x, was 12x). L=2 1..1: 76s (was ~5min); its item count rose
+23.9M → 56.9M — first-match record selection changed under
+subsumption, NOT the cap (64 didn't recover it); wall-clock still
+3-4x better. L=1 and L=2 0..0 item counts byte-identical (14,141 /
+632,537). v4's L=3 kill point (1.42B items) is now ~15min of
+wall-clock; overnight instrumented run queued as next step.
+
 ## 2026-07-11/12 — all levers landed; the conflict-scope bug; L=3 pushed to 1.4B+, still open
 
 **Strategy (user):** goal is whole-32-word multi-SM programs; ALL
