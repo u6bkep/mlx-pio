@@ -815,3 +815,108 @@ fn tx_a_rediscovery_and_optimality() {
     assert_champions_sound(&spec4, &r.champions);
     assert!(covered(&r.champions, &reference), "tx_a itself is not covered by any champion");
 }
+
+/// The probe-log and snapshot instrumentation flags must be
+/// side-effect free w.r.t. the search: champions and every stat are
+/// bit-identical with them on, and the files appear with parseable
+/// content. Uses a small memo cap so purges (and the pre-purge
+/// snapshot) actually fire.
+#[test]
+fn instrumentation_flags_do_not_change_search() {
+    let config = Config {
+        pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 1, ..PinMap::default() },
+        ..Config::default()
+    };
+    let cfg = cfg_for(config, 0, 1);
+    let side = SideCfg::NONE;
+    let reference = words_of(
+        &[
+            Insn::plain(Op::Set { dst: SetDst::Pins, data: 1 }),
+            Insn::plain(Op::Set { dst: SetDst::Pins, data: 0 }),
+        ],
+        &side,
+    );
+    let mut spec = EngineSpec {
+        cfg,
+        slots: 2,
+        cycles: 17,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![],
+        memo_cap: 64,
+    };
+    spec.expected = run_spec(&spec, reference);
+
+    let baseline = search(&spec, 1_000_000);
+
+    let dir = std::env::temp_dir().join(format!("narrow_instr_gate_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let probe_path = dir.join("probe.jsonl");
+    let snap_dir = dir.join("snaps");
+    std::env::set_var("PIO_NARROW_PROBE_LOG", &probe_path);
+    std::env::set_var("PIO_NARROW_PROBE_BYTES", "8000000");
+    std::env::set_var("PIO_NARROW_SNAPSHOT", &snap_dir);
+    std::env::set_var("PIO_NARROW_SNAPSHOT_MAX", "4");
+    let instrumented = search(&spec, 1_000_000);
+    std::env::remove_var("PIO_NARROW_PROBE_LOG");
+    std::env::remove_var("PIO_NARROW_PROBE_BYTES");
+    std::env::remove_var("PIO_NARROW_SNAPSHOT");
+    std::env::remove_var("PIO_NARROW_SNAPSHOT_MAX");
+
+    assert_eq!(baseline.champions, instrumented.champions, "instrumentation changed champions");
+    assert_eq!(
+        format!("{:?}", baseline.stats),
+        format!("{:?}", instrumented.stats),
+        "instrumentation changed stats"
+    );
+
+    // Probe log: non-empty, has census rows and the end summary.
+    // (Line-level format checks stay lenient: concurrent tests may
+    // append to the same file while the env vars are set.)
+    let probe = std::fs::read_to_string(&probe_path).unwrap();
+    assert!(probe.lines().any(|l| l.starts_with("{\"census_cycle\"")), "no census rows");
+    assert!(probe.lines().any(|l| l.starts_with("{\"probe_log_end\"")), "no end summary");
+    if instrumented.stats.memo_state_misses + instrumented.stats.memo_cond_misses > 0 {
+        assert!(
+            probe.lines().any(|l| l.starts_with("{\"probe\":")),
+            "misses occurred but no detail lines were sampled"
+        );
+    }
+
+    // Snapshots: the end snapshot always exists; a purge snapshot
+    // exists iff purges fired.
+    let names: Vec<String> = std::fs::read_dir(&snap_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().any(|n| n.contains("-end-")), "no end snapshot: {names:?}");
+    if instrumented.stats.memo_purges > 0 {
+        assert!(names.iter().any(|n| n.contains("-purge-")), "purges fired but no purge snapshot");
+    }
+    // Every snapshot line is a JSON object with the expected leaders.
+    for n in &names {
+        let s = std::fs::read_to_string(snap_dir.join(n)).unwrap();
+        assert!(s.lines().next().unwrap().starts_with("{\"snapshot\""), "{n}: bad header");
+        assert!(
+            s.lines().skip(1).all(|l| l.starts_with("{\"cycle\"")),
+            "{n}: bad record line"
+        );
+    }
+
+    let sm = instrumented.stats.memo_state_misses;
+    let cm = instrumented.stats.memo_cond_misses;
+    eprintln!(
+        "instr gate: items={} core_matches={} state_miss={sm} cond_miss={cm} hits={} purges={} snaps={}",
+        instrumented.stats.items,
+        instrumented.stats.memo_core_matches,
+        instrumented.stats.memo_hits,
+        instrumented.stats.memo_purges,
+        names.len()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -132,6 +132,11 @@ pub struct Stats {
     /// Probes whose key CORE matched at least one record (hit or not) —
     /// the gap to `memo_hits` is pattern/condition mismatches.
     pub memo_core_matches: u64,
+    /// Core-matched probes where no record's state pattern matched.
+    pub memo_state_misses: u64,
+    /// Core-matched probes where a state pattern matched but every
+    /// record's program conditions failed.
+    pub memo_cond_misses: u64,
     /// Failure records currently in the memo.
     pub memo_entries: u64,
     /// Times the memo hit its cap and purged low-benefit records.
@@ -869,6 +874,7 @@ fn close_child(
     memo: &mut std::collections::HashMap<KeyCore, MemoEntry>,
     memo_cap: usize,
     min_benefit: &mut u32,
+    snap: &mut Option<Snapshotter>,
     stats: &mut Stats,
     champion: bool,
 ) {
@@ -896,6 +902,9 @@ fn close_child(
         }
         if !f.any_champion && f.recordable && benefit >= *min_benefit {
             if (stats.memo_entries as usize) >= memo_cap {
+                if let Some(sn) = snap.as_mut() {
+                    sn.write("purge", memo, *min_benefit, stats, frames);
+                }
                 // Purge low-benefit records; raise the bar.
                 *min_benefit = min_benefit.saturating_mul(2);
                 let mut kept = 0u64;
@@ -1025,6 +1034,345 @@ impl HitDump {
     }
 }
 
+// --- Probe/table instrumentation (offline mining) --------------------
+// Two independent flags, both inert unless set and both side-effect
+// free w.r.t. the search (verdicts, champions, stats and DFS order are
+// bit-identical with them on — gated by
+// `instrumentation_flags_do_not_change_search`). Big dumps belong on
+// the data drive: point them under /data/pio_optimization/runs/.
+//
+// `PIO_NARROW_PROBE_LOG=<path>`: JSONL stream classifying EVERY memo
+// probe (nocore / state_miss / cond_miss / hit) into a per-cycle
+// census, plus sampled per-probe diagnostic lines for the two miss
+// classes: on a state miss, the nearest stored record's differing
+// state components (which field blocks sharing); on a cond miss, the
+// first failing program condition. Detail volume is bounded by
+// `PIO_NARROW_PROBE_BYTES` (default 8 GiB): past half the budget the
+// sampling stride doubles each time half the REMAINING budget is
+// spent, so late/deep probes are thinned, never truncated. Census and
+// totals are exact regardless. Diagnostic lines scan hash tables in
+// iteration order, so they are not byte-stable across runs; the
+// census/summary lines are.
+//
+// `PIO_NARROW_SNAPSHOT=<dir>`: dumps the ENTIRE memo table as JSONL
+// (one line per record: core, read-mask, projected values, conds,
+// benefit) plus the open frame stack, immediately BEFORE each purge
+// (the table at its fullest) and at search end. At the 8M-entry cap a
+// snapshot is ~2 GB; `PIO_NARROW_SNAPSHOT_MAX` (default 8) caps the
+// purge snapshots, the end snapshot always writes.
+
+const PROBE_NOCORE: usize = 0;
+const PROBE_STATE_MISS: usize = 1;
+const PROBE_COND_MISS: usize = 2;
+const PROBE_HIT: usize = 3;
+
+/// State components (canonical `project_state` order) whose projected
+/// values differ between two same-mask projections. FIFO components
+/// are variable-length (level + words), so the cursors advance
+/// per-side.
+fn component_diff(mask: u16, a: &[u32], b: &[u32]) -> u16 {
+    let mut diff = 0u16;
+    let (mut i, mut j) = (0usize, 0usize);
+    for bit in [SC_X, SC_Y, SC_ISR, SC_OSR, SC_ISR_CNT, SC_OSR_CNT, SC_IRQ] {
+        if mask & bit != 0 {
+            if a[i] != b[j] {
+                diff |= bit;
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    for bit in [SC_TX, SC_RX] {
+        if mask & bit != 0 {
+            let (la, lb) = (a[i] as usize, b[j] as usize);
+            if a[i..=i + la] != b[j..=j + lb] {
+                diff |= bit;
+            }
+            i += la + 1;
+            j += lb + 1;
+        }
+    }
+    diff
+}
+
+/// Per-probe outcome stream, `PIO_NARROW_PROBE_LOG`.
+struct ProbeLog {
+    w: std::io::BufWriter<std::fs::File>,
+    /// Detail bytes written / budget / next stride-doubling threshold.
+    bytes: u64,
+    budget: u64,
+    next_thresh: u64,
+    /// Every `stride`-th miss gets a detail line; doubles as the budget
+    /// drains.
+    stride: u64,
+    misses_seen: u64,
+    /// Probe outcomes per cycle (nocore/state_miss/cond_miss/hit).
+    census: Vec<[u64; 4]>,
+}
+
+/// Bounded nearest-record scan per set on a state miss.
+const PROBE_NEAR_SCAN: usize = 256;
+
+fn probe_log_open(cycles: u32) -> Option<ProbeLog> {
+    let path = std::env::var("PIO_NARROW_PROBE_LOG").ok()?;
+    let budget = std::env::var("PIO_NARROW_PROBE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8u64 << 30);
+    let f = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
+    eprintln!("narrow-search: probe log to {path} (detail budget {budget} bytes)");
+    Some(ProbeLog {
+        w: std::io::BufWriter::new(f),
+        bytes: 0,
+        budget,
+        next_thresh: budget / 2,
+        stride: 1,
+        misses_seen: 0,
+        census: vec![[0u64; 4]; cycles as usize + 1],
+    })
+}
+
+impl ProbeLog {
+    /// Record one probe outcome in the census; returns whether this
+    /// probe's diagnostic detail is sampled in.
+    fn count(&mut self, cycle: u32, outcome: usize) -> bool {
+        let c = (cycle as usize).min(self.census.len() - 1);
+        self.census[c][outcome] += 1;
+        if outcome != PROBE_STATE_MISS && outcome != PROBE_COND_MISS {
+            return false;
+        }
+        self.misses_seen += 1;
+        self.stride > 0 && self.misses_seen % self.stride == 0
+    }
+
+    fn wrote(&mut self, n: usize) {
+        self.bytes += n as u64;
+        while self.next_thresh < self.budget && self.bytes >= self.next_thresh {
+            self.stride *= 2;
+            self.next_thresh += (self.budget - self.next_thresh) / 2;
+        }
+        if self.bytes >= self.budget {
+            self.stride = 0; // budget exhausted: census only from here
+        }
+    }
+
+    /// One sampled miss, with per-set diagnosis against the entry's
+    /// current tables.
+    #[allow(clippy::too_many_arguments)]
+    fn miss(
+        &mut self,
+        outcome: usize,
+        key: &MemoKey,
+        entry: &MemoEntry,
+        mirror_blocked: bool,
+        it_decided: &[u16; 32],
+        it_value: &[u16; 32],
+        slots: u8,
+        proj: &mut Vec<u32>,
+    ) {
+        use std::io::Write;
+        let st = &key.2;
+        let mut sets = Vec::new();
+        for &(mask, ref table) in &entry.sets {
+            if mirror_blocked && mask & (SC_X | SC_Y) != 0 {
+                sets.push(format!("{{\"mask\":{mask},\"blocked\":true}}"));
+                continue;
+            }
+            proj.clear();
+            project_state(st, mask, proj);
+            match table.get(proj.as_slice()) {
+                None => {
+                    // Nearest record: min differing-component count over
+                    // a bounded scan of this set's table.
+                    let mut near: Option<(u32, u16)> = None;
+                    for k in table.keys().take(PROBE_NEAR_SCAN) {
+                        let d = component_diff(mask, proj, k);
+                        let n = d.count_ones();
+                        if near.map_or(true, |(bn, _)| n < bn) {
+                            near = Some((n, d));
+                        }
+                    }
+                    let near_s = near.map_or("null".to_string(), |(n, d)| {
+                        format!("{{\"ncomp\":{n},\"diff\":{d}}}")
+                    });
+                    sets.push(format!(
+                        "{{\"mask\":{mask},\"proj\":{:?},\"keys\":{},\"near\":{near_s}}}",
+                        proj,
+                        table.len()
+                    ));
+                }
+                Some(recs) => {
+                    // State pattern matched; report the first failing
+                    // condition of each record (cap 4).
+                    let fails: Vec<String> = recs
+                        .iter()
+                        .take(4)
+                        .map(|(conds, benefit)| {
+                            let f = conds.iter().find(|&&(s, m, v)| {
+                                it_decided[s as usize] & m != m || it_value[s as usize] & m != v
+                            });
+                            match f {
+                                Some(&(s, m, v)) => format!(
+                                    "{{\"slot\":{s},\"m\":{m},\"want\":{v},\"dec\":{},\"got\":{},\"benefit\":{benefit}}}",
+                                    it_decided[s as usize] & m,
+                                    it_value[s as usize] & m
+                                ),
+                                None => "{}".to_string(),
+                            }
+                        })
+                        .collect();
+                    sets.push(format!(
+                        "{{\"mask\":{mask},\"recs\":{},\"fails\":[{}]}}",
+                        recs.len(),
+                        fails.join(",")
+                    ));
+                }
+            }
+        }
+        let kind = if outcome == PROBE_STATE_MISS { "state_miss" } else { "cond_miss" };
+        let prober: Vec<String> = (0..slots as usize)
+            .map(|s| format!("\"{:04x}/{:04x}\"", it_decided[s], it_value[s]))
+            .collect();
+        let line = format!(
+            "{{\"probe\":\"{kind}\",\"cycle\":{},\"ni\":{},\"pc\":{},\"stall\":\"{:?}\",\"clk\":{},\"x\":{},\"y\":{},\"osr\":{},\"isr\":{},\"irq\":{},\"out\":{},\"dir\":{},\"prober\":[{}],\"sets\":[{}]}}",
+            key.0, key.1, st.pc, st.stall, st.clk_acc, st.x, st.y, st.osr, st.isr,
+            st.irq_flags, st.out_latch, st.dir_latch,
+            prober.join(","),
+            sets.join(",")
+        );
+        if self.w.write_all(line.as_bytes()).is_ok() && self.w.write_all(b"\n").is_ok() {
+            self.wrote(line.len() + 1);
+        }
+    }
+
+    /// Exact census + totals, written at search end.
+    fn finish(&mut self, stats: &Stats) {
+        use std::io::Write;
+        for (c, row) in self.census.iter().enumerate() {
+            if row.iter().any(|&n| n > 0) {
+                let _ = writeln!(
+                    self.w,
+                    "{{\"census_cycle\":{c},\"nocore\":{},\"state_miss\":{},\"cond_miss\":{},\"hit\":{}}}",
+                    row[0], row[1], row[2], row[3]
+                );
+            }
+        }
+        let _ = writeln!(
+            self.w,
+            "{{\"probe_log_end\":{{\"items\":{},\"core_matches\":{},\"state_misses\":{},\"cond_misses\":{},\"hits\":{},\"detail_bytes\":{},\"final_stride\":{}}}}}",
+            stats.items,
+            stats.memo_core_matches,
+            stats.memo_state_misses,
+            stats.memo_cond_misses,
+            stats.memo_hits,
+            self.bytes,
+            self.stride
+        );
+        let _ = self.w.flush();
+    }
+}
+
+/// Full-table snapshots, `PIO_NARROW_SNAPSHOT`.
+struct Snapshotter {
+    dir: std::path::PathBuf,
+    seq: u32,
+    max_purge: u32,
+}
+
+fn snapshot_open() -> Option<Snapshotter> {
+    let dir = std::path::PathBuf::from(std::env::var("PIO_NARROW_SNAPSHOT").ok()?);
+    let max_purge = std::env::var("PIO_NARROW_SNAPSHOT_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("narrow-search: cannot create snapshot dir {}", dir.display());
+        return None;
+    }
+    eprintln!(
+        "narrow-search: memo snapshots to {} (max {max_purge} purge snaps + end)",
+        dir.display()
+    );
+    Some(Snapshotter { dir, seq: 0, max_purge })
+}
+
+impl Snapshotter {
+    /// Dump the whole table + open frame stack. `reason` is "purge"
+    /// (called BEFORE the retain, `min_benefit` is the pre-raise bar)
+    /// or "end".
+    fn write(
+        &mut self,
+        reason: &str,
+        memo: &std::collections::HashMap<KeyCore, MemoEntry>,
+        min_benefit: u32,
+        stats: &Stats,
+        frames: &[Frame],
+    ) {
+        use std::io::Write;
+        if reason == "purge" {
+            if self.seq >= self.max_purge {
+                return;
+            }
+        }
+        let path = self.dir.join(format!(
+            "memo-{:03}-{reason}-items{}.jsonl",
+            self.seq, stats.items
+        ));
+        self.seq += 1;
+        let Ok(f) = std::fs::File::create(&path) else {
+            eprintln!("narrow-search: snapshot open failed: {}", path.display());
+            return;
+        };
+        let mut w = std::io::BufWriter::new(f);
+        let frames_s: Vec<String> = frames
+            .iter()
+            .map(|f| {
+                format!(
+                    "{{\"cycle\":{},\"ni\":{},\"pc\":{},\"children_left\":{},\"items_at_open\":{},\"recordable\":{}}}",
+                    f.key.0, f.key.1, f.key.2.pc, f.children_left, f.items_at_open, f.recordable
+                )
+            })
+            .collect();
+        let _ = writeln!(
+            w,
+            "{{\"snapshot\":{{\"reason\":\"{reason}\",\"min_benefit\":{min_benefit},\"items\":{},\"memo_entries\":{},\"memo_hits\":{},\"core_matches\":{},\"state_misses\":{},\"cond_misses\":{},\"purges\":{},\"frames\":[{}]}}}}",
+            stats.items,
+            stats.memo_entries,
+            stats.memo_hits,
+            stats.memo_core_matches,
+            stats.memo_state_misses,
+            stats.memo_cond_misses,
+            stats.memo_purges,
+            frames_s.join(",")
+        );
+        for (core, entry) in memo {
+            for &(mask, ref table) in &entry.sets {
+                for (vals, recs) in table {
+                    for (conds, benefit) in recs {
+                        let conds_s: Vec<String> = conds
+                            .iter()
+                            .map(|&(s, m, v)| format!("[{s},{m},{v}]"))
+                            .collect();
+                        let pending = core
+                            .pending_exec
+                            .map_or("null".to_string(), |p| p.to_string());
+                        let _ = writeln!(
+                            w,
+                            "{{\"cycle\":{},\"ni\":{},\"pc\":{},\"delay\":{},\"stall\":\"{:?}\",\"pending\":{pending},\"clk\":{},\"out\":{},\"dir\":{},\"mask\":{mask},\"vals\":{:?},\"conds\":[{}],\"benefit\":{benefit}}}",
+                            core.cycle, core.next_input, core.pc, core.delay_count,
+                            core.stall, core.clk_acc, core.out_latch, core.dir_latch,
+                            vals,
+                            conds_s.join(",")
+                        );
+                    }
+                }
+            }
+        }
+        let _ = w.flush();
+        eprintln!("narrow-search: snapshot written: {}", path.display());
+    }
+}
+
 /// The program bits an executing instruction consults at fetch: side +
 /// opcode + the (decided) opcode's operand fields. Delay is consulted
 /// separately at completion. Over-approximating consultation only adds
@@ -1119,6 +1467,8 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
     // never-recorded root frame absorbing top-level merges.
     let memo_on = spec.memo_cap > 0;
     let mut dump = if memo_on { dump_open() } else { None };
+    let mut probe_log = if memo_on { probe_log_open(spec.cycles) } else { None };
+    let mut snap = if memo_on { snapshot_open() } else { None };
     let mut memo: std::collections::HashMap<KeyCore, MemoEntry> =
         std::collections::HashMap::new();
     // Records must beat this subtree size to earn a slot; quadruples at
@@ -1182,28 +1532,55 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
         // rooted at the SWAPPED state — such a hit is only valid if the
         // record read neither X nor Y (then it covers the twin too).
         if memo_on {
-            let hit: Option<(Conds, u16)> =
-                memo.get(&key_core(it.cycle, it.next_input, &it.st)).and_then(|entry| {
-                    stats.memo_core_matches += 1;
-                    let mirror_blocked = it.unbound && it.st.x != it.st.y;
-                    entry.sets.iter().find_map(|&(mask, ref table)| {
-                        if mirror_blocked && mask & (SC_X | SC_Y) != 0 {
-                            return None;
+            let core = key_core(it.cycle, it.next_input, &it.st);
+            let mirror_blocked = it.unbound && it.st.x != it.st.y;
+            let mut outcome = PROBE_NOCORE;
+            let mut hit: Option<(Conds, u16)> = None;
+            if let Some(entry) = memo.get(&core) {
+                stats.memo_core_matches += 1;
+                outcome = PROBE_STATE_MISS;
+                'sets: for &(mask, ref table) in &entry.sets {
+                    if mirror_blocked && mask & (SC_X | SC_Y) != 0 {
+                        continue;
+                    }
+                    proj.clear();
+                    project_state(&it.st, mask, &mut proj);
+                    if let Some(recs) = table.get(&proj) {
+                        outcome = PROBE_COND_MISS;
+                        for (conds, _) in recs {
+                            if conds.iter().all(|&(s, m, v)| {
+                                it.decided[s as usize] & m == m
+                                    && it.value[s as usize] & m == v
+                            }) {
+                                hit = Some((conds.clone(), mask));
+                                outcome = PROBE_HIT;
+                                break 'sets;
+                            }
                         }
-                        proj.clear();
-                        project_state(&it.st, mask, &mut proj);
-                        table.get(&proj).and_then(|recs| {
-                            recs.iter()
-                                .find(|(conds, _)| {
-                                    conds.iter().all(|&(s, m, v)| {
-                                        it.decided[s as usize] & m == m
-                                            && it.value[s as usize] & m == v
-                                    })
-                                })
-                                .map(|(conds, _)| (conds.clone(), mask))
-                        })
-                    })
-                });
+                    }
+                }
+                match outcome {
+                    PROBE_STATE_MISS => stats.memo_state_misses += 1,
+                    PROBE_COND_MISS => stats.memo_cond_misses += 1,
+                    _ => {}
+                }
+            }
+            if let Some(pl) = probe_log.as_mut() {
+                if pl.count(it.cycle, outcome) {
+                    if let Some(entry) = memo.get(&core) {
+                        pl.miss(
+                            outcome,
+                            &(it.cycle, it.next_input, it.st),
+                            entry,
+                            mirror_blocked,
+                            &it.decided,
+                            &it.value,
+                            spec.slots,
+                            &mut proj,
+                        );
+                    }
+                }
+            }
             if let Some((conds, rmask)) = hit {
                 stats.memo_hits += 1;
                 if let Some(d) = dump.as_mut() {
@@ -1214,7 +1591,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                 for &(s, m, v) in &conds {
                     top.merge(s as usize, m, v);
                 }
-                close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut stats, false);
+                close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false);
                 continue 'items;
             }
         }
@@ -1377,7 +1754,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                             });
                         } else {
                             // Every value filtered: this fork is a leaf.
-                            close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut stats, false);
+                            close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false);
                         }
                     }
                     continue 'items;
@@ -1469,7 +1846,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                 stats.refuted += 1;
                 if memo_on {
                     merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
-                    close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut stats, false);
+                    close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false);
                 }
                 continue 'items;
             }
@@ -1582,12 +1959,18 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
         }
         if memo_on {
             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
-            close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut stats, true);
+            close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, true);
         }
     }
     debug_assert!(frames.len() == 1, "unbalanced frame accounting");
     if let Some(d) = dump.as_mut() {
         d.finish(&stats);
+    }
+    if let Some(pl) = probe_log.as_mut() {
+        pl.finish(&stats);
+    }
+    if let Some(sn) = snap.as_mut() {
+        sn.write("end", &memo, min_benefit, &stats, &frames);
     }
 
     SearchResult { champions, stats, champion_cap_hit }

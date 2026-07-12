@@ -124,6 +124,15 @@ Genome → score → search, end to end, fast and deterministic:
   markers to stderr AND write a structured JSONL trace — per-restart
   checkpoints, new-best events with disassembly, per-attempt final minima
   distributions (the minima distribution is analysis data, not just progress).
+- **Big dumps go to `/data/pio_optimization/runs/`** (second SSD), not the
+  crate's `runs/` dir — the narrowing engine's mining flags can emit tens of
+  GB. Engine instrumentation (all env-driven, search-behavior-free, gated by
+  `instrumentation_flags_do_not_change_search`): `PIO_NARROW_DUMP` (memo-hit
+  pairs), `PIO_NARROW_PROBE_LOG` + `PIO_NARROW_PROBE_BYTES` (per-probe
+  outcome census + sampled miss diagnostics: which state component or program
+  cond blocks a match; stride-doubles past half budget, default 8 GiB),
+  `PIO_NARROW_SNAPSHOT` + `PIO_NARROW_SNAPSHOT_MAX` (full memo-table JSONL
+  dump before each purge and at search end).
 - **Discuss one-way doors** (correctness redefinitions, oracle changes)
   before implementing.
 
