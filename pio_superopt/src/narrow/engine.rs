@@ -792,14 +792,20 @@ fn project_state(st: &NState, mask: u16, out: &mut Vec<u32>) {
     if mask & SC_IRQ != 0 {
         out.push(st.irq_flags as u32);
     }
-    for f in [(mask & SC_TX != 0).then_some(&st.tx), (mask & SC_RX != 0).then_some(&st.rx)]
-        .into_iter()
-        .flatten()
-    {
-        out.push(f.level() as u32);
-        for i in 0..f.level() {
-            out.push(f.peek(i));
+    if mask & SC_TX != 0 {
+        out.push(st.tx.level() as u32);
+        for i in 0..st.tx.level() {
+            out.push(st.tx.peek(i));
         }
+    }
+    // RX projects its LEVEL only: no ISA path reads RX contents (there
+    // is no rx-fifo source; PUSH/autopush/STATUS consult fullness or
+    // level) and the observable trace is pins — two states differing
+    // only in queued RX words evolve identically. (Probe census
+    // 2026-07-12: full-contents RX was the single largest state-miss
+    // component, 44% of near-miss diffs.)
+    if mask & SC_RX != 0 {
+        out.push(st.rx.level() as u32);
     }
 }
 
@@ -1178,6 +1184,7 @@ fn close_child(
     snap: &mut Option<Snapshotter>,
     stats: &mut Stats,
     champion: bool,
+    search_slots: u8,
 ) {
     let mut champ = champion;
     loop {
@@ -1190,8 +1197,14 @@ fn close_child(
         let f = frames.pop().expect("root frame is never popped");
         // Conditions = consulted fields decided at-or-above the fork;
         // fields forked below drop out (all their values explored).
+        // Slots at/past `search_slots` are spec constants — never
+        // forked, never twin-mirrored — so a cond on them matches every
+        // prober by construction and is dropped. (Snapshot 2026-07-12:
+        // filler-walk conds were 88% of all cond storage and pure
+        // always-match scan overhead. Seeded bits INSIDE searched slots
+        // stay: the binding fork mirrors those slots in the twin.)
         let mut conds: Conds = Vec::new();
-        for s in 0..32 {
+        for s in 0..search_slots as usize {
             let m = f.consulted_mask[s] & f.decided[s];
             if m != 0 {
                 conds.push((s as u8, m, f.consulted_value[s] & m));
@@ -1365,9 +1378,9 @@ const PROBE_COND_MISS: usize = 2;
 const PROBE_HIT: usize = 3;
 
 /// State components (canonical `project_state` order) whose projected
-/// values differ between two same-mask projections. FIFO components
-/// are variable-length (level + words), so the cursors advance
-/// per-side.
+/// values differ between two same-mask projections. TX is
+/// variable-length (level + words), so the cursors advance per-side;
+/// RX projects its level only.
 fn component_diff(mask: u16, a: &[u32], b: &[u32]) -> u16 {
     let mut diff = 0u16;
     let (mut i, mut j) = (0usize, 0usize);
@@ -1380,15 +1393,16 @@ fn component_diff(mask: u16, a: &[u32], b: &[u32]) -> u16 {
             j += 1;
         }
     }
-    for bit in [SC_TX, SC_RX] {
-        if mask & bit != 0 {
-            let (la, lb) = (a[i] as usize, b[j] as usize);
-            if a[i..=i + la] != b[j..=j + lb] {
-                diff |= bit;
-            }
-            i += la + 1;
-            j += lb + 1;
+    if mask & SC_TX != 0 {
+        let (la, lb) = (a[i] as usize, b[j] as usize);
+        if a[i..=i + la] != b[j..=j + lb] {
+            diff |= SC_TX;
         }
+        i += la + 1;
+        j += lb + 1;
+    }
+    if mask & SC_RX != 0 && a[i] != b[j] {
+        diff |= SC_RX;
     }
     diff
 }
@@ -1938,7 +1952,7 @@ fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> Sear
                 for &(s, m, v) in &conds {
                     top.merge(s as usize, m, v);
                 }
-                close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false);
+                close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                 continue 'items;
             }
         }
@@ -2119,7 +2133,7 @@ fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> Sear
                             });
                         } else {
                             // Every value filtered: this fork is a leaf.
-                            close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false);
+                            close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                         }
                     }
                     continue 'items;
@@ -2211,7 +2225,7 @@ fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> Sear
                 stats.refuted += 1;
                 if memo_on {
                     merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
-                    close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false);
+                    close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                 }
                 continue 'items;
             }
@@ -2324,7 +2338,7 @@ fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> Sear
         }
         if memo_on {
             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
-            close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, true);
+            close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, true, spec.slots);
         }
     }
     debug_assert!(frames.len() == 1, "unbalanced frame accounting");
