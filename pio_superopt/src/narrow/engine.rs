@@ -785,14 +785,14 @@ fn stall_state_reads(stall: Stall) -> u16 {
 /// over everything else.
 type Conds = Vec<(u8, u16, u16)>;
 
-/// A failure record: the subtree's consulted-state pattern (mask +
-/// projected fork-time values), its consulted program-field conditions,
-/// and the item count it summarizes (its benefit — what one hit saves).
-struct StateRecord {
-    mask: u16,
-    vals: Vec<u32>,
-    conds: Conds,
-    benefit: u32,
+/// Failure records at one key core, two-level like the playground's
+/// MemoEntry: per distinct read-mask, a table from projected state
+/// values to the (program conds, benefit) records — so a probe costs
+/// one projection + one hash lookup per DISTINCT MASK at the core
+/// (typically one or two), not a scan of every record ever stored.
+#[derive(Default)]
+struct MemoEntry {
+    sets: Vec<(u16, std::collections::HashMap<Vec<u32>, Vec<(Conds, u32)>>)>,
 }
 
 /// One frame of the fork tree, mirroring the DFS stack (LIFO makes each
@@ -866,7 +866,7 @@ fn merge_segment(fr: &mut Frame, seg_mask: &[u16; 32], seg_reads: u16, value: &[
 /// save the most work.
 fn close_child(
     frames: &mut Vec<Frame>,
-    memo: &mut std::collections::HashMap<KeyCore, Vec<StateRecord>>,
+    memo: &mut std::collections::HashMap<KeyCore, MemoEntry>,
     memo_cap: usize,
     min_benefit: &mut u32,
     stats: &mut Stats,
@@ -899,10 +899,18 @@ fn close_child(
                 // Purge low-benefit records; raise the bar.
                 *min_benefit = min_benefit.saturating_mul(4);
                 let mut kept = 0u64;
-                memo.retain(|_, recs| {
-                    recs.retain(|r| r.benefit >= *min_benefit);
-                    kept += recs.len() as u64;
-                    !recs.is_empty()
+                memo.retain(|_, entry| {
+                    let mut any = false;
+                    for (_, table) in entry.sets.iter_mut() {
+                        table.retain(|_, recs| {
+                            recs.retain(|&(_, b)| b >= *min_benefit);
+                            kept += recs.len() as u64;
+                            !recs.is_empty()
+                        });
+                        any |= !table.is_empty();
+                    }
+                    entry.sets.retain(|(_, t)| !t.is_empty());
+                    any
                 });
                 stats.memo_entries = kept;
                 stats.memo_purges += 1;
@@ -912,10 +920,19 @@ fn close_child(
                 // components the subtree read.
                 let mut vals = Vec::new();
                 project_state(&f.key.2, f.state_reads, &mut vals);
-                memo.entry(key_core(f.key.0, f.key.1, &f.key.2)).or_default().push(
-                    StateRecord { mask: f.state_reads, vals, conds: conds.clone(), benefit },
-                );
-                stats.memo_entries += 1;
+                let entry = memo.entry(key_core(f.key.0, f.key.1, &f.key.2)).or_default();
+                let table = match entry.sets.iter_mut().position(|(m, _)| *m == f.state_reads) {
+                    Some(i) => &mut entry.sets[i].1,
+                    None => {
+                        entry.sets.push((f.state_reads, std::collections::HashMap::new()));
+                        &mut entry.sets.last_mut().unwrap().1
+                    }
+                };
+                let recs = table.entry(vals).or_default();
+                if !recs.iter().any(|(c, _)| *c == conds) {
+                    recs.push((conds.clone(), benefit));
+                    stats.memo_entries += 1;
+                }
             }
         }
         let parent = frames.last_mut().expect("synthetic root below every frame");
@@ -1102,7 +1119,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
     // never-recorded root frame absorbing top-level merges.
     let memo_on = spec.memo_cap > 0;
     let mut dump = if memo_on { dump_open() } else { None };
-    let mut memo: std::collections::HashMap<KeyCore, Vec<StateRecord>> =
+    let mut memo: std::collections::HashMap<KeyCore, MemoEntry> =
         std::collections::HashMap::new();
     // Records must beat this subtree size to earn a slot; quadruples at
     // every cap purge.
@@ -1166,26 +1183,26 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
         // record read neither X nor Y (then it covers the twin too).
         if memo_on {
             let hit: Option<(Conds, u16)> =
-                memo.get(&key_core(it.cycle, it.next_input, &it.st)).and_then(|entries| {
+                memo.get(&key_core(it.cycle, it.next_input, &it.st)).and_then(|entry| {
                     stats.memo_core_matches += 1;
-                    entries
-                        .iter()
-                        .find(|r| {
-                            if it.unbound
-                                && it.st.x != it.st.y
-                                && r.mask & (SC_X | SC_Y) != 0
-                            {
-                                return false;
-                            }
-                            proj.clear();
-                            project_state(&it.st, r.mask, &mut proj);
-                            proj == r.vals
-                                && r.conds.iter().all(|&(s, m, v)| {
-                                    it.decided[s as usize] & m == m
-                                        && it.value[s as usize] & m == v
+                    let mirror_blocked = it.unbound && it.st.x != it.st.y;
+                    entry.sets.iter().find_map(|&(mask, ref table)| {
+                        if mirror_blocked && mask & (SC_X | SC_Y) != 0 {
+                            return None;
+                        }
+                        proj.clear();
+                        project_state(&it.st, mask, &mut proj);
+                        table.get(&proj).and_then(|recs| {
+                            recs.iter()
+                                .find(|(conds, _)| {
+                                    conds.iter().all(|&(s, m, v)| {
+                                        it.decided[s as usize] & m == m
+                                            && it.value[s as usize] & m == v
+                                    })
                                 })
+                                .map(|(conds, _)| (conds.clone(), mask))
                         })
-                        .map(|r| (r.conds.clone(), r.mask))
+                    })
                 });
             if let Some((conds, rmask)) = hit {
                 stats.memo_hits += 1;
