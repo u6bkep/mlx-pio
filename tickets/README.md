@@ -13,6 +13,7 @@ Status values: `open` · `in-progress` · `blocked` · `done` · `wontfix`
 | 004 | Eval hot-path performance | in-progress (3.4x) | high |
 | 005 | Spec-level oracle (tolerance-band metric + independent certifier) | in-progress (certifier+plumbing+densify done; long run live) | high |
 | 006 | Runner / problem / engine restructure | in-progress (resumable runner landed) | high |
+| 007 | Consulted-state memo keys (generalization, not eviction) | open | high |
 
 Provenance: 001–003 distilled from a survey of `reference/mlx86` (a friend's
 x86-assembly superoptimizer) on 2026-06-22. The split of what transfers vs. what
