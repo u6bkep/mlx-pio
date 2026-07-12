@@ -82,9 +82,11 @@ pub struct EngineSpec {
     pub seed: Vec<(u8, u16, u16)>,
     /// Consulted-set memo capacity in entries (0 disables). Records are
     /// FAILURE-ONLY (an exhausted, champion-free subtree keyed by its
-    /// fork state + the decided fields it consulted), so hitting the
-    /// cap just freezes insertion — pruning power is lost, soundness
-    /// is not.
+    /// fork state + the decided fields it consulted) and benefit-gated:
+    /// a record must summarize a big-enough subtree to earn a slot, and
+    /// reaching the cap purges low-benefit records and raises the bar
+    /// instead of freezing. Dropping records only loses pruning, never
+    /// soundness.
     pub memo_cap: usize,
 }
 
@@ -122,6 +124,8 @@ pub struct Stats {
     pub memo_hits: u64,
     /// Failure records currently in the memo.
     pub memo_entries: u64,
+    /// Times the memo hit its cap and purged low-benefit records.
+    pub memo_purges: u64,
 }
 
 pub struct SearchResult {
@@ -545,6 +549,10 @@ type MemoKey = (u32, u32, NState);
 /// over everything else.
 type Conds = Vec<(u8, u16, u16)>;
 
+/// A failure record: conditions plus the item count of the subtree it
+/// summarizes (its benefit — what one hit saves).
+type MemoRecord = (Conds, u32);
+
 /// One frame of the fork tree, mirroring the DFS stack (LIFO makes each
 /// subtree contiguous). Accumulates the subtree's consulted set for the
 /// failure record at finalize.
@@ -564,6 +572,10 @@ struct Frame {
     /// runs from two root states (identity S, twin sigma(S)) under one
     /// key, or a value conflict surfaced in the consulted union.
     recordable: bool,
+    /// `stats.items` when this frame opened; subtrees are contiguous in
+    /// the DFS, so `stats.items - items_at_open` at finalize is exactly
+    /// the subtree's item count — the record's benefit.
+    items_at_open: u64,
 }
 
 impl Frame {
@@ -597,10 +609,17 @@ fn merge_segment(fr: &mut Frame, seg_mask: &[u16; 32], value: &[u16; 32]) {
 /// Account one completed child of the open frame; finalize frames whose
 /// subtrees are done — recording champion-free ones — and merge their
 /// (decided-filtered) conditions upward.
+///
+/// Records are benefit-gated: a subtree smaller than `min_benefit`
+/// items is not worth a table slot. When the table hits `memo_cap`,
+/// low-benefit records are purged and the bar quadruples — insertion
+/// never freezes, and the table converges on the records that each
+/// save the most work.
 fn close_child(
     frames: &mut Vec<Frame>,
-    memo: &mut std::collections::HashMap<MemoKey, Vec<Conds>>,
+    memo: &mut std::collections::HashMap<MemoKey, Vec<MemoRecord>>,
     memo_cap: usize,
+    min_benefit: &mut u32,
     stats: &mut Stats,
     champion: bool,
 ) {
@@ -622,9 +641,24 @@ fn close_child(
                 conds.push((s as u8, m, f.consulted_value[s] & m));
             }
         }
-        if !f.any_champion && f.recordable && (stats.memo_entries as usize) < memo_cap {
-            memo.entry(f.key).or_default().push(conds.clone());
-            stats.memo_entries += 1;
+        let benefit = (stats.items - f.items_at_open).min(u32::MAX as u64) as u32;
+        if !f.any_champion && f.recordable && benefit >= *min_benefit {
+            if (stats.memo_entries as usize) >= memo_cap {
+                // Purge low-benefit records; raise the bar.
+                *min_benefit = min_benefit.saturating_mul(4);
+                let mut kept = 0u64;
+                memo.retain(|_, recs| {
+                    recs.retain(|&(_, b)| b >= *min_benefit);
+                    kept += recs.len() as u64;
+                    !recs.is_empty()
+                });
+                stats.memo_entries = kept;
+                stats.memo_purges += 1;
+            }
+            if benefit >= *min_benefit {
+                memo.entry(f.key).or_default().push((conds.clone(), benefit));
+                stats.memo_entries += 1;
+            }
         }
         let parent = frames.last_mut().expect("synthetic root below every frame");
         for &(s, m, v) in &conds {
@@ -723,7 +757,11 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
     // LIFO makes every subtree contiguous — with a synthetic,
     // never-recorded root frame absorbing top-level merges.
     let memo_on = spec.memo_cap > 0;
-    let mut memo: std::collections::HashMap<MemoKey, Vec<Conds>> = std::collections::HashMap::new();
+    let mut memo: std::collections::HashMap<MemoKey, Vec<MemoRecord>> =
+        std::collections::HashMap::new();
+    // Records must beat this subtree size to earn a slot; quadruples at
+    // every cap purge.
+    let mut min_benefit: u32 = 4;
     let mut frames: Vec<Frame> = vec![Frame {
         key: (0, 0, root.st),
         decided: [0u16; 32],
@@ -732,13 +770,14 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
         consulted_value: [0u16; 32],
         any_champion: false,
         recordable: false,
+        items_at_open: 0,
     }];
 
     'items: while let Some(mut it) = stack.pop() {
         stats.items += 1;
         if last_beat.elapsed().as_secs() >= 10 {
             eprintln!(
-                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} memo_hit={} memo_ent={} champions={} stack={}",
+                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} memo_hit={} memo_ent={} minben={} purges={} champions={} stack={}",
                 stats.items,
                 stats.forks,
                 stats.refuted,
@@ -746,6 +785,8 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                 stats.canon_pruned,
                 stats.memo_hits,
                 stats.memo_entries,
+                min_benefit,
+                stats.memo_purges,
                 stats.champions_found,
                 stack.len()
             );
@@ -763,12 +804,12 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                 memo.get(&(it.cycle, it.next_input, it.st)).and_then(|entries| {
                     entries
                         .iter()
-                        .find(|conds| {
+                        .find(|(conds, _)| {
                             conds.iter().all(|&(s, m, v)| {
                                 it.decided[s as usize] & m == m && it.value[s as usize] & m == v
                             })
                         })
-                        .cloned()
+                        .map(|(conds, _)| conds.clone())
                 });
             if let Some(conds) = hit {
                 stats.memo_hits += 1;
@@ -776,7 +817,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                 for &(s, m, v) in &conds {
                     top.merge(s as usize, m, v);
                 }
-                close_child(&mut frames, &mut memo, spec.memo_cap, &mut stats, false);
+                close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut stats, false);
                 continue 'items;
             }
         }
@@ -917,10 +958,11 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                                 consulted_value: [0u16; 32],
                                 any_champion: false,
                                 recordable: true,
+                                items_at_open: stats.items,
                             });
                         } else {
                             // Every value filtered: this fork is a leaf.
-                            close_child(&mut frames, &mut memo, spec.memo_cap, &mut stats, false);
+                            close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut stats, false);
                         }
                     }
                     continue 'items;
@@ -980,6 +1022,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                             consulted_value: [0u16; 32],
                             any_champion: false,
                             recordable: true,
+                            items_at_open: stats.items,
                         });
                     }
                     continue 'items;
@@ -998,7 +1041,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                 stats.refuted += 1;
                 if memo_on {
                     merge_segment(frames.last_mut().expect("root frame"), &seg_mask, &it.value);
-                    close_child(&mut frames, &mut memo, spec.memo_cap, &mut stats, false);
+                    close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut stats, false);
                 }
                 continue 'items;
             }
@@ -1062,6 +1105,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                             consulted_value: [0u16; 32],
                             any_champion: false,
                             recordable: true,
+                            items_at_open: stats.items,
                         });
                     }
                     continue 'items;
@@ -1090,7 +1134,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
         }
         if memo_on {
             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, &it.value);
-            close_child(&mut frames, &mut memo, spec.memo_cap, &mut stats, true);
+            close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut stats, true);
         }
     }
     debug_assert!(frames.len() == 1, "unbalanced frame accounting");
