@@ -897,7 +897,7 @@ fn close_child(
         if !f.any_champion && f.recordable && benefit >= *min_benefit {
             if (stats.memo_entries as usize) >= memo_cap {
                 // Purge low-benefit records; raise the bar.
-                *min_benefit = min_benefit.saturating_mul(4);
+                *min_benefit = min_benefit.saturating_mul(2);
                 let mut kept = 0u64;
                 memo.retain(|_, entry| {
                     let mut any = false;

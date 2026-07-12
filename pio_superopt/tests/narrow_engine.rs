@@ -730,6 +730,40 @@ fn tx_a_oracle_sanity() {
     assert!(toggles >= 10, "DI toggled only {toggles} times — schedule too weak");
 }
 
+/// The L=3 wall bracket alone, with the big-memo configuration
+/// (8M-entry cap, gentler purge) — the targeted experiment for memo
+/// capacity policy. Run: `cargo test --release --test narrow_engine --
+/// --ignored tx_a_l3_first --nocapture`
+#[test]
+#[ignore]
+fn tx_a_l3_first_bracket() {
+    let (mut spec4, side) = tx_a_spec(460);
+    let reference = tx_a_words(&side);
+    spec4.expected = run_spec(&spec4, reference);
+
+    let (mut s, _) = tx_a_spec(460);
+    s.slots = 3;
+    s.cfg.wrap_bottom = 0;
+    s.cfg.wrap_top = 0;
+    s.expected = spec4.expected.clone();
+    s.memo_cap = 1 << 23;
+    let r = search(&s, 5);
+    eprintln!(
+        "L=3 wrap 0..0 (bigmemo): items={} forks={} refuted={} prefilt={} canon={} memo_hit={} memo_ent={} purges={} champions={}",
+        r.stats.items,
+        r.stats.forks,
+        r.stats.refuted,
+        r.stats.prefiltered,
+        r.stats.canon_pruned,
+        r.stats.memo_hits,
+        r.stats.memo_entries,
+        r.stats.memo_purges,
+        r.stats.champions_found
+    );
+    eprintln!("  benefit_hist: {}", r.stats.benefit_hist_compact());
+    assert_eq!(r.stats.champions_found, 0, "L=3 wrap 0..0 unexpectedly satisfiable");
+}
+
 /// The main event: rediscover tx_a from its trace at L=4 and prove
 /// footprint <= 3 impossible. Long-running; #[ignore]d from CI.
 #[test]
