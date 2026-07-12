@@ -1628,13 +1628,15 @@ impl ProbeLog {
 /// the record was over-conditioned on the delay value:
 ///   co_refuted  — identical captures, both refute the same cycle
 ///                 (sharing would have been valid for this item)
-///   absorbed    — full states re-equalize before any capture diff
-///                 (the WAIT/IRQ schedule swallowed the delay delta;
-///                 identical until the slot's delay is next consulted)
+///   absorbed    — states differed (the delay delta was expressed)
+///                 then re-equalized before any capture diff (the
+///                 WAIT/IRQ schedule swallowed it)
 ///   diverged    — captures differ (genuine timing effect)
 ///   one_refuted — exactly one spelling walks out of footprint
 ///   demand_edge — an undecided field would fork first (inconclusive)
-///   horizon     — trace end reached with no verdict
+///   unconsulted — race ended (horizon) with the differing delay
+///                 never consulted — over-conditioned in-window
+///   horizon     — trace end reached after the delta was expressed
 /// Tallies stream to stderr every 4096 checks — a time-boxed kill
 /// (50-min policy) loses nothing.
 #[derive(Default)]
@@ -1645,6 +1647,7 @@ struct DelayPair {
     diverged: u64,
     one_refuted: u64,
     demand_edge: u64,
+    unconsulted: u64,
     horizon: u64,
     /// Summed cycles-from-probe until resolution, per class above.
     cyc_co: u64,
@@ -1656,7 +1659,7 @@ impl DelayPair {
     fn print(&self, tag: &str) {
         let avg = |s: u64, n: u64| s as f64 / n.max(1) as f64;
         eprintln!(
-            "delay-pair {tag}: checked={} co_refuted={} (avg {:.1}cy) absorbed={} (avg {:.1}cy) diverged={} (avg {:.1}cy) one_refuted={} demand_edge={} horizon={}",
+            "delay-pair {tag}: checked={} co_refuted={} (avg {:.1}cy) absorbed={} (avg {:.1}cy) diverged={} (avg {:.1}cy) one_refuted={} demand_edge={} unconsulted={} horizon={}",
             self.checked,
             self.co_refuted,
             avg(self.cyc_co, self.co_refuted),
@@ -1666,6 +1669,7 @@ impl DelayPair {
             avg(self.cyc_dv, self.diverged),
             self.one_refuted,
             self.demand_edge,
+            self.unconsulted,
             self.horizon,
         );
     }
@@ -1733,9 +1737,13 @@ impl DelayPair {
         let preload = spec.inputs.len() <= 4;
         let start = it.cycle;
         let mut cyc = it.cycle;
+        // The spellings start state-equal; the race is live only once
+        // the differing delay field is actually consulted (states
+        // diverge). Absorption = re-equalizing AFTER that.
+        let mut differed = false;
         let verdict = loop {
             if cyc >= spec.cycles {
-                break "horizon";
+                break if differed { "horizon" } else { "unconsulted" };
             }
             if let Some(&m) = irq_at.get(&cyc) {
                 sa.irq_flags |= m;
@@ -1787,7 +1795,9 @@ impl DelayPair {
             if refuted {
                 break "co_refuted";
             }
-            if sa == sb {
+            if sa != sb {
+                differed = true;
+            } else if differed {
                 break "absorbed";
             }
         };
@@ -1807,6 +1817,7 @@ impl DelayPair {
             }
             "one_refuted" => self.one_refuted += 1,
             "demand_edge" => self.demand_edge += 1,
+            "unconsulted" => self.unconsulted += 1,
             _ => self.horizon += 1,
         }
         if self.checked % 4096 == 0 {
