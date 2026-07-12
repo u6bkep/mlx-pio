@@ -1,53 +1,51 @@
 # STATUS — current frontier
 
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
-> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-12 (midday).
+> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-12 (pm).
 
-## Narrowing engine — memo machinery was 87% of CPU; now 6.7x faster
+## L=3 0..0 IN FLIGHT — instrumented, detached, ~2.4M items/s
 
-perf (100s L=3 slices) found the probe's record-list rescan at ~55%
-CPU, SipHash ~25%, insert dedup ~7%. Fixed (5807b93): contiguous
-packed-conds RecList, FxHash maps, insert-side subsumption +
-REC_LIST_CAP=32 (swept 32/64/256; equal hit density, 32 fastest
-everywhere). Same-slice L=3 throughput 257K → **1.72M items/s**;
-L=2 0..1 40min → 4.5min (within 1.35x of plain DFS, was 12x);
-L=2 1..1 ~5min → 76s. All verdicts reproduce; L=1 / L=2 0..0 item
-counts byte-identical. New stats: recs_avg/recs_max in heartbeat.
+Launched 14:03 under `/data/pio_optimization/runs/txa_l3_*` (probe
+census + snapshots; 8GiB detail budget burned in the shallow region
+by design, census/snapshots cover depth). At this rate v4's 1.42B kill
+point ≈ 10 min, v1's 5.67B ≈ 40 min — **the bracket may close**.
+Watch: `tail -f /data/pio_optimization/runs/txa_l3_run.log`.
 
-**Implication: v4's L=3 kill point (1.42B items) is now ~15 min of
-wall-clock. An overnight run plausibly finishes the 0..0 bracket —
-or shows whether deep-region throughput decay survives capped lists.**
+## Engine this session: 6.7x sequential + 25x parallel
 
-## Instrumentation flags — landed (95710db), for the next long run
-
-Env-driven, search-behavior-free (gated), big dumps →
-`/data/pio_optimization/runs/` (2nd SSD, 1.3T free):
-- `PIO_NARROW_PROBE_LOG=<path>` (+`_BYTES`, default 8GiB): per-cycle
-  probe-outcome census (nocore/state_miss/cond_miss/hit) + sampled
-  miss diagnostics (nearest-record component diff / first failing
-  cond). Stride-doubles past half budget.
-- `PIO_NARROW_SNAPSHOT=<dir>` (+`_MAX`): full memo-table JSONL dump
-  before each purge + at end.
+- **Memo rework (5807b93)**: perf showed 87% CPU in memo machinery →
+  RecList (contiguous packed conds), FxHash, insert-side subsumption +
+  REC_LIST_CAP=32 (swept). 257K → 1.72M items/s sequential.
+- **Parallel split driver (f673354)**: `search_split(spec, cap,
+  threads)` — phase-1 truncated-spec champions = frontier work units
+  (gentle cycle growth, straggler lesson from the playground); seeded
+  workers, per-unit memos, deterministic; binding-free units mirror-
+  expanded. Refutation verdicts exactly ≡ sequential (gated).
+  **L=2 0..1 bracket: 40min → 4.5min → 11s (28 threads).**
+- **Instrumentation flags (95710db)**: PIO_NARROW_PROBE_LOG census +
+  near-miss diagnostics; PIO_NARROW_SNAPSHOT pre-purge table dumps.
 
 ## Next (in expected-value order)
 
-1. **Overnight instrumented L=3 0..0** with both flags — either the
-   bracket closes, or the probe census + snapshots say exactly which
-   state components block deep sharing.
-2. **Predicate-valued patterns** (condition on the predicate class the
-   subtree tested, e.g. `x==0` vs x's exact value) — build informed by
-   the near-miss data.
-3. **Wrap-bracket verdict-equivalence** — L=2's 0..1/1..1 theorem
-   generalized could skip whole L=3 brackets; probe empirically first.
-4. **ISR/OSR provenance; cond-lazy JMP targets** (fork-width lever).
-5. **Multi-case specs** (sequential trace concat + reset) — needed by
-   the flagship RX resynthesis.
+1. **Read the L=3 verdict + dumps** (census: which components block
+   deep sharing; snapshots: table composition at purges).
+2. **Ticket 009 — word behavioral quotient** (digest classes):
+   mechanized P2/P4 + memo cond canonicalization; attacks the
+   dominant cond-miss class. Low risk, do before 008.
+3. **Ticket 008 — outcome-grouped forking** (fork on consult OUTCOME,
+   value-sets per field; unifies with predicate-valued memo records).
+   Highest ceiling, big surgery.
+4. **Ticket 010 — multi-SM factorization blueprint** (playground
+   compile⊗exec arc; needs multi-case specs first).
+5. **Multi-case specs** (trace concat + reset) — flagship RX prereq;
+   include the determinism prefilter + cheapest-case-first ordering
+   lessons from 010.
 
 ## Flagship (unchanged): phase-invariant RX
 
 Spec/oracle must quantify duty skew (±8ns measured / ±24 design) ×
 parked phase; battery = pio_harness/tests/rx_bench_repro.rs +
-ro_sampled fixtures. Engine needs multi-case specs (above) first.
+ro_sampled fixtures. Engine needs multi-case specs first.
 
 ## Shard twin — COMPLETE (2a3a2e7); hand shard_pio/ to Christian
 
@@ -55,4 +53,5 @@ ro_sampled fixtures. Engine needs multi-case specs (above) first.
 
 -0 pinger / -1 responder on [3][4][4][4], worktree
 Raven-Firmware.single-sm-tx-bench UNPUSHED @350ede86. Paused: SMT
-len-4, compress2, len-5 fleet, ticket 006 runner migration.
+len-4, compress2, len-5 fleet, ticket 006 runner migration (partly
+subsumed by search_split's unit model).
