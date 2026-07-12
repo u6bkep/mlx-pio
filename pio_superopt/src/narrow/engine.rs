@@ -126,6 +126,23 @@ pub struct Stats {
     pub memo_entries: u64,
     /// Times the memo hit its cap and purged low-benefit records.
     pub memo_purges: u64,
+    /// log2 histogram of candidate-record benefits (subtree item counts
+    /// of champion-free, recordable subtrees at finalize, BEFORE the
+    /// benefit gate) — where the memo's value actually lives.
+    pub benefit_hist: [u64; 32],
+}
+
+impl Stats {
+    /// Nonzero benefit-histogram buckets, e.g. "2^0:512 2^4:31".
+    pub fn benefit_hist_compact(&self) -> String {
+        self.benefit_hist
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| c > 0)
+            .map(|(i, c)| format!("2^{i}:{c}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 pub struct SearchResult {
@@ -642,6 +659,9 @@ fn close_child(
             }
         }
         let benefit = (stats.items - f.items_at_open).min(u32::MAX as u64) as u32;
+        if !f.any_champion && f.recordable {
+            stats.benefit_hist[(benefit.max(1).ilog2() as usize).min(31)] += 1;
+        }
         if !f.any_champion && f.recordable && benefit >= *min_benefit {
             if (stats.memo_entries as usize) >= memo_cap {
                 // Purge low-benefit records; raise the bar.
@@ -665,6 +685,87 @@ fn close_child(
             parent.merge(s as usize, m, v);
         }
         champ = f.any_champion;
+    }
+}
+
+/// Memo-hit dump for offline convergence analysis, enabled by the
+/// `PIO_NARROW_DUMP=<path>` env var (line cap via
+/// `PIO_NARROW_DUMP_CAP`, default 200k). Every memo hit is a
+/// machine-found pair of DIFFERENT partial programs with provably
+/// interchangeable futures from the same state — exactly the
+/// "functionally identical but not generation-pruned" signal that
+/// seeds new canonicity levers. Hits are log-sampled per key (first 4,
+/// then powers of two); a search-end summary lists the hottest
+/// convergence clusters.
+struct HitDump {
+    w: std::io::BufWriter<std::fs::File>,
+    written: u64,
+    cap: u64,
+    counts: std::collections::HashMap<MemoKey, u32>,
+}
+
+fn dump_open() -> Option<HitDump> {
+    let path = std::env::var("PIO_NARROW_DUMP").ok()?;
+    let cap = std::env::var("PIO_NARROW_DUMP_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    let f = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
+    eprintln!("narrow-search: dumping memo-hit pairs to {path} (cap {cap})");
+    Some(HitDump {
+        w: std::io::BufWriter::new(f),
+        written: 0,
+        cap,
+        counts: std::collections::HashMap::new(),
+    })
+}
+
+impl HitDump {
+    fn hit(&mut self, key: &MemoKey, conds: &Conds, it_decided: &[u16; 32], it_value: &[u16; 32], slots: u8) {
+        use std::io::Write;
+        let n = self.counts.entry(*key).or_insert(0);
+        *n += 1;
+        let n = *n;
+        if !(n <= 4 || n & (n - 1) == 0) || self.written >= self.cap {
+            return;
+        }
+        self.written += 1;
+        let st = &key.2;
+        let conds_s: Vec<String> =
+            conds.iter().map(|&(s, m, v)| format!("[{s},{m:#06x},{v:#06x}]")).collect();
+        let prober: Vec<String> = (0..slots as usize)
+            .map(|s| format!("[{:#06x},{:#06x}]", it_decided[s], it_value[s]))
+            .collect();
+        let _ = writeln!(
+            self.w,
+            "{{\"cycle\":{},\"ni\":{},\"pc\":{},\"x\":{:#x},\"y\":{:#x},\"osr\":{:#x},\"isr\":{:#x},\"irq\":{:#x},\"out\":{:#x},\"dir\":{:#x},\"stall\":\"{:?}\",\"hits\":{},\"conds\":[{}],\"prober\":[{}]}}",
+            key.0, key.1, st.pc, st.x, st.y, st.osr, st.isr, st.irq_flags,
+            st.out_latch, st.dir_latch, st.stall, n,
+            conds_s.join(","),
+            prober.join(",")
+        );
+    }
+
+    fn finish(&mut self, stats: &Stats) {
+        use std::io::Write;
+        let mut hot: Vec<(&MemoKey, &u32)> = self.counts.iter().collect();
+        hot.sort_by(|a, b| b.1.cmp(a.1));
+        for (key, hits) in hot.iter().take(50) {
+            let _ = writeln!(
+                self.w,
+                "{{\"cluster\":{{\"cycle\":{},\"ni\":{},\"pc\":{},\"stall\":\"{:?}\",\"hits\":{}}}}}",
+                key.0, key.1, key.2.pc, key.2.stall, hits
+            );
+        }
+        let _ = writeln!(
+            self.w,
+            "{{\"search_end\":{{\"items\":{},\"memo_hits\":{},\"distinct_hit_keys\":{},\"benefit_hist\":\"{}\"}}}}",
+            stats.items,
+            stats.memo_hits,
+            self.counts.len(),
+            stats.benefit_hist_compact()
+        );
+        let _ = self.w.flush();
     }
 }
 
@@ -757,6 +858,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
     // LIFO makes every subtree contiguous — with a synthetic,
     // never-recorded root frame absorbing top-level merges.
     let memo_on = spec.memo_cap > 0;
+    let mut dump = if memo_on { dump_open() } else { None };
     let mut memo: std::collections::HashMap<MemoKey, Vec<MemoRecord>> =
         std::collections::HashMap::new();
     // Records must beat this subtree size to earn a slot; quadruples at
@@ -813,6 +915,9 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                 });
             if let Some(conds) = hit {
                 stats.memo_hits += 1;
+                if let Some(d) = dump.as_mut() {
+                    d.hit(&(it.cycle, it.next_input, it.st), &conds, &it.decided, &it.value, spec.slots);
+                }
                 let top = frames.last_mut().expect("root frame");
                 for &(s, m, v) in &conds {
                     top.merge(s as usize, m, v);
@@ -1138,6 +1243,9 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
         }
     }
     debug_assert!(frames.len() == 1, "unbalanced frame accounting");
+    if let Some(d) = dump.as_mut() {
+        d.finish(&stats);
+    }
 
     SearchResult { champions, stats, champion_cap_hit }
 }

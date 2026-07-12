@@ -694,9 +694,18 @@ fn tx_a_rediscovery_and_optimality() {
                 s.expected = spec4.expected.clone();
                 let r = search(&s, 5);
                 eprintln!(
-                    "L={slots} wrap {wb}..{wt}: items={} forks={} refuted={} champions={}",
-                    r.stats.items, r.stats.forks, r.stats.refuted, r.stats.champions_found
+                    "L={slots} wrap {wb}..{wt}: items={} forks={} refuted={} prefilt={} canon={} memo_hit={} memo_ent={} purges={} champions={}",
+                    r.stats.items,
+                    r.stats.forks,
+                    r.stats.refuted,
+                    r.stats.prefiltered,
+                    r.stats.canon_pruned,
+                    r.stats.memo_hits,
+                    r.stats.memo_entries,
+                    r.stats.memo_purges,
+                    r.stats.champions_found
                 );
+                eprintln!("  benefit_hist: {}", r.stats.benefit_hist_compact());
                 assert_eq!(
                     r.stats.champions_found, 0,
                     "L={slots} wrap {wb}..{wt} unexpectedly matches tx_a's trace: {:04x?}",
