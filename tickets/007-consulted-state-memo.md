@@ -1,4 +1,4 @@
-status: open
+status: done (389bbfa — incl. segment-local X/Y provenance + the frame-conflict scope fix it uncovered)
 priority: high
 
 # Consulted-state memo keys — generalization instead of eviction
