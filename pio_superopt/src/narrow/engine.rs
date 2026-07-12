@@ -1619,6 +1619,202 @@ impl ProbeLog {
     }
 }
 
+/// Delay-pair divergence probe (`PIO_NARROW_DELAY_PAIR`, instrumented
+/// sequential search only). Mining for 008 stages 2/3: a cond-miss
+/// whose record differs from the prober in EXACTLY one delay-bit cond
+/// means two delay spellings reconverged to the same core state — the
+/// dominant conflict class (44% of the L=3 wall). Lock-step simulate
+/// both spellings forward from the probe point to classify whether
+/// the record was over-conditioned on the delay value:
+///   co_refuted  — identical captures, both refute the same cycle
+///                 (sharing would have been valid for this item)
+///   absorbed    — full states re-equalize before any capture diff
+///                 (the WAIT/IRQ schedule swallowed the delay delta;
+///                 identical until the slot's delay is next consulted)
+///   diverged    — captures differ (genuine timing effect)
+///   one_refuted — exactly one spelling walks out of footprint
+///   demand_edge — an undecided field would fork first (inconclusive)
+///   horizon     — trace end reached with no verdict
+/// Tallies stream to stderr every 4096 checks — a time-boxed kill
+/// (50-min policy) loses nothing.
+#[derive(Default)]
+struct DelayPair {
+    checked: u64,
+    co_refuted: u64,
+    absorbed: u64,
+    diverged: u64,
+    one_refuted: u64,
+    demand_edge: u64,
+    horizon: u64,
+    /// Summed cycles-from-probe until resolution, per class above.
+    cyc_co: u64,
+    cyc_ab: u64,
+    cyc_dv: u64,
+}
+
+impl DelayPair {
+    fn print(&self, tag: &str) {
+        let avg = |s: u64, n: u64| s as f64 / n.max(1) as f64;
+        eprintln!(
+            "delay-pair {tag}: checked={} co_refuted={} (avg {:.1}cy) absorbed={} (avg {:.1}cy) diverged={} (avg {:.1}cy) one_refuted={} demand_edge={} horizon={}",
+            self.checked,
+            self.co_refuted,
+            avg(self.cyc_co, self.co_refuted),
+            self.absorbed,
+            avg(self.cyc_ab, self.absorbed),
+            self.diverged,
+            avg(self.cyc_dv, self.diverged),
+            self.one_refuted,
+            self.demand_edge,
+            self.horizon,
+        );
+    }
+
+    /// Find a single-delay-conflict record for this prober and race the
+    /// two spellings. `proj` is borrowed scratch.
+    #[allow(clippy::too_many_arguments)]
+    fn check(
+        &mut self,
+        spec: &EngineSpec,
+        irq_at: &FxMap<u32, u8>,
+        entry: &MemoEntry,
+        it: &Item,
+        delay_mask: u16,
+        mirror_blocked: bool,
+        proj: &mut Vec<u32>,
+    ) {
+        if delay_mask == 0 {
+            return;
+        }
+        // A record ALL of whose conds the prober satisfies except
+        // exactly one pure value conflict confined to a searched
+        // slot's delay bits.
+        let mut found: Option<(usize, u16)> = None;
+        'sets: for &(mask, ref table) in &entry.sets {
+            if mirror_blocked && mask & (SC_X | SC_Y) != 0 {
+                continue;
+            }
+            proj.clear();
+            project_state(&it.st, mask, proj);
+            if let Some(list) = table.get(proj.as_slice()) {
+                'recs: for i in 0..list.recs.len() {
+                    let mut cand: Option<(usize, u16)> = None;
+                    for &p in list.conds_of(i) {
+                        let (s, m, v) = ((p >> 32) as usize, (p >> 16) as u16, p as u16);
+                        if it.decided[s] & m != m {
+                            continue 'recs; // undecided demand, not a pure pair
+                        }
+                        let conflict = (it.value[s] & m) ^ v;
+                        if conflict == 0 {
+                            continue;
+                        }
+                        if cand.is_some() || conflict & !delay_mask != 0 || s >= spec.slots as usize {
+                            continue 'recs;
+                        }
+                        cand = Some((s, v & delay_mask));
+                    }
+                    if let Some(c) = cand {
+                        found = Some(c);
+                        break 'sets;
+                    }
+                }
+            }
+        }
+        let Some((slot, want)) = found else { return };
+        self.checked += 1;
+
+        let mut cfg_a = spec.cfg.clone();
+        cfg_a.code = it.value; // prober spelling
+        let mut cfg_b = spec.cfg.clone();
+        cfg_b.code = it.value;
+        cfg_b.code[slot] = (cfg_b.code[slot] & !delay_mask) | want; // record spelling
+        let (mut sa, mut sb) = (it.st, it.st);
+        let (mut na, mut nb) = (it.next_input, it.next_input);
+        let preload = spec.inputs.len() <= 4;
+        let start = it.cycle;
+        let mut cyc = it.cycle;
+        let verdict = loop {
+            if cyc >= spec.cycles {
+                break "horizon";
+            }
+            if let Some(&m) = irq_at.get(&cyc) {
+                sa.irq_flags |= m;
+                sb.irq_flags |= m;
+            }
+            if !preload {
+                while (na as usize) < spec.inputs.len() && !sa.tx.is_full() {
+                    sa.tx.push(spec.inputs[na as usize]);
+                    na += 1;
+                }
+                while (nb as usize) < spec.inputs.len() && !sb.tx.is_full() {
+                    sb.tx.push(spec.inputs[nb as usize]);
+                    nb += 1;
+                }
+            }
+            let ext = stim_at(&spec.stim, cyc);
+            let ga = compose(&sa, spec.stim.mask, ext);
+            let gb = compose(&sb, spec.stim.mask, ext);
+            let fa = peek_tick(&sa, &cfg_a) && will_fetch(&sa, &cfg_a, ga);
+            let fb = peek_tick(&sb, &cfg_b) && will_fetch(&sb, &cfg_b, gb);
+            // Out-of-footprint fetch refutes (OOB rule).
+            let oa = fa && sa.pc as usize >= spec.slots as usize;
+            let ob = fb && sb.pc as usize >= spec.slots as usize;
+            if oa || ob {
+                break if oa && ob { "co_refuted" } else { "one_refuted" };
+            }
+            // An undecided field would fork here — the concrete race
+            // ends (words agree on all undecided bits, so a joint
+            // demand at equal states would stay joint; unequal states
+            // make this conservative).
+            if (fa && demand(it.decided[sa.pc as usize], cfg_a.code[sa.pc as usize], &cfg_a).is_some())
+                || (fb && demand(it.decided[sb.pc as usize], cfg_b.code[sb.pc as usize], &cfg_b).is_some())
+            {
+                break "demand_edge";
+            }
+            if clock_tick(&mut sa, &cfg_a) {
+                super::step(&mut sa, &cfg_a, ga);
+            }
+            if clock_tick(&mut sb, &cfg_b) {
+                super::step(&mut sb, &cfg_b, gb);
+            }
+            let ca = capture_word(&sa, &spec.capture_pins, spec.stim.mask, ext);
+            let cb = capture_word(&sb, &spec.capture_pins, spec.stim.mask, ext);
+            if ca != cb {
+                break "diverged";
+            }
+            let refuted = ca != spec.expected[cyc as usize];
+            cyc += 1;
+            if refuted {
+                break "co_refuted";
+            }
+            if sa == sb {
+                break "absorbed";
+            }
+        };
+        let dt = (cyc - start) as u64;
+        match verdict {
+            "co_refuted" => {
+                self.co_refuted += 1;
+                self.cyc_co += dt;
+            }
+            "absorbed" => {
+                self.absorbed += 1;
+                self.cyc_ab += dt;
+            }
+            "diverged" => {
+                self.diverged += 1;
+                self.cyc_dv += dt;
+            }
+            "one_refuted" => self.one_refuted += 1,
+            "demand_edge" => self.demand_edge += 1,
+            _ => self.horizon += 1,
+        }
+        if self.checked % 4096 == 0 {
+            self.print("tally");
+        }
+    }
+}
+
 /// Full-table snapshots, `PIO_NARROW_SNAPSHOT`.
 struct Snapshotter {
     dir: std::path::PathBuf,
@@ -1852,6 +2048,11 @@ fn search_impl(
     let mut dump = if memo_on && instrument { dump_open() } else { None };
     let mut probe_log = if memo_on && instrument { probe_log_open(spec.cycles) } else { None };
     let mut snap = if memo_on && instrument { snapshot_open() } else { None };
+    let mut delay_pair = if memo_on && instrument && std::env::var("PIO_NARROW_DELAY_PAIR").is_ok() {
+        Some(DelayPair::default())
+    } else {
+        None
+    };
     let mut memo: FxMap<KeyCore, MemoEntry> = FxMap::default();
     // Records must beat this subtree size to earn a slot; quadruples at
     // every cap purge.
@@ -1982,6 +2183,13 @@ fn search_impl(
                             spec.slots,
                             &mut proj,
                         );
+                        // Rides the probe log's miss sampling (needs
+                        // both env vars set).
+                        if outcome == PROBE_COND_MISS {
+                            if let Some(dp) = delay_pair.as_mut() {
+                                dp.check(spec, &irq_at, entry, &it, delay_mask, mirror_blocked, &mut proj);
+                            }
+                        }
                     }
                 }
             }
@@ -2450,6 +2658,9 @@ fn search_impl(
         }
     }
     debug_assert!(frames.len() == 1, "unbalanced frame accounting");
+    if let Some(dp) = delay_pair.as_ref() {
+        dp.print("final");
+    }
     if let Some(d) = dump.as_mut() {
         d.finish(&stats);
     }

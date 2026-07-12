@@ -735,6 +735,33 @@ fn tx_a_oracle_sanity() {
 /// The L=3 wall bracket alone, with the big-memo configuration
 /// (8M-entry cap, gentler purge) — the targeted experiment for memo
 /// capacity policy. Run: `cargo test --release --test narrow_engine --
+/// Mining harness (008 stages 2/3): sequential instrumented search on
+/// the 2..2 bracket — an all-slots-live monster — with the diagnostic
+/// env channels (PIO_NARROW_PROBE_LOG + PIO_NARROW_DELAY_PAIR). Meant
+/// to be TIME-BOXED externally (systemd RuntimeMaxSec, 50-min policy):
+/// tallies stream to stderr, a kill loses nothing. `cargo test
+/// --release --test narrow_engine -- --ignored tx_a_l3_22_mine
+/// --nocapture`
+#[test]
+#[ignore]
+fn tx_a_l3_22_mine() {
+    let (mut spec4, side) = tx_a_spec(460);
+    let reference = tx_a_words(&side);
+    spec4.expected = run_spec(&spec4, reference);
+
+    let (mut s, _) = tx_a_spec(460);
+    s.slots = 3;
+    s.cfg.wrap_bottom = 2;
+    s.cfg.wrap_top = 2;
+    s.expected = spec4.expected;
+    s.memo_cap = 1 << 23;
+    let r = search(&s, 5);
+    eprintln!(
+        "L=3 wrap 2..2 (mine): items={} refuted={} memo_hit={} champions={}",
+        r.stats.items, r.stats.refuted, r.stats.memo_hits, r.stats.champions_found
+    );
+}
+
 /// --ignored tx_a_l3_first --nocapture`
 #[test]
 #[ignore]
