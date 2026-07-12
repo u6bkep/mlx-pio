@@ -1,8 +1,37 @@
 # 009 — Word behavioral quotient (digest classes)
 
-**Status:** open · **Source:** playground factorization (45,878
+**Status:** open — design settled 2026-07-12 (see "Design decisions"
+below); implementation paused mid-session by the emulator-fidelity
+discovery its first lemma triggered (journal 2026-07-12 eve), resuming
+on corrected semantics. · **Source:** playground factorization (45,878
 compile spellings → 13,335 probe-observable classes via 128-bit
 behavior digests, quotiented BEFORE search).
+
+## Design decisions (2026-07-12)
+
+- **Digests propose, lemmas prove.** Class merges feed impossibility
+  verdicts, so they must be proven, not fuzzed. The SMT mirror cannot
+  prove the full space (no WAIT/IRQ/IN/PUSH, 1-pin configs only), so:
+  battery digest groups candidates; only merges verified by a small
+  library of auditable, per-config lemmas (checked against exec_op
+  source) enter the table; unproven candidates stay singletons (sound
+  — less pruning, never wrong verdicts) and are LOGGED as lemma TODOs.
+- **Fork-time sibling dedup** is the sound generation insertion point:
+  within one field-fork loop, skip a candidate iff an already-PUSHED
+  sibling has the same behavior signature under the child's decided
+  mask. Dynamically sound by construction (the kept sibling provably
+  survived P1/side/P2/P4 filters); no static representative choice, no
+  P1 interaction bugs. Precompute per-realizable-mask signature tables
+  (demand order makes realizable masks a small prefix set, ~30/config).
+- **Memo cond canonicalization is likely moot within one search** once
+  generation dedups spellings; measure the cond-miss composition from
+  the census run before building it.
+- **Known real classes to encode first**: SET pins/pindirs data
+  masking by set_count (16x on 1-pin configs); config-dependent pin
+  aliasing. NOTE: `mov null,src` does NOT exist (MOV dst 011 is
+  PINDIRS); ISR/OSR self-moves are REAL ops under corrected semantics.
+- Spec-relative quotient (space excludes all shift-count observers) is
+  a legitimate extension for seeded spaces.
 
 ## The idea
 

@@ -4,6 +4,64 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-12 (eve) — EMULATOR FIDELITY: shift-counter semantics wrong in all 3 layers; fixed; verdicts re-established
+
+Ticket 009's first lemma ("which words are no-ops") forced a datasheet
+check that found TWO hardware divergences shared consistently by the
+vendored emulator, the narrow twin, and the z3 mirror (so every
+differential gate passed while all three were wrong vs silicon):
+
+1. **MOV→ISR/OSR resets the shift counter** (empty/full) and **OUT→ISR
+   sets isr_count to the bit count** (RP2350 ch.11 destination
+   annotations). All layers left the counters untouched. Fixed in
+   e4a4860. Fallout: `mov osr,osr` is NOT a hardware no-op (re-arms
+   autopull, flips !OSRE) — NOP_CANON moved 0xA0E7 → **0xA021
+   (`mov x,x`)**; P2 prunes only the y,y twin now; ISR/OSR self-moves
+   enumerate as real ops. Cost: forking the nop sets `named`, so P1
+   mirror-folding disarms in nop-carrying unbound subtrees (no
+   register-free true nop exists on silicon; 008's outcome classes
+   could recover this).
+2. **PUSH IFFULL / PULL IFEMPTY are shift-count GUARDS** ("do nothing
+   unless the count reached its threshold"), evaluated before any FIFO
+   access. All layers consulted the bit only on a full/empty FIFO —
+   e.g. `pull ifempty` with queued data below threshold popped the
+   FIFO; on silicon it is a no-op. Fixed in a810ec5. Engine: PULL/PUSH
+   read-masks gained SC_OSR_CNT/SC_ISR_CNT for the if-variants (memo
+   soundness); `is_pull_empty_read` models the guard (binding fork).
+   Four legacy vendored tests had PINNED the wrong behavior (citing
+   the buggy lines); rewritten to the datasheet.
+
+Blast radius: production dme_pio.rs unaffected (its `mov isr,osr` uses
+are `mov; push` with no IN between — counters dead; NOT the deaf-RX
+culprit). Certified DME encoder unaffected (movs to Y/Pins only; reads
+don't reset). HIL-validated TX transform unaffected (empirical). The
+OLD enumerate.rs track excludes ISR/OSR self-moves as "identity nops"
+— **the ≤4-word impossibility proof now carries that caveat** (those
+are real ops in the corrected semantics; re-proving needs the narrow
+ladder anyway).
+
+Verdicts re-established under corrected semantics (4b3bd26), all
+refutations HOLD: L=1 0..0 18,357 items (was 14,141 — space grew);
+L=2 0..0 (split gate), 0..1 195.6M items/20.0s, 1..1 195.4M/19.8s at
+28 threads. L=3 0..0 relaunched with `search_split(28)`
+(txa_l3_split_run.log, 2052 frontier units); the old-semantics
+instrumented sequential run left running for its census/purge data
+(verdict tainted, throughput benchmark still valid — it blew past
+v4's 1.42B kill point at ~1.5M items/s sustained).
+
+Answered: no config makes the ISR/OSR self-moves no-ops again — the
+counter observers (!OSRE, ifempty/iffull, autopull/autopush) are word
+encodings present in every config's space. The consulted-state memo
+already recovers the cost dynamically wherever a subtree never reads
+the counters; a spec-relative quotient (space excludes all observers)
+is a legitimate 009 extension.
+
+Full suites green everywhere: picoem 327, superopt default 95+ across
+targets, smt feature 82 (differential cross-checks re-validate the
+mirror against the corrected twin). Test authorship of the mechanical
+layer fixes was delegated to a subagent (both fidelity commits) and
+verified here.
+
 ## 2026-07-12 (midday) — mining flags + perf-guided memo rework: 6.7x
 
 **Instrumentation flags (95710db).** Two env channels, both provably
