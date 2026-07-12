@@ -1,61 +1,54 @@
 # STATUS — current frontier
 
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
-> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-11 (late).
+> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-12 (early am).
 
-## Narrowing engine — evaluator + fork loop LANDED; L=3 wall says: build the memo
+## Narrowing engine — ALL LEVERS LANDED; L=3 wall pushed back, not down
 
-- **Evaluator** (`pio_superopt/src/narrow/`, 4b9a364..42ecea0): flat Copy
-  NState, total bit-field decode, vendored-exact; diff-gate ~2,500
-  programs byte-identical; independently reviewed (zero divergences).
-  Contract: `docs/evaluator-spec.md` (now incl. §9 driver contract).
-- **Fork engine** (`narrow/engine.rs`, aa489b3, cf892d0): bit-field
-  demand forking, trace refutation, don't-care champions; delay
-  post-fork + side-set trace pre-filter (≈1.65x). Gates green
-  (`tests/narrow_engine.rs`).
-- **Proofs banked** (tx_a oracle, 0 champions, eager+lazy engines
-  agree): footprint 1 and 2 CANNOT reproduce tx_a's trace (all wraps;
-  L=2 0..1 = 220M items). L=1 period-3 duty impossible.
-- **The wall**: L=3 first bracket abandoned >5.67B items/~90min of six
-  brackets. Plain DFS has no cross-item sharing — the playground's
-  lesson holds ("the memo is the whole game"). PIVOT (user call).
+All four planned levers shipped, census-gated (0381fc4..fe610b3):
+pin-write pre-filter (exact one-cycle lookahead), P1-full register
+symmetry (always-on, binding forks; seeding added), P2/P3/P4 canon
+filters, and the consulted-set memo — upgraded mid-session to
+consulted-STATE keys (ticket 007, done): core + read-masked patterns,
+segment-local X/Y provenance, two-level index. A conflict-scope bug
+that had silently poisoned EVERY fork-frame record since the memo
+landed was found via a measurement gate and fixed (389bbfa).
+
+**tx_a ladder (460-cycle oracle), all verdicts reproduce (0 champions):**
+- L=1: 14,141 items (was 16,735) · L=2 0..0: 632,537 (was 1,080,991)
+- L=2 0..1: 153.3M (was 220.4M) · **L=2 1..1: 23.9M (was 220.4M — 9.2x,
+  memo-driven; wrap-invariance is dead, the memo sees structure DFS can't)**
+- **L=3 0..0 STILL OPEN.** v4 (1M-entry memo) killed at 1.42B items,
+  hits flatlined at 2.57M once purges hit bar 1024; v5 (8M entries, x2
+  purge) tripled hit density (7.4M hits @ 230M items) but ALSO
+  flatlined ~200M and ran at 17K items/s. Verdict: capacity is not the
+  lever — deep regions stop matching under value-exact patterns.
 
 ## Next (in expected-value order)
 
-1. **Consulted-set memoization** — the real narrowing machinery;
-   canonical-prefix hashing is the memo key (ties into CANON content
-   addressing). Design against the playground's memo.
-2. **Op-level pin-write pre-filter** — SET/OUT/MOV PINS to captured,
-   OE-pinned pins determine levels like side-set does; kills 32-wide
-   data forks early.
-3. **Runner integration** — resumable brackets (spec-ladder pattern)
-   before any more L=3+ compute.
-4. Full P1 virtual registers: must model PULL's implicit X at the link
-   binding (nonblocking/if_empty PULL on empty FIFO loads X — X/Y
-   renaming is NOT a free symmetry; P1-lite is a default-off flag).
-
-## Shard twin — COMPLETE (merged 2a3a2e7)
-
-`shard_pio/`: evaluator-spec.md implemented in shard; 101/101 certified
-vectors byte-identical; full closure checker-green, zero CANON
-advisories. Run: `bin/shard_eval run runner.shard` from shard_pio/
-(prebuilt binary at ~/Documents/programmingSync/computer-whisperer/
-shard/bin — 40-60x faster than the Rust bootstrap). PIO semantics now
-exist as CHECKED SHARD DEFINITIONS → Christian's 2-SM ≡ 1-SM equality
-proof is statable. Proof arc needs (README design notes): Block-record
-lift of shared latches/irq_flags, inter-SM intra-cycle ordering pinned
-in spec + 2-SM vectors, then step2 bisimulation by induction over the
-cycle list. Hand shard_pio/ to Christian for review.
+1. **Mine the dumps** — runs/txa_l3_v5_hits.jsonl + v4 (309K hit-pair
+   lines): which components/fields block sharing in hot clusters.
+2. **Predicate-valued patterns** — records condition on x's VALUE where
+   the subtree only zero-tested it (`jmp !x`); condition on the
+   predicate class. Same soundness shape as consulted-state.
+3. **Probe throughput** — 64-165K items/s vs 800K plain; fast hasher,
+   projection reuse. Memo must also stop LOSING wall-clock at L=2 0..1.
+4. **ISR/OSR provenance; cond-lazy JMP targets** (fork-width lever,
+   tx_a is JMP-heavy).
+5. **Multi-case specs** (sequential trace concatenation + state reset)
+   — the engine feature the flagship RX resynthesis needs.
 
 ## Flagship (unchanged): phase-invariant RX
 
 Spec/oracle must quantify duty skew (±8ns measured / ±24 design) ×
 parked phase; battery = pio_harness/tests/rx_bench_repro.rs +
-ro_sampled fixtures. Fast-RX variant needed for production main.
+ro_sampled fixtures. Engine now has seeding + impossibility proofs;
+needs multi-case specs (above) before it can attack this.
+
+## Shard twin — COMPLETE (2a3a2e7); hand shard_pio/ to Christian
 
 ## Bench (idle) / paused
 
 -0 pinger / -1 responder on [3][4][4][4], worktree
-Raven-Firmware.single-sm-tx-bench UNPUSHED @350ede86. Hardware
-validation deferred until phase-invariant RX. Paused: SMT len-4,
-compress2, len-5 fleet.
+Raven-Firmware.single-sm-tx-bench UNPUSHED @350ede86. Paused: SMT
+len-4, compress2, len-5 fleet, ticket 006 runner migration.

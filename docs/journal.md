@@ -4,6 +4,99 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-11/12 — all levers landed; the conflict-scope bug; L=3 pushed to 1.4B+, still open
+
+**Strategy (user):** goal is whole-32-word multi-SM programs; ALL
+refutation weapons are indispensable at scale — build everything
+visible, don't gate levers on which wins at L=3; long-running tests
+mean more engine work, not runner work (runner integration dropped).
+
+**Landed, each census-gated (0381fc4, 5819fe6, 4205bea, a69b9d5,
+c7596e1, 3b1a540, 389bbfa, 44919a6, fe610b3):**
+1. Pin-write pre-filter: exact one-cycle lookahead reusing step() when
+   a fork value completes the consulted set and the (op,dst) writes a
+   pin latch. Champion sets provably identical. Inert on tx_a's config
+   (out_count=0) at L=2 — space-dependent, confirming build-them-all.
+2. P1-full register symmetry, ALWAYS ON. Audit vs exec_op: exactly two
+   asymmetric channels — PULL nonblock/if_empty on empty TX READS
+   physical X into OSR; pending_exec words are data (never renamed).
+   Unbound item = words + mirror twin; at an asymmetric event fork
+   identity + twin-as-ordinary-item (decided words mirrored, x/y
+   swapped = true twin state by equivariance). First design (swap once,
+   mirror champions at report) was UNSOUND — conjugation breaks at the
+   event; the twin must become a concrete item. EngineSpec::seed added
+   (constrained resynthesis) and used to gate the fork end-to-end
+   (pull_empty_binding_fork: each binding's trace finds exactly its own
+   spelling).
+3. Canon P2 (nop = mov osr,osr — register-free keeps P1 armed), P4
+   (vacuous JMP-to-fallthrough, non-writing conds), P3 (front-loaded
+   delays in runs of FRESHLY-FORKED consecutive nops; fresh-fork-only
+   flag keeps seeds/wrap-revisits sound).
+4. Consulted-set memo (failure-only, the playground translation):
+   frame stack mirrors DFS; records = consulted (mask,value) ∩ fork's
+   decided snapshot at (cycle, next_input, state); probe refutes items
+   whose decided fields satisfy a record. Benefit-gated (subtree items
+   = stats.items - items_at_open, O(1) by DFS contiguity), purge-and-
+   raise at cap. Guards: unbound prober with x!=y can't hit (mirror
+   twin at swapped state uncovered); binding-fork spelling conflicts
+   poison recordability.
+5. Ticket 007 (consulted-STATE keys) same session: key = always-read
+   CORE (cycle, ni, pc, delay, stall, pending, clk_acc, latches) +
+   read-masked patterns (x, y, isr, osr, counts, irq, fifos read-
+   normalized); per-opcode read table (over-approx sound); segment-
+   local X/Y provenance (set x,imm consults its field only if x is
+   READ; sound because a write and its readers in one fork-free
+   segment share all enclosing frames). Two-level index (per core:
+   mask -> hash of projected values) after v3 showed 50x probe
+   collapse; insert dedup killed ~94% of stored records.
+
+**THE BUG (389bbfa):** Frame::merge's conflict detection compared
+consulted values on the full overlap INCLUDING the field the frame
+itself forked — children necessarily consult that field with different
+values, so EVERY fork frame above leaf level was silently poisoned
+unrecordable, from the memo's first commit. Only deepest conflict-free
+frames (delay forks over refuted leaves) recorded — hence "99.3% of
+records < 16 items" and the v1/v2 hit flatlines. Found by a
+MEASUREMENT gate (consulted_state census showed 8.6% where 3-30x was
+expected; core-match counter + a 12-line probe-miss trace localized
+it). Fix: conflicts only on bits the frame keeps (decided at frame).
+consulted_state gate: 830,875 -> 245,991 items (3.4x, asserted).
+
+**New gates:** census_l1 (all 65,536 words, reproduces-trace IFF
+covered under the P1+P2+P4 quotient; constant-HIGH census = 60,992
+matching words, exact); memo_on_off_equivalence (champion LISTS);
+pull_empty_binding_fork; p3_delay_normal_form;
+consulted_state_shares_across_unread_register; tx_a_l3_first_bracket
+(#[ignore], big-memo bracket experiment). PIO_NARROW_DUMP=<path>
+streams memo-hit pairs (different partial programs, interchangeable
+futures) + cluster summary; Stats::benefit_hist.
+
+**tx_a ladder (verdicts all reproduce, 0 champions):** L=1 14,141
+(was 16,735); L=2 0..0 632,537 (was 1,080,991); L=2 0..1 153,331,047
+(was 220,364,655); L=2 1..1 23,890,049 (was 220,364,655 — 9.2x,
+665K memo hits; the 0..1/1..1 wrap-invariance theorem is dead, the
+memo exploits single-slot-loop convergence plain DFS can't).
+
+**L=3 0..0 REMAINS OPEN — the wall moved but stands.** v1 (old
+engine): abandoned >5.67B items. v2 (filters, memo frozen at 1M cap):
+killed 3.25B+. v4 (full levers, 1M cap): killed 1.42B+; hits
+flatlined at 2.57M once x4 purges pushed the bar to 1024. v5
+(bracket-only, 8M entries ≈ user-approved ~1GB, x2 purge): TRIPLE the
+hit density (7.4M hits @ 230M items) but also flatlined ~200M and
+throughput fell to 17K items/s (giant-table probing). Conclusion:
+capacity is NOT the lever — under value-exact patterns, deep regions
+stop matching regardless of budget. Memory: ~100MB/1M records
+measured (VmHWM), user's ballpark exact.
+
+**Where the signal points next:** (1) mine runs/txa_l3_v5_hits.jsonl +
+v4 dump (309K hit-pair lines) for what blocks sharing; (2) predicate-
+valued patterns (records condition on x's exact value where the
+subtree only zero-tested it — jmp !x cares about x==0, not x==17);
+(3) probe throughput (fast hasher; memo currently LOSES wall-clock at
+L=2 0..1: 153M items @ 64K/s vs v2's 159M @ 800K/s); (4) ISR/OSR
+provenance, cond-lazy JMP targets; (5) multi-case specs for the
+flagship RX (sequential trace concatenation + reset).
+
 ## 2026-07-11 (later) — fork engine v1 + first impossibility proofs; shard twin COMPLETE; L=3 wall → memo is the pivot
 
 **Fork engine landed (aa489b3, cf892d0).** narrow/engine.rs: hole

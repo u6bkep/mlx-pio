@@ -65,6 +65,31 @@ Genome → score → search, end to end, fast and deterministic:
 
 ## Durable lessons (paid for; don't re-learn)
 
+- **Measurement gates catch what correctness gates can't.** The memo's
+  conflict-scope bug (every fork-frame record silently poisoned since its
+  first commit) survived exact censuses and on/off-equivalence because
+  dropped records are SOUND — only a gate asserting the memo's *effect
+  size* (items must halve on a constructed sharing space) exposed it.
+  Every performance lever needs a gate on its magnitude, not just its
+  soundness.
+- **Generalization beats eviction, but value-exact patterns still hit a
+  wall at depth.** Consulted-state keys + provenance (ticket 007) are the
+  playground's free key-minimality rebuilt for the flat evaluator, and
+  they multiplied sharing (L=2 1..1: 9.2x) — yet the L=3 bracket
+  flatlines under ANY capacity (1M and 8M records both starve). Deep
+  regions differ in values the subtree only ever predicate-tests; the
+  next rung is predicate-class patterns, not more RAM (~100MB/1M records
+  measured).
+- **Memo probing is a first-class cost.** Naive per-record scans lost
+  50x throughput; the playground's two-level index (mask -> hashed
+  projection) is load-bearing, not an optimization. Even fixed, the memo
+  loses wall-clock where sharing is thin (L=2 0..1) — hit density decides,
+  and it is wrap/space-dependent.
+- **X/Y renaming is not a free symmetry, but it IS quotientable.** The
+  only asymmetric channels are PULL-on-empty's physical-X read and
+  exec'd (data) words; a binding fork whose twin becomes an ordinary
+  concrete item (words mirrored, x/y swapped) is sound where champion-
+  time mirroring provably is not.
 - **The oracle is the strongest human-bias source.** Cycle-exact equality to a
   hand-written reference MANDATES human timing bit-for-bit (and `dme_ref` is
   not even spec-shaped). Next binding constraints, in order: 10-slot window
