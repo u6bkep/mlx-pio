@@ -3610,10 +3610,11 @@ mod tests {
         assert_eq!(pio.sm[0].pc, 1, "PC advanced after PUSH completed");
     }
 
-    /// PUSH IF_FULL with full FIFO + autopush off: no-op, PC advances.
-    /// Exercises the `if_full && rx_fifo.is_full()` arm in `exec_push`.
+    /// PUSH IFFULL below its shift-count threshold is a complete no-op
+    /// (RP2350 ch.11: "do nothing unless the total input shift count
+    /// has reached its threshold") — even with the RX FIFO full.
     #[test]
-    fn push_if_full_with_full_fifo_is_noop() {
+    fn push_if_full_below_threshold_is_noop() {
         // PUSH if_full (block=1, if_full=1): opcode=100, dir=0,
         // if_full=1, block=1 = 0b100_00000_0_1_1_00000 = 0x8060
         let mut pio = make_pio_with_program(&[0x8060]);
@@ -3622,32 +3623,31 @@ mod tests {
         }
         let isr_before = 0xCAFE_BABE_u32;
         pio.sm[0].isr = isr_before;
-        pio.sm[0].isr_count = 32;
+        pio.sm[0].isr_count = 3; // below threshold (default 32)
 
         step_n(&mut pio, 1, 0);
-        // No stall: if_full no-op when FIFO full.
-        assert!(!pio.sm[0].stalled, "PUSH IF_FULL never stalls");
-        // ISR untouched: PUSH did not run.
+        // Guard failed: complete no-op, no stall.
+        assert!(!pio.sm[0].stalled, "guard-failed PUSH IFFULL must not stall");
         assert_eq!(
             pio.sm[0].isr, isr_before,
-            "PUSH IF_FULL skipped — ISR untouched"
+            "PUSH IFFULL skipped — ISR untouched"
         );
-        assert_eq!(pio.sm[0].isr_count, 32);
+        assert_eq!(pio.sm[0].isr_count, 3);
     }
 
-    /// PULL IF_EMPTY with empty TX FIFO copies X into OSR. Distinct
-    /// from `test_pull_noblock_empty_copies_x` (which exercises
-    /// non-blocking + non-if_empty) and from PULL block.
+    /// PULL IFEMPTY whose guard passes (osr_count at threshold, the
+    /// reset default), NOBLOCK, empty TX FIFO: copies X into OSR.
+    /// Distinct from `test_pull_noblock_empty_copies_x` (non-if_empty).
     #[test]
-    fn pull_if_empty_with_empty_fifo_copies_x_to_osr() {
-        // PULL if_empty, block=1: opcode=100, dir=1, if_empty=1, block=1
-        // = 0b100_00000_1_1_1_00000 = 0x80E0
-        let mut pio = make_pio_with_program(&[0x80E0]);
+    fn pull_if_empty_guard_passed_noblock_copies_x() {
+        // PULL if_empty, block=0: opcode=100, dir=1, if_empty=1, block=0
+        // = 0b100_00000_1_1_0_00000 = 0x80C0
+        let mut pio = make_pio_with_program(&[0x80C0]);
         pio.sm[0].x = 0x1234_5678;
-        // TX FIFO empty by default.
+        // TX FIFO empty by default; osr_count resets to 32 = threshold.
 
         step_n(&mut pio, 1, 0);
-        assert!(!pio.sm[0].stalled, "PULL IF_EMPTY does not stall on empty");
+        assert!(!pio.sm[0].stalled, "noblock PULL does not stall on empty");
         assert_eq!(pio.sm[0].osr, 0x1234_5678, "OSR copied from X");
         assert_eq!(pio.sm[0].osr_count, 0);
     }

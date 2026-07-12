@@ -919,18 +919,20 @@ impl StateMachine {
 
     /// PUSH instruction.
     fn exec_push(&mut self, if_full: bool, block: bool) {
+        // IFFULL: do nothing unless the input shift count has reached
+        // its threshold (RP2350 datasheet 11.4.6) — the guard is
+        // evaluated before any FIFO access.
+        if if_full && self.isr_count < self.push_threshold() {
+            return;
+        }
         if self.rx_fifo.is_full() {
-            if if_full {
-                // If-full and FIFO is full: no-op
-                return;
-            }
             if block {
                 // Block and FIFO is full: stall
                 self.stalled = true;
                 self.stall_kind = StallKind::Push;
                 return;
             }
-            // Non-blocking, non-if_full, full FIFO: push drops (FIFO handles)
+            // Non-blocking, full FIFO: push drops (FIFO handles)
         }
         self.rx_fifo.push(self.isr);
         self.isr = 0;
@@ -939,13 +941,13 @@ impl StateMachine {
 
     /// PULL instruction.
     fn exec_pull(&mut self, if_empty: bool, block: bool) {
+        // IFEMPTY: do nothing unless the output shift count has reached
+        // its threshold (RP2350 datasheet 11.4.7) — the guard is
+        // evaluated before any FIFO access.
+        if if_empty && self.osr_count < self.pull_threshold() {
+            return;
+        }
         if self.tx_fifo.is_empty() {
-            if if_empty {
-                // If-empty and FIFO is empty: copy X to OSR
-                self.osr = self.x;
-                self.osr_count = 0;
-                return;
-            }
             if block {
                 // Block and FIFO is empty: stall
                 self.stalled = true;
@@ -1677,19 +1679,21 @@ mod tests {
         assert_eq!(sm.pending_exec, Some(0xABCD));
     }
 
-    /// PUSH into a full RX FIFO with `if_full=true` is a no-op (line 845
-    /// if_full=true arm after the FIFO-full check).
+    /// PUSH IFFULL whose guard passes (isr_count at threshold) behaves
+    /// as a plain PUSH: blocking on a full RX FIFO stalls. (The IfFull
+    /// bit is a shift-count guard, not a FIFO-state modifier — RP2350
+    /// ch.11.)
     #[test]
-    fn push_if_full_on_full_fifo_is_noop() {
+    fn push_if_full_guard_passed_full_fifo_blocks() {
         let mut sm = StateMachine::new();
         for v in 0..4u32 {
             assert!(sm.rx_fifo.push(v));
         }
         sm.isr = 0x9999;
-        sm.isr_count = 32;
+        sm.isr_count = 32; // at threshold (default 32) — guard passes
         sm.exec_push(true, true); // if_full=true, block=true
-        assert!(!sm.stalled);
-        assert_eq!(sm.isr, 0x9999, "ISR untouched on if_full no-op");
+        assert!(sm.stalled, "guard-passed blocking PUSH stalls on full FIFO");
+        assert_eq!(sm.isr, 0x9999, "ISR untouched while stalled");
         assert_eq!(sm.isr_count, 32);
     }
 
@@ -1727,16 +1731,27 @@ mod tests {
         assert_eq!(sm.isr, 0);
     }
 
-    /// PULL on empty TX FIFO with `if_empty=true` copies X into OSR
-    /// (line 865 → 866 if_empty arm).
+    /// PULL IFEMPTY whose guard passes (osr_count at threshold, the
+    /// reset default): NOBLOCK on an empty FIFO copies X into OSR;
+    /// BLOCK stalls (the IfEmpty bit is a shift-count guard, not a
+    /// FIFO-state modifier — RP2350 ch.11).
     #[test]
-    fn pull_if_empty_copies_x_to_osr() {
+    fn pull_if_empty_guard_passed_empty_fifo() {
         let mut sm = StateMachine::new();
         sm.x = 0xFEED_FACE;
-        sm.exec_pull(true, true); // if_empty=true, block=true
+        sm.exec_pull(true, false); // if_empty=true, noblock
         assert_eq!(sm.osr, 0xFEED_FACE);
         assert_eq!(sm.osr_count, 0);
         assert!(!sm.stalled);
+
+        let mut sm = StateMachine::new();
+        sm.x = 0xFEED_FACE;
+        sm.exec_pull(true, true); // if_empty=true, block
+        assert!(sm.stalled, "guard-passed blocking PULL stalls on empty FIFO");
+        match sm.stall_kind {
+            StallKind::Pull => {}
+            _ => panic!("expected Pull stall"),
+        }
     }
 
     /// PULL blocking on empty FIFO stalls (line 872 block arm).
@@ -1878,6 +1893,75 @@ mod tests {
         sm.exec_mov(7, 0, 1, 0, &mut pins, &mut dirs);
         assert_eq!(sm.osr, 0xDEAD_BEEF);
         assert_eq!(sm.osr_count, 0, "MOV OSR must reset osr_count to 0");
+    }
+
+    /// PULL IFEMPTY below threshold is a complete no-op even with data
+    /// queued (RP2350 ch.11 PULL: "do nothing unless the total output
+    /// shift count has reached its threshold"), and neither stalls nor
+    /// copies X when the FIFO is empty.
+    #[test]
+    fn pull_ifempty_below_threshold_is_noop() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = (sm.shiftctrl & !(0x1F << 25)) | (8 << 25); // pull threshold 8
+        sm.tx_fifo.push(0x1234_5678);
+        sm.osr = 0xAAAA_AAAA;
+        sm.osr_count = 3; // below threshold
+        sm.exec_pull(true, true);
+        assert_eq!(sm.tx_fifo.level(), 1, "guard-failed PULL must not pop");
+        assert_eq!(sm.osr, 0xAAAA_AAAA);
+        assert_eq!(sm.osr_count, 3);
+        assert!(!sm.stalled);
+
+        // Empty-FIFO case: no stall (block) and no X copy.
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = (sm.shiftctrl & !(0x1F << 25)) | (8 << 25);
+        sm.x = 0x5555_5555;
+        sm.osr = 0xAAAA_AAAA;
+        sm.osr_count = 3;
+        sm.exec_pull(true, true);
+        assert!(!sm.stalled, "guard-failed PULL must not stall");
+        assert_eq!(sm.osr, 0xAAAA_AAAA, "guard-failed PULL must not read X");
+    }
+
+    /// PULL IFEMPTY at/above threshold behaves as a plain PULL.
+    #[test]
+    fn pull_ifempty_at_threshold_pulls() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = (sm.shiftctrl & !(0x1F << 25)) | (8 << 25);
+        sm.tx_fifo.push(0x1234_5678);
+        sm.osr_count = 8; // at threshold
+        sm.exec_pull(true, true);
+        assert_eq!(sm.osr, 0x1234_5678);
+        assert_eq!(sm.osr_count, 0);
+        assert_eq!(sm.tx_fifo.level(), 0);
+    }
+
+    /// PUSH IFFULL below threshold is a complete no-op: no push, ISR
+    /// preserved (RP2350 ch.11 PUSH IfFull annotation).
+    #[test]
+    fn push_iffull_below_threshold_is_noop() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = (sm.shiftctrl & !(0x1F << 20)) | (8 << 20); // push threshold 8
+        sm.isr = 0x5555_0055;
+        sm.isr_count = 3; // below threshold
+        sm.exec_push(true, true);
+        assert_eq!(sm.rx_fifo.level(), 0, "guard-failed PUSH must not push");
+        assert_eq!(sm.isr, 0x5555_0055, "guard-failed PUSH must keep ISR");
+        assert_eq!(sm.isr_count, 3);
+        assert!(!sm.stalled);
+    }
+
+    /// PUSH IFFULL at/above threshold behaves as a plain PUSH.
+    #[test]
+    fn push_iffull_at_threshold_pushes() {
+        let mut sm = StateMachine::new();
+        sm.shiftctrl = (sm.shiftctrl & !(0x1F << 20)) | (8 << 20);
+        sm.isr = 0x5555_0055;
+        sm.isr_count = 8;
+        sm.exec_push(true, true);
+        assert_eq!(sm.rx_fifo.level(), 1);
+        assert_eq!(sm.isr, 0);
+        assert_eq!(sm.isr_count, 0);
     }
 
     /// OUT ISR with bit_count=n sets the ISR shift counter to n. RP2350

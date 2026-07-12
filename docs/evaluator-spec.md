@@ -179,11 +179,15 @@ rotate) starting at `base`.
   ISR shift counter to Bit count", count being the 1..=32 normalized bit
   count); EXEC (pending_exec := data & 0xFFFF — the shifted-out word
   truncates to 16 bits).
-- **PUSH iffull block** — rx full: iffull ⇒ no-op; block ⇒ stall(Push);
-  else DROP (push discarded). Then push isr; isr := 0; isr_count := 0.
-- **PULL ifempty block** — tx empty: ifempty ⇒ osr := x, count := 0;
-  block ⇒ stall(Pull); else osr := x (nonblocking empty-pull reads X).
-  Else osr := pop; osr_count := 0.
+- **PUSH iffull block** — GUARD first: iffull ∧ isr_count <
+  push_threshold ⇒ complete no-op (datasheet ch.11: "do nothing unless
+  the total input shift count has reached its threshold"). Then: rx
+  full ⇒ block ? stall(Push) : DROP (push discarded, ISR still clears).
+  Then push isr; isr := 0; isr_count := 0.
+- **PULL ifempty block** — GUARD first: ifempty ∧ osr_count <
+  pull_threshold ⇒ complete no-op (same datasheet wording, output
+  side). Then: tx empty ⇒ block ? stall(Pull) : osr := x, count := 0
+  (nonblocking empty-pull reads X). Else osr := pop; osr_count := 0.
 - **MOV dst op src** — src: PINS (in_base-rotated, masked by in_count
   when 1..=31), X, Y, NULL, — , STATUS (level(sel ? rx : tx) < status_n
   ? all-ones : 0), ISR, OSR. op: none | invert | bit-reverse. dst:
@@ -199,11 +203,13 @@ rotate) starting at `base`.
 - **SET dst data** — PINS/PINDIRS via set_base/set_count; X/Y :=
   zero-extended data. Reserved dst codes: no-op.
 
-MOV ISR/OSR **reset their shift counters to 0** (empty/full), and OUT
-ISR **sets isr_count to the bit count** — per RP2350 datasheet ch.11's
-MOV/OUT destination annotations. Both the vendored emulator and this
-twin were corrected to match (previously they left the counters
-untouched); the change is fuzz-pinned by `narrow_diff`.
+MOV ISR/OSR **reset their shift counters to 0** (empty/full), OUT ISR
+**sets isr_count to the bit count**, and PUSH IFFULL / PULL IFEMPTY
+**guard on the shift count BEFORE any FIFO access** — per RP2350
+datasheet ch.11. Both the vendored emulator and this twin were
+corrected to match (previously the counters were left untouched and
+the iffull/ifempty bit was consulted only on a full/empty FIFO); the
+changes are fuzz-pinned by `narrow_diff`.
 
 ## 9. The driver/harness contract
 

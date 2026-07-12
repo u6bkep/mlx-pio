@@ -359,13 +359,17 @@ pub fn step(st: &SymState, prog: &SymProgram, cfg: &Config, inputs: &[u32]) -> S
     let odst = operand.extract(7, 5);
 
     // -- PULL --------------------------------------------------------------------
+    // IFEMPTY: do nothing unless the output shift count has reached its
+    // threshold (datasheet 11.4.7) — the guard is evaluated before any
+    // FIFO access. Past the guard, Block decides: stall on empty, or
+    // copy X into the OSR.
     let if_empty = bit(&operand, 6);
     let block = bit(&operand, 5);
-    // Blocking pull on an empty FIFO stalls; any other empty case copies X
-    // into the OSR (emulator behavior for both noblock and ifempty-on-empty).
-    let pull_stall = (&is_pull) & (&fifo_empty) & (&block) & !(&if_empty);
-    let pull_pops = (&is_pull) & !(&fifo_empty);
-    let pull_x = (&is_pull) & (&fifo_empty) & !(&pull_stall);
+    let osre_miss = (&if_empty) & st.osr_cnt.bvult(&bvu(thresh, 8));
+    let pull_go = (&is_pull) & !(&osre_miss);
+    let pull_stall = (&pull_go) & (&fifo_empty) & (&block);
+    let pull_pops = (&pull_go) & !(&fifo_empty);
+    let pull_x = (&pull_go) & (&fifo_empty) & !(&block);
 
     // -- MOV ------------------------------------------------------------------------
     let msrc = operand.extract(2, 0);

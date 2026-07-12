@@ -553,15 +553,16 @@ fn exec_op(st: &mut NState, cfg: &NCfg, opcode: u8, operand: u8, gpio_in: u32) -
         // PUSH / PULL
         4 => {
             let is_pull = (operand >> 7) & 1 != 0;
-            let if_x = (operand >> 6) & 1 != 0;
+            let if_flag = (operand >> 6) & 1 != 0;
             let block = (operand >> 5) & 1 != 0;
             if is_pull {
+                // PULL IFEMPTY: do nothing unless the output shift count
+                // has reached its threshold (datasheet 11.4.7) — the
+                // guard is evaluated before any FIFO access.
+                if if_flag && st.osr_count < cfg.pull_threshold {
+                    return false;
+                }
                 if st.tx.is_empty() {
-                    if if_x {
-                        st.osr = st.x;
-                        st.osr_count = 0;
-                        return false;
-                    }
                     if block {
                         st.stall = Stall::Pull;
                         return false;
@@ -573,10 +574,12 @@ fn exec_op(st: &mut NState, cfg: &NCfg, opcode: u8, operand: u8, gpio_in: u32) -
                 st.osr = st.tx.pop().unwrap();
                 st.osr_count = 0;
             } else {
+                // PUSH IFFULL: do nothing unless the input shift count
+                // has reached its threshold (datasheet 11.4.6).
+                if if_flag && st.isr_count < cfg.push_threshold {
+                    return false;
+                }
                 if st.rx.is_full() {
-                    if if_x {
-                        return false;
-                    }
                     if block {
                         st.stall = Stall::Push;
                         return false;
@@ -859,5 +862,87 @@ mod tests {
         // OUT ISR, 0 (field=0 → 32): operand = (6<<5)|0.
         exec_op(&mut st, &cfg, 3, 6 << 5, 0);
         assert_eq!(st.isr_count, 32, "OUT ISR, 0 (=32) sets isr_count = 32");
+    }
+
+    /// PULL IFEMPTY below threshold is a complete no-op even with data
+    /// queued: no pop, no OSR write. RP2350 ch.11 PULL: IfEmpty = "do
+    /// nothing unless the total output shift count has reached its
+    /// threshold".
+    #[test]
+    fn pull_ifempty_below_threshold_is_noop() {
+        let mut cfg = base_cfg();
+        cfg.pull_threshold = 8;
+        let mut st = NState::new(&cfg);
+        st.tx.push(0x1234_5678);
+        st.osr = 0xAAAA_AAAA;
+        st.osr_count = 3; // below threshold
+        // PULL IFEMPTY BLOCK: operand bit7|bit6|bit5 = 0xE0.
+        exec_op(&mut st, &cfg, 4, 0xE0, 0);
+        assert_eq!(st.tx.level(), 1, "guard-failed PULL must not pop");
+        assert_eq!(st.osr, 0xAAAA_AAAA);
+        assert_eq!(st.osr_count, 3);
+        assert_eq!(st.stall, Stall::None);
+    }
+
+    /// PULL IFEMPTY below threshold on an EMPTY FIFO: neither stalls
+    /// (block) nor copies X (noblock) — the guard precedes both.
+    #[test]
+    fn pull_ifempty_below_threshold_no_stall_no_x() {
+        let mut cfg = base_cfg();
+        cfg.pull_threshold = 8;
+        let mut st = NState::new(&cfg);
+        st.x = 0x5555_5555;
+        st.osr = 0xAAAA_AAAA;
+        st.osr_count = 3;
+        exec_op(&mut st, &cfg, 4, 0xE0, 0); // ifempty + block, TX empty
+        assert_eq!(st.stall, Stall::None, "guard-failed PULL must not stall");
+        assert_eq!(st.osr, 0xAAAA_AAAA, "guard-failed PULL must not read X");
+    }
+
+    /// PULL IFEMPTY at/above threshold behaves as a plain PULL.
+    #[test]
+    fn pull_ifempty_at_threshold_pulls() {
+        let mut cfg = base_cfg();
+        cfg.pull_threshold = 8;
+        let mut st = NState::new(&cfg);
+        st.tx.push(0x1234_5678);
+        st.osr_count = 8; // at threshold
+        exec_op(&mut st, &cfg, 4, 0xE0, 0);
+        assert_eq!(st.osr, 0x1234_5678);
+        assert_eq!(st.osr_count, 0);
+        assert_eq!(st.tx.level(), 0);
+    }
+
+    /// PUSH IFFULL below threshold is a complete no-op: no push, ISR
+    /// preserved. RP2350 ch.11 PUSH: IfFull = "do nothing unless the
+    /// total input shift count has reached its threshold".
+    #[test]
+    fn push_iffull_below_threshold_is_noop() {
+        let mut cfg = base_cfg();
+        cfg.push_threshold = 8;
+        let mut st = NState::new(&cfg);
+        st.isr = 0x5555_0055;
+        st.isr_count = 3; // below threshold
+        // PUSH IFFULL BLOCK: operand bit6|bit5 = 0x60.
+        exec_op(&mut st, &cfg, 4, 0x60, 0);
+        assert_eq!(st.rx.level(), 0, "guard-failed PUSH must not push");
+        assert_eq!(st.isr, 0x5555_0055, "guard-failed PUSH must keep ISR");
+        assert_eq!(st.isr_count, 3);
+        assert_eq!(st.stall, Stall::None);
+    }
+
+    /// PUSH IFFULL at/above threshold behaves as a plain PUSH.
+    #[test]
+    fn push_iffull_at_threshold_pushes() {
+        let mut cfg = base_cfg();
+        cfg.push_threshold = 8;
+        let mut st = NState::new(&cfg);
+        st.isr = 0x5555_0055;
+        st.isr_count = 8;
+        exec_op(&mut st, &cfg, 4, 0x60, 0);
+        assert_eq!(st.rx.level(), 1);
+        assert_eq!(st.rx.peek(0), 0x5555_0055);
+        assert_eq!(st.isr, 0);
+        assert_eq!(st.isr_count, 0);
     }
 }

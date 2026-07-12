@@ -518,17 +518,22 @@ fn word_touches_regs(w: u16) -> bool {
     }
 }
 
-/// Is this word a PULL that READS X this cycle (nonblocking or if_empty
-/// variant executing on an empty TX FIFO)? The one binding-asymmetric
+/// Is this word a PULL that READS X this cycle (a nonblocking pull
+/// executing its empty-TX-FIFO path)? The one binding-asymmetric
 /// instruction reachable from CODE (register fields there are virtual);
-/// it distinguishes the twins iff x != y at execution.
-fn is_pull_empty_read(w: u16, st: &NState) -> bool {
+/// it distinguishes the twins iff x != y at execution. An IFEMPTY pull
+/// whose guard fails (osr_count below threshold) is a complete no-op
+/// and reads nothing; a blocking pull stalls instead of reading X.
+fn is_pull_empty_read(w: u16, st: &NState, cfg: &NCfg) -> bool {
     if (w >> 13) & 0x7 != 4 || (w >> 7) & 1 == 0 {
         return false;
     }
     let if_empty = (w >> 6) & 1 != 0;
     let block = (w >> 5) & 1 != 0;
-    st.tx.is_empty() && (if_empty || !block)
+    if if_empty && st.osr_count < cfg.pull_threshold {
+        return false;
+    }
+    st.tx.is_empty() && !block
 }
 
 /// Would the next `step` EXECUTE an instruction (fetched or pending)?
@@ -705,12 +710,14 @@ fn word_state_reads(w: u16, cfg: &NCfg) -> u16 {
         }
         3 => SC_OSR | SC_OSR_CNT | if cfg.autopull { SC_TX } else { 0 },
         4 => {
+            let if_flag = if (w >> 6) & 1 != 0 { u16::MAX } else { 0 };
             if (w >> 7) & 1 != 0 {
                 // PULL reads TX; on empty it reads X, and the binding
-                // demand compares x != y.
-                SC_TX | SC_X | SC_Y
+                // demand compares x != y. IFEMPTY guards on osr_count.
+                SC_TX | SC_X | SC_Y | (if_flag & SC_OSR_CNT)
             } else {
-                SC_RX | SC_ISR
+                // PUSH; IFFULL guards on isr_count.
+                SC_RX | SC_ISR | (if_flag & SC_ISR_CNT)
             }
         }
         5 => match w & 0x7 {
@@ -2003,7 +2010,7 @@ fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> Sear
                     word_touches_regs(w)
                 } else {
                     it.st.x != it.st.y
-                        && is_pull_empty_read(cfg.code[it.st.pc as usize], &it.st)
+                        && is_pull_empty_read(cfg.code[it.st.pc as usize], &it.st, &cfg)
                 };
                 if demands_binding {
                     it.unbound = false;
