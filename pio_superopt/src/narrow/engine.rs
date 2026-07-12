@@ -137,6 +137,14 @@ pub struct Stats {
     /// Core-matched probes where a state pattern matched but every
     /// record's program conditions failed.
     pub memo_cond_misses: u64,
+    /// Probes that reached a record list (core + mask + state values
+    /// all matched) and scanned it.
+    pub memo_rec_scans: u64,
+    /// Total records examined across those scans (mean list length =
+    /// this / memo_rec_scans) — the probe-side linear-scan cost.
+    pub memo_recs_scanned: u64,
+    /// Longest record list seen at probe.
+    pub memo_max_recs: u64,
     /// Failure records currently in the memo.
     pub memo_entries: u64,
     /// Times the memo hit its cap and purged low-benefit records.
@@ -787,17 +795,172 @@ fn stall_state_reads(stall: Stall) -> u16 {
 
 /// Per-slot consulted-condition set: `(mask, value)` of the DECIDED
 /// fields a subtree's evaluation read. The failure claim quantifies
-/// over everything else.
+/// over everything else. `close_child` emits at most one entry per
+/// slot, in slot order — `RecList` packing relies on both.
 type Conds = Vec<(u8, u16, u16)>;
+
+/// The memo maps are hashed with FxHash: SipHash was ~25% of L=3
+/// search CPU (perf, 2026-07-12) and these keys carry no DoS surface.
+/// Nothing decision-bearing consults map iteration order (purge
+/// retention is a per-record predicate), so verdicts, champions and
+/// stats are unchanged; only dump/snapshot line order shifts.
+type FxMap<K, V> =
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+
+/// Pack one cond as `slot << 32 | mask << 16 | value`.
+#[inline]
+fn pack_cond(s: u8, m: u16, v: u16) -> u64 {
+    (s as u64) << 32 | (m as u64) << 16 | v as u64
+}
+
+/// Does record `a` subsume record `b` — does `a` fire on every item
+/// `b` fires on? True iff every cond of `a` is implied by a cond of
+/// `b` on the same slot: `b` demands at least `a`'s bits with the same
+/// values. Both packed lists are in ascending slot order.
+fn subsumes(a: &[u64], b: &[u64]) -> bool {
+    let mut bi = 0usize;
+    'conds: for &pa in a {
+        let (sa, ma, va) = ((pa >> 32) as u8, (pa >> 16) as u16, pa as u16);
+        while bi < b.len() {
+            let (sb, mb, vb) = ((b[bi] >> 32) as u8, (b[bi] >> 16) as u16, b[bi] as u16);
+            if sb < sa {
+                bi += 1;
+            } else if sb == sa {
+                if mb & ma == ma && vb & ma == va {
+                    continue 'conds;
+                }
+                return false;
+            } else {
+                return false;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+/// A record list at one (core, read-mask, projected-values) key: every
+/// record's packed conds live in ONE contiguous buffer, so the probe's
+/// linear scan streams a single allocation instead of chasing a `Vec`
+/// per record (that chase was ~55% of L=3 search CPU). Lists are kept
+/// short by insert-side subsumption and `REC_LIST_CAP`.
+#[derive(Default)]
+struct RecList {
+    packed: Vec<u64>,
+    /// (start of the record's conds in `packed`, benefit); record i
+    /// ends where record i+1 starts (the last at `packed.len()`).
+    recs: Vec<(u32, u32)>,
+}
+
+/// Max records per value-key: eviction keeps the highest benefits.
+/// Sound at any value (fewer records = fewer hits, never wrong ones);
+/// bounds the probe scan as lists age. Swept on tx_a (2026-07-12):
+/// 32 vs 64 vs 256 gave L=3-slice throughput 1.72M/s vs 1.28M/s vs
+/// 0.69M/s at equal hit DENSITY (~6.5%), and 32 also won wall-clock on
+/// both L=2 brackets — longer lists were pure scan cost. (The L=2 1..1
+/// item-count inflation vs the pre-subsumption memo, 23.9M -> 56.9M,
+/// is first-match selection, not the cap: 64 didn't recover it, and
+/// wall-clock still improved 3-4x.)
+const REC_LIST_CAP: usize = 32;
+
+impl RecList {
+    #[inline]
+    fn conds_of(&self, i: usize) -> &[u64] {
+        let start = self.recs[i].0 as usize;
+        let end = self.recs.get(i + 1).map_or(self.packed.len(), |r| r.0 as usize);
+        &self.packed[start..end]
+    }
+
+    /// Rebuild without the records whose indices are in `dead`
+    /// (ascending). O(list) — lists are capped and short.
+    fn remove(&mut self, dead: &[usize]) {
+        if dead.is_empty() {
+            return;
+        }
+        let mut packed = Vec::with_capacity(self.packed.len());
+        let mut recs = Vec::with_capacity(self.recs.len() - dead.len());
+        let mut d = 0usize;
+        for i in 0..self.recs.len() {
+            if d < dead.len() && dead[d] == i {
+                d += 1;
+                continue;
+            }
+            recs.push((packed.len() as u32, self.recs[i].1));
+            packed.extend_from_slice(self.conds_of(i));
+        }
+        self.packed = packed;
+        self.recs = recs;
+    }
+
+    /// Insert a record with subsumption both ways and the list cap;
+    /// returns the change in stored-record count (-cap evictions can
+    /// make it negative even on success).
+    fn insert(&mut self, conds: &Conds, benefit: u32) -> i64 {
+        // An existing record that subsumes the new one fires strictly
+        // more often: the new record adds nothing. Keep the higher
+        // benefit as the survivor's purge priority.
+        let new_packed: Vec<u64> = conds.iter().map(|&(s, m, v)| pack_cond(s, m, v)).collect();
+        let mut benefit = benefit;
+        for i in 0..self.recs.len() {
+            if subsumes(self.conds_of(i), &new_packed) {
+                self.recs[i].1 = self.recs[i].1.max(benefit);
+                return 0;
+            }
+        }
+        // Records the new one subsumes are dead weight; fold their
+        // benefits into the new record. Removing at least one always
+        // frees room, so the cap only bites when `dead` is empty.
+        let mut dead: Vec<usize> = Vec::new();
+        for i in 0..self.recs.len() {
+            if subsumes(&new_packed, self.conds_of(i)) {
+                benefit = benefit.max(self.recs[i].1);
+                dead.push(i);
+            }
+        }
+        if dead.is_empty() && self.recs.len() >= REC_LIST_CAP {
+            let (mi, &(_, mb)) = self
+                .recs
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, &(_, b))| b)
+                .expect("cap > 0");
+            if mb >= benefit {
+                return 0; // new record is the weakest: drop it
+            }
+            self.remove(&[mi]);
+            self.recs.push((self.packed.len() as u32, benefit));
+            self.packed.extend_from_slice(&new_packed);
+            return 0;
+        }
+        let removed = dead.len() as i64;
+        self.remove(&dead);
+        self.recs.push((self.packed.len() as u32, benefit));
+        self.packed.extend_from_slice(&new_packed);
+        1 - removed
+    }
+
+    /// Drop records below the purge bar; returns how many remain.
+    fn retain_benefit(&mut self, bar: u32) -> usize {
+        let dead: Vec<usize> = self
+            .recs
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(_, b))| b < bar)
+            .map(|(i, _)| i)
+            .collect();
+        self.remove(&dead);
+        self.recs.len()
+    }
+}
 
 /// Failure records at one key core, two-level like the playground's
 /// MemoEntry: per distinct read-mask, a table from projected state
-/// values to the (program conds, benefit) records — so a probe costs
-/// one projection + one hash lookup per DISTINCT MASK at the core
-/// (typically one or two), not a scan of every record ever stored.
+/// values to the record list — so a probe costs one projection + one
+/// hash lookup per DISTINCT MASK at the core (typically one or two),
+/// not a scan of every record ever stored.
 #[derive(Default)]
 struct MemoEntry {
-    sets: Vec<(u16, std::collections::HashMap<Vec<u32>, Vec<(Conds, u32)>>)>,
+    sets: Vec<(u16, FxMap<Vec<u32>, RecList>)>,
 }
 
 /// One frame of the fork tree, mirroring the DFS stack (LIFO makes each
@@ -871,7 +1034,7 @@ fn merge_segment(fr: &mut Frame, seg_mask: &[u16; 32], seg_reads: u16, value: &[
 /// save the most work.
 fn close_child(
     frames: &mut Vec<Frame>,
-    memo: &mut std::collections::HashMap<KeyCore, MemoEntry>,
+    memo: &mut FxMap<KeyCore, MemoEntry>,
     memo_cap: usize,
     min_benefit: &mut u32,
     snap: &mut Option<Snapshotter>,
@@ -911,10 +1074,10 @@ fn close_child(
                 memo.retain(|_, entry| {
                     let mut any = false;
                     for (_, table) in entry.sets.iter_mut() {
-                        table.retain(|_, recs| {
-                            recs.retain(|&(_, b)| b >= *min_benefit);
-                            kept += recs.len() as u64;
-                            !recs.is_empty()
+                        table.retain(|_, list| {
+                            let n = list.retain_benefit(*min_benefit);
+                            kept += n as u64;
+                            n > 0
                         });
                         any |= !table.is_empty();
                     }
@@ -933,15 +1096,12 @@ fn close_child(
                 let table = match entry.sets.iter_mut().position(|(m, _)| *m == f.state_reads) {
                     Some(i) => &mut entry.sets[i].1,
                     None => {
-                        entry.sets.push((f.state_reads, std::collections::HashMap::new()));
+                        entry.sets.push((f.state_reads, FxMap::default()));
                         &mut entry.sets.last_mut().unwrap().1
                     }
                 };
-                let recs = table.entry(vals).or_default();
-                if !recs.iter().any(|(c, _)| *c == conds) {
-                    recs.push((conds.clone(), benefit));
-                    stats.memo_entries += 1;
-                }
+                let delta = table.entry(vals).or_default().insert(&conds, benefit);
+                stats.memo_entries = (stats.memo_entries as i64 + delta) as u64;
             }
         }
         let parent = frames.last_mut().expect("synthetic root below every frame");
@@ -966,7 +1126,7 @@ struct HitDump {
     w: std::io::BufWriter<std::fs::File>,
     written: u64,
     cap: u64,
-    counts: std::collections::HashMap<MemoKey, u32>,
+    counts: FxMap<MemoKey, u32>,
 }
 
 fn dump_open() -> Option<HitDump> {
@@ -981,7 +1141,7 @@ fn dump_open() -> Option<HitDump> {
         w: std::io::BufWriter::new(f),
         written: 0,
         cap,
-        counts: std::collections::HashMap::new(),
+        counts: FxMap::default(),
     })
 }
 
@@ -1201,29 +1361,34 @@ impl ProbeLog {
                         table.len()
                     ));
                 }
-                Some(recs) => {
+                Some(list) => {
                     // State pattern matched; report the first failing
                     // condition of each record (cap 4).
-                    let fails: Vec<String> = recs
-                        .iter()
-                        .take(4)
-                        .map(|(conds, benefit)| {
-                            let f = conds.iter().find(|&&(s, m, v)| {
-                                it_decided[s as usize] & m != m || it_value[s as usize] & m != v
+                    let fails: Vec<String> = (0..list.recs.len().min(4))
+                        .map(|i| {
+                            let benefit = list.recs[i].1;
+                            let f = list.conds_of(i).iter().copied().find(|&p| {
+                                let (s, m, v) =
+                                    ((p >> 32) as usize, (p >> 16) as u16, p as u16);
+                                it_decided[s] & m != m || it_value[s] & m != v
                             });
                             match f {
-                                Some(&(s, m, v)) => format!(
-                                    "{{\"slot\":{s},\"m\":{m},\"want\":{v},\"dec\":{},\"got\":{},\"benefit\":{benefit}}}",
-                                    it_decided[s as usize] & m,
-                                    it_value[s as usize] & m
-                                ),
+                                Some(p) => {
+                                    let (s, m, v) =
+                                        ((p >> 32) as usize, (p >> 16) as u16, p as u16);
+                                    format!(
+                                        "{{\"slot\":{s},\"m\":{m},\"want\":{v},\"dec\":{},\"got\":{},\"benefit\":{benefit}}}",
+                                        it_decided[s] & m,
+                                        it_value[s] & m
+                                    )
+                                }
                                 None => "{}".to_string(),
                             }
                         })
                         .collect();
                     sets.push(format!(
                         "{{\"mask\":{mask},\"recs\":{},\"fails\":[{}]}}",
-                        recs.len(),
+                        list.recs.len(),
                         fails.join(",")
                     ));
                 }
@@ -1259,12 +1424,15 @@ impl ProbeLog {
         }
         let _ = writeln!(
             self.w,
-            "{{\"probe_log_end\":{{\"items\":{},\"core_matches\":{},\"state_misses\":{},\"cond_misses\":{},\"hits\":{},\"detail_bytes\":{},\"final_stride\":{}}}}}",
+            "{{\"probe_log_end\":{{\"items\":{},\"core_matches\":{},\"state_misses\":{},\"cond_misses\":{},\"hits\":{},\"rec_scans\":{},\"recs_scanned\":{},\"max_recs\":{},\"detail_bytes\":{},\"final_stride\":{}}}}}",
             stats.items,
             stats.memo_core_matches,
             stats.memo_state_misses,
             stats.memo_cond_misses,
             stats.memo_hits,
+            stats.memo_rec_scans,
+            stats.memo_recs_scanned,
+            stats.memo_max_recs,
             self.bytes,
             self.stride
         );
@@ -1303,7 +1471,7 @@ impl Snapshotter {
     fn write(
         &mut self,
         reason: &str,
-        memo: &std::collections::HashMap<KeyCore, MemoEntry>,
+        memo: &FxMap<KeyCore, MemoEntry>,
         min_benefit: u32,
         stats: &Stats,
         frames: &[Frame],
@@ -1335,23 +1503,30 @@ impl Snapshotter {
             .collect();
         let _ = writeln!(
             w,
-            "{{\"snapshot\":{{\"reason\":\"{reason}\",\"min_benefit\":{min_benefit},\"items\":{},\"memo_entries\":{},\"memo_hits\":{},\"core_matches\":{},\"state_misses\":{},\"cond_misses\":{},\"purges\":{},\"frames\":[{}]}}}}",
+            "{{\"snapshot\":{{\"reason\":\"{reason}\",\"min_benefit\":{min_benefit},\"items\":{},\"memo_entries\":{},\"memo_hits\":{},\"core_matches\":{},\"state_misses\":{},\"cond_misses\":{},\"rec_scans\":{},\"recs_scanned\":{},\"max_recs\":{},\"purges\":{},\"frames\":[{}]}}}}",
             stats.items,
             stats.memo_entries,
             stats.memo_hits,
             stats.memo_core_matches,
             stats.memo_state_misses,
             stats.memo_cond_misses,
+            stats.memo_rec_scans,
+            stats.memo_recs_scanned,
+            stats.memo_max_recs,
             stats.memo_purges,
             frames_s.join(",")
         );
         for (core, entry) in memo {
             for &(mask, ref table) in &entry.sets {
-                for (vals, recs) in table {
-                    for (conds, benefit) in recs {
-                        let conds_s: Vec<String> = conds
+                for (vals, list) in table {
+                    for i in 0..list.recs.len() {
+                        let benefit = list.recs[i].1;
+                        let conds_s: Vec<String> = list
+                            .conds_of(i)
                             .iter()
-                            .map(|&(s, m, v)| format!("[{s},{m},{v}]"))
+                            .map(|&p| {
+                                format!("[{},{},{}]", p >> 32, (p >> 16) as u16, p as u16)
+                            })
                             .collect();
                         let pending = core
                             .pending_exec
@@ -1446,7 +1621,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
     }
 
     // IRQ sets indexed by cycle for O(1) lookup.
-    let mut irq_at = std::collections::HashMap::new();
+    let mut irq_at: FxMap<u32, u8> = FxMap::default();
     for &(c, m) in &spec.irq_sets {
         *irq_at.entry(c).or_insert(0u8) |= m;
     }
@@ -1469,8 +1644,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
     let mut dump = if memo_on { dump_open() } else { None };
     let mut probe_log = if memo_on { probe_log_open(spec.cycles) } else { None };
     let mut snap = if memo_on { snapshot_open() } else { None };
-    let mut memo: std::collections::HashMap<KeyCore, MemoEntry> =
-        std::collections::HashMap::new();
+    let mut memo: FxMap<KeyCore, MemoEntry> = FxMap::default();
     // Records must beat this subtree size to earn a slot; quadruples at
     // every cap purge.
     let mut min_benefit: u32 = 4;
@@ -1492,7 +1666,7 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
         stats.items += 1;
         if last_beat.elapsed().as_secs() >= 10 {
             eprintln!(
-                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} memo_hit={} memo_ent={} minben={} purges={} champions={} stack={}",
+                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
                 stats.items,
                 stats.forks,
                 stats.refuted,
@@ -1502,6 +1676,8 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                 stats.memo_entries,
                 min_benefit,
                 stats.memo_purges,
+                stats.memo_recs_scanned as f64 / stats.memo_rec_scans.max(1) as f64,
+                stats.memo_max_recs,
                 stats.champions_found,
                 stack.len()
             );
@@ -1545,14 +1721,25 @@ pub fn search(spec: &EngineSpec, champion_cap: usize) -> SearchResult {
                     }
                     proj.clear();
                     project_state(&it.st, mask, &mut proj);
-                    if let Some(recs) = table.get(&proj) {
+                    if let Some(list) = table.get(&proj) {
                         outcome = PROBE_COND_MISS;
-                        for (conds, _) in recs {
-                            if conds.iter().all(|&(s, m, v)| {
-                                it.decided[s as usize] & m == m
-                                    && it.value[s as usize] & m == v
+                        stats.memo_rec_scans += 1;
+                        stats.memo_recs_scanned += list.recs.len() as u64;
+                        stats.memo_max_recs = stats.memo_max_recs.max(list.recs.len() as u64);
+                        for i in 0..list.recs.len() {
+                            let conds = list.conds_of(i);
+                            if conds.iter().all(|&p| {
+                                let (s, m, v) =
+                                    ((p >> 32) as usize, (p >> 16) as u16, p as u16);
+                                it.decided[s] & m == m && it.value[s] & m == v
                             }) {
-                                hit = Some((conds.clone(), mask));
+                                hit = Some((
+                                    conds
+                                        .iter()
+                                        .map(|&p| ((p >> 32) as u8, (p >> 16) as u16, p as u16))
+                                        .collect(),
+                                    mask,
+                                ));
                                 outcome = PROBE_HIT;
                                 break 'sets;
                             }
@@ -2002,7 +2189,7 @@ pub fn run_spec(spec: &EngineSpec, code: [u16; 32]) -> Vec<u32> {
         }
         next_input = spec.inputs.len();
     }
-    let mut irq_at = std::collections::HashMap::new();
+    let mut irq_at: FxMap<u32, u8> = FxMap::default();
     for &(c, m) in &spec.irq_sets {
         *irq_at.entry(c).or_insert(0u8) |= m;
     }

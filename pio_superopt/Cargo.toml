@@ -22,6 +22,10 @@ ureq = "2"
 # feature-gated). Links the SYSTEM libz3 — optional so fleet worker boxes
 # without z3 installed keep building with default features.
 z3 = { version = "0.20.2", optional = true }
+# Non-cryptographic hasher for the narrowing engine's memo maps: SipHash
+# was ~25% of L=3 search CPU (perf, 2026-07-12); keys are internal, no
+# DoS surface. Verdicts don't consult map iteration order.
+rustc-hash = "2"
 
 [dev-dependencies]
 # Ground-truth decoder, used to prove the encoder round-trips
@@ -44,6 +48,8 @@ harness = false
 [profile.release]
 lto = "fat"
 codegen-units = 1
+# Symbols for perf profiling; costs disk, not runtime.
+debug = true
 
 [profile.bench]
 lto = "fat"
