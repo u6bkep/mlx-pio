@@ -131,6 +131,10 @@ pub struct Stats {
     /// the candidate's partial word is lemma-provably interchangeable
     /// with an already-generated sibling of the same fork.
     pub quotient_pruned: u64,
+    /// Items refuted for fetching a slot at/past the searched length
+    /// (out-of-footprint execution is undefined behavior on hardware;
+    /// counted inside `refuted` too).
+    pub oob_refuted: u64,
     /// Items refuted by a consulted-set memo hit (subtree skipped).
     pub memo_hits: u64,
     /// Probes whose key CORE matched at least one record (hit or not) —
@@ -1986,6 +1990,26 @@ fn search_impl(spec: &EngineSpec, champion_cap: usize, instrument: bool) -> Sear
 
             let fetching = peek_tick(&it.st, &cfg) && will_fetch(&it.st, &cfg, gpio_in);
             let fetch_pc = it.st.pc as usize;
+            // OOB refutation: fetching a slot at/past the searched
+            // length is undefined behavior on hardware — the rest of
+            // the 32-word ROM belongs to other programs, so a program
+            // that guarantees behavior out there is really a 32-word
+            // program. Such candidates are OUTSIDE the space (space =
+            // programs whose execution stays within their L words for
+            // the whole horizon). Reachable via fall-through past the
+            // last slot or a computed MOV/OUT PC; JMP targets are
+            // already generation-restricted. Sound for the memo: the
+            // verdict depends only on pc (core key) and spec.slots (a
+            // search constant).
+            if fetching && fetch_pc >= spec.slots as usize {
+                stats.refuted += 1;
+                stats.oob_refuted += 1;
+                if memo_on {
+                    merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
+                    close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
+                }
+                continue 'items;
+            }
             if fetching {
                 if memo_on {
                     seg_mask[fetch_pc] |=
@@ -2366,6 +2390,7 @@ fn merge_stats(into: &mut Stats, s: &Stats) {
     into.prefiltered += s.prefiltered;
     into.canon_pruned += s.canon_pruned;
     into.quotient_pruned += s.quotient_pruned;
+    into.oob_refuted += s.oob_refuted;
     into.memo_hits += s.memo_hits;
     into.memo_core_matches += s.memo_core_matches;
     into.memo_state_misses += s.memo_state_misses;
@@ -2540,6 +2565,15 @@ fn stim_at(stim: &Stim, cycle: u32) -> u32 {
 /// (same cycle loop as the search, no forking). Used to generate the
 /// expected trace from a reference program and to re-check champions.
 pub fn run_spec(spec: &EngineSpec, code: [u16; 32]) -> Vec<u32> {
+    run_spec_oob(spec, code).0
+}
+
+/// [`run_spec`] plus an out-of-footprint flag: true iff the run ever
+/// fetched a slot at/past `spec.slots` — the same dynamic condition
+/// the search refutes on (undefined behavior on hardware). The trace
+/// is still completed over the nop filler so callers can compare it;
+/// an oob word is OUTSIDE the search space regardless of its trace.
+pub fn run_spec_oob(spec: &EngineSpec, code: [u16; 32]) -> (Vec<u32>, bool) {
     let mut cfg = spec.cfg.clone();
     cfg.code = code;
     let mut st = NState::new(&cfg);
@@ -2560,6 +2594,7 @@ pub fn run_spec(spec: &EngineSpec, code: [u16; 32]) -> Vec<u32> {
     }
 
     let mut out = Vec::with_capacity(spec.cycles as usize);
+    let mut oob = false;
     for cycle in 0..spec.cycles {
         if let Some(&m) = irq_at.get(&cycle) {
             st.irq_flags |= m;
@@ -2572,6 +2607,9 @@ pub fn run_spec(spec: &EngineSpec, code: [u16; 32]) -> Vec<u32> {
         }
         let ext = stim_at(&spec.stim, cycle);
         let gpio_in = compose(&st, spec.stim.mask, ext);
+        oob |= peek_tick(&st, &cfg)
+            && will_fetch(&st, &cfg, gpio_in)
+            && st.pc >= spec.slots;
         if clock_tick(&mut st, &cfg) {
             super::step(&mut st, &cfg, gpio_in);
         }
@@ -2587,5 +2625,5 @@ pub fn run_spec(spec: &EngineSpec, code: [u16; 32]) -> Vec<u32> {
         }
         out.push(w);
     }
-    out
+    (out, oob)
 }

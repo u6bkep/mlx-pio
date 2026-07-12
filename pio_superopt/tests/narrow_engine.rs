@@ -8,7 +8,7 @@
 
 use pio_superopt::encode::encode_insn;
 use pio_superopt::ir::{Insn, JmpCond, Op, SetDst, SideCfg, WaitSrc};
-use pio_superopt::narrow::engine::{mirror_word, run_spec, search, EngineSpec};
+use pio_superopt::narrow::engine::{mirror_word, run_spec, run_spec_oob, search, EngineSpec};
 use pio_superopt::narrow::{NCfg, Stim};
 use pio_superopt::program::{Config, PinMap, Program};
 
@@ -44,8 +44,10 @@ fn mirror_program(words: &[u16; 32], slots: u8) -> [u16; 32] {
 /// reproduces the trace; check that claim too.
 fn assert_champions_sound(spec: &EngineSpec, champions: &[pio_superopt::narrow::engine::Champion]) {
     for (i, ch) in champions.iter().enumerate() {
+        let (trace, oob) = run_spec_oob(spec, ch.words());
+        assert!(!oob, "champion {i} executes out of footprint (UB on hardware)");
         assert_eq!(
-            run_spec(spec, ch.words()),
+            trace,
             spec.expected,
             "champion {i} does not reproduce the spec trace"
         );
@@ -129,10 +131,14 @@ fn census_l1(spec: &EngineSpec, side: &SideCfg, champions: &[pio_superopt::narro
     let mut n_match = 0u32;
     for w in 0..=0xFFFFu16 {
         code[0] = w;
-        let matches = run_spec(spec, code) == spec.expected;
+        let (trace, oob) = run_spec_oob(spec, code);
+        let matches = trace == spec.expected;
         n_match += matches as u32;
-        if matches && !in_l1_space(w, spec.slots) {
-            continue; // documented space exclusion, not a claim
+        if matches && (oob || !in_l1_space(w, spec.slots)) {
+            // Out of space: documented word exclusion, or execution
+            // left the declared footprint (UB on hardware) — such a
+            // word's trace only "matches" over the nop filler.
+            continue;
         }
         let cov = covered_q(w) || covered_q(canon_l1_word(w, spec));
         assert_eq!(
