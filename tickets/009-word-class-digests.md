@@ -1,9 +1,13 @@
 # 009 — Word behavioral quotient (digest classes)
 
-**Status:** open — design settled 2026-07-12 (see "Design decisions"
-below); implementation paused mid-session by the emulator-fidelity
-discovery its first lemma triggered (journal 2026-07-12 eve), resuming
-on corrected semantics. · **Source:** playground factorization (45,878
+**Status:** CORE LANDED (a687b45, 2026-07-12): `word_canon` lemma
+quotient + per-mask partial-word tables + fork-time sibling dedup;
+~1.9x on tx_a brackets, battery + census gated. Remaining: memo cond
+canonicalization (measure the census first — generation dedup may
+have made it moot) and lemmas for battery-suggested-but-unproven
+classes (e.g. STATUS with status_n > fifo depth ≡ !NULL, cross-field).
+En route, the design's first lemma exposed the emulator-fidelity bug
+(journal 2026-07-12 eve). · **Source:** playground factorization (45,878
 compile spellings → 13,335 probe-observable classes via 128-bit
 behavior digests, quotiented BEFORE search).
 
