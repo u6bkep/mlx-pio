@@ -1279,6 +1279,14 @@ fn probe_log_open(cycles: u32) -> Option<ProbeLog> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8u64 << 30);
+    // Initial sampling stride. At stride 1 a miss-heavy search burns
+    // the whole budget in the first minute of shallow region; start
+    // coarser to spread detail across the run's depth.
+    let stride0 = std::env::var("PIO_NARROW_PROBE_STRIDE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&s: &u64| s > 0)
+        .unwrap_or(1);
     let f = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
     eprintln!("narrow-search: probe log to {path} (detail budget {budget} bytes)");
     Some(ProbeLog {
@@ -1286,7 +1294,7 @@ fn probe_log_open(cycles: u32) -> Option<ProbeLog> {
         bytes: 0,
         budget,
         next_thresh: budget / 2,
-        stride: 1,
+        stride: stride0,
         misses_seen: 0,
         census: vec![[0u64; 4]; cycles as usize + 1],
     })
@@ -1309,7 +1317,10 @@ impl ProbeLog {
         self.bytes += n as u64;
         while self.next_thresh < self.budget && self.bytes >= self.next_thresh {
             self.stride *= 2;
-            self.next_thresh += (self.budget - self.next_thresh) / 2;
+            // The halving step integer-divides to 0 as the threshold
+            // converges on the budget — clamp to 1 or this loop never
+            // terminates (it froze the first instrumented L=3 run).
+            self.next_thresh += ((self.budget - self.next_thresh) / 2).max(1);
         }
         if self.bytes >= self.budget {
             self.stride = 0; // budget exhausted: census only from here
