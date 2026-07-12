@@ -1063,9 +1063,10 @@ fn tx_a_l3_rest_brackets() {
     let (mut spec4, side) = tx_a_spec(460);
     let reference = tx_a_words(&side);
     spec4.expected = run_spec(&spec4, reference);
-    // Cheap brackets first so their verdicts bank early; wrap 0..2
-    // (the full 3-slot loop — by far the deepest space) runs last.
-    for (wb, wt) in [(0u8, 1u8), (1, 1), (1, 2), (2, 2), (0, 2)] {
+    // Cheap brackets first so their verdicts bank early; the two
+    // 2-slot-loop monsters run last (1..2 measured 52B+ items before
+    // an OOM killed it at 6% settled; 0..2 is the full 3-slot loop).
+    for (wb, wt) in [(0u8, 1u8), (1, 1), (2, 2), (1, 2), (0, 2)] {
         let (mut s, _) = tx_a_spec(460);
         s.slots = 3;
         s.cfg.wrap_bottom = wb;
