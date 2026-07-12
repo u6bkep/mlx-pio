@@ -4,6 +4,52 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-12 (late night) — OOB refutation, 008 stage 1, OOM incident, gated relaunch
+
+**OOB refutation landed** (6b08a0b, user ruling): executing any slot
+at/past the searched length is UB on hardware (the rest of the ROM
+belongs to other programs) — the space is now "programs whose
+execution stays within their L words for the whole horizon". Refuted
+at fetch time (`fetch_pc >= spec.slots`); catches fall-through and
+computed MOV/OUT PC; JMP targets were already generation-restricted.
+Censuses validate the redefinition exactly; `run_spec_oob` flags OOB
+for census callers. Prior refutations stand a fortiori.
+
+**Split driver deepened** (48f236e): phase-1 frontier target 16x→128x
+threads (shallow cycle-1 frontiers left near-unconstrained hours-deep
+units; 0..1 fell 499s→68s with 43% fewer items), live progress
+counter (AtomicU64, 2^20 chunks), per-worker quotient reuse.
+
+**L=3 brackets 0..1 and 1..1 REFUTED**: 3.47B items/68s and 3.19B/61s
+(28 threads). 1..2 revealed as a second monster (2-slot wrap loop):
+52.3B live items at only 6% units settled before the run died.
+
+**008 stage 1 — lazy JMP target demand** (12ec1cb): target demanded at
+consult time (taken execution), like delay; fetch_footprint for JMP
+shrinks to cond bits; P4 relocated into the deferred fork. Measured:
+L=2 1..1 +2% items (vacuous jmp-to-ft now walks to first-taken
+instead of dying at fetch), L=3 0..1 −1.4% (3.427B, verdict + item
+count byte-identical across independent runs). Kept per the
+build-every-lever ruling: the untaken-fan saving scales with L, the
+walk overhead is bounded. Probe-log measurement that reshaped 008:
+target-only conflicts are 0.33% of the wall — **the wall is JMP
+delay-bit conflicts (41.5M/94.9M sampled = 44%, same word different
+delay spelling) and cross-opcode pairs (41%)**; side-set conflicts
+~0 (the fork-time side pre-filter already kills them). Stage 2/3
+design must center timing/outcome sharing, not cond grouping (2.5%).
+
+**OOM incident**: running the rest brackets + a 28-worker stage-1
+measurement + the old census run concurrently OOMed the box and
+killed everything including the Claude session (per-worker memos
+multiply by threads × runs). Lessons operationalized: big searches
+run SERIALIZED, and detached under
+`systemd-run --user -p MemoryMax=48G -p MemorySwapMax=0` so a runaway
+kills its own cgroup, not the system, and survives session death.
+Rest-run relaunched as unit `pio-l3rest` (txa_l3_rest2.log), bracket
+order now banks 2..2 before the 1..2 monster (7169b6c). The old
+census run died at 6.65B items without its end-of-run census —
+accepted (old semantics, verdict tainted anyway).
+
 ## 2026-07-12 (night) — THE L=3 WALL FELL + census analysis picks the next lever
 
 **L=3 wrap 0..0 REFUTED**: 5,332,269,770 items exhausted in 1567s at

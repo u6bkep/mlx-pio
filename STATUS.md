@@ -1,68 +1,52 @@
 # STATUS — current frontier
 
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
-> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-12 (eve).
+> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-12 (late night).
 
-## Emulator fidelity fixed (e4a4860, a810ec5) — verdicts re-established
+## L=3 ladder: 3 of 6 brackets REFUTED, rest in flight (gated unit)
 
-RP2350 ch.11: MOV→ISR/OSR resets the shift counter, OUT→ISR sets it,
-and PUSH IFFULL / PULL IFEMPTY are shift-count GUARDS. All three
-layers (vendored, narrow twin, z3 mirror) shared the divergence —
-fixed identically, pinned by unit tests + narrow_diff + smt fuzz.
-`NOP_CANON` is now `mov x,x` (0xA021); ISR/OSR self-moves are real
-ops. Old enumerate.rs ≤4-word impossibility proof carries a caveat
-(it excluded those self-moves as nops). Production firmware and past
-certified artifacts unaffected (journal 2026-07-12 eve).
+0..0 (5.33B items/26min), 0..1 (3.43B/65s), 1..1 (3.14B/59s) proven
+under corrected semantics + OOB refutation (6b08a0b: out-of-footprint
+execution is UB; space = programs staying within their L words).
+Remaining: 2..2 (fast), then the two monsters 1..2 (52B+ items at 6%
+settled when the first attempt died) and 0..2. Running detached as
+systemd unit `pio-l3rest` (txa_l3_rest2.log), MemoryMax=48G.
+**Ops rule (post-OOM): big searches run serialized and gated —
+`systemd-run --user -p MemoryMax=48G -p MemorySwapMax=0`.** All six
+refuted ⇒ tx_a footprint ≤ 3 impossible ⇒ L=4 rediscovery next.
 
-**All small-bracket refutations HOLD under corrected semantics**:
-L=1 18,357 items; L=2 0..0 / 0..1 (195.6M, 20s) / 1..1 (195.4M,
-19.8s) at 28 threads.
+## Ticket 008 in progress — stage 1 of 4 landed (12ec1cb)
 
-## Ticket 009 CORE LANDED (a687b45) — lemma word quotient, ~1.9x
+Lazy JMP target demand (consult-time fork, like delay): L=3 0..1
+−1.4%, 1..1 −1.6% items; L=2 +2% (bounded vacuous-walk cost); scales
+with L. **Probe-log measurement reshaped the ticket**: target-only
+conflicts are 0.33% of the deep-memo wall; the wall is **JMP
+delay-bit conflicts (44% — same word, different delay spelling) and
+cross-opcode pairs (41%)**; cond-bit conflicts 2.5%, side ~0 (the
+fork-time side pre-filter kills them). Remaining stages: (2)
+outcome-grouped forking (value-set items, u32-bitmask sets per
+≤5-bit field, lazy refinement at re-consult), (3) predicate-valued
+memo records on stage-2 partitions, (4) ISR_CNT provenance. Stage
+2/3 design must center timing/outcome sharing, not cond grouping.
+After all stages: one-shot Codex review (gpt-5.6-sol) of the engine.
 
-`word_canon` (lemma-verified per-config classes; battery gate
-executes every respelling: tx_a folds 23,584/65,536 words) + lazy
-per-mask partial-word class tables + fork-time sibling dedup. Both
-L=1 censuses pass with it active. Brackets: L=1 13,501 items; L=2
-0..1 102.7M/11.3s; 1..1 102.5M/11.6s (from ~195M/20s). Remaining
-009: memo cond canonicalization (measure census first), lemmas for
-battery-suggested-but-unproven classes.
+## Emulator fidelity fixed (e4a4860, a810ec5) — holds
 
-## L=3 0..0 WALL FELL — REFUTED, 5.33B items in 26 min (28 threads)
-
-The bracket that killed every overnight run (v1 5.67B killed, v4
-1.42B, v5 230M) is a PROVEN impossibility under corrected semantics
-(quotient binary, txa_l3_split_run.log). **Remaining five L=3
-brackets in flight** (`tx_a_l3_rest`, txa_l3_rest.log, monitored) on
-the newest binary — all six refuted ⇒ tx_a footprint ≤ 3 impossible;
-then L=4 rediscovery is the frontier.
-
-## Census/snapshot analysis DONE (05c3303) — verdicts on next levers
-
-From the old instrumented run (8GB probe samples + 8.4M-record purge
-snapshot): cond misses = 90.2% of core-matched probes, 97% value
-conflicts on genuinely different slot-0/1 words → **008 owns the
-deep-memo wall; memo cond canonicalization measured DEAD (0.97%)**.
-Landed immediately: filler-slot cond strip (88.2% of all cond
-storage was always-match filler-walk bloat) + RX level-only patterns
-(RX contents unreadable by the ISA; was 44% of state-miss diffs).
-ISR_CNT provenance (35% of state-misses) queued into 008. Old census
-run still grinding (1 core) for its end-of-run exact census.
+MOV→ISR/OSR resets shift counter, OUT→ISR sets it, PUSH IFFULL/PULL
+IFEMPTY are guards; all 3 layers fixed identically, gates pinned.
+NOP_CANON = mov x,x. Old ≤4-word impossibility proof carries a caveat.
 
 ## Next (in expected-value order)
 
-1. **L=3 rest verdicts** → L=4 rediscovery ladder.
-2. **Ticket 008 — outcome-grouped forking** (evidence section added:
-   it provably owns the 90% cond-miss class; includes ISR_CNT
-   provenance; also recovers the P1 nop-naming cost).
+1. **L=3 rest verdicts** (in flight) → L=4 rediscovery ladder.
+2. **008 stages 2–4** (see above) + Codex engine review.
 3. **Ticket 010 + multi-case specs** (flagship RX prereq).
 
 ## Flagship (unchanged): phase-invariant RX
 
 Spec/oracle must quantify duty skew (±8ns measured / ±24 design) ×
 parked phase; battery = pio_harness/tests/rx_bench_repro.rs +
-ro_sampled fixtures. Engine needs multi-case specs first. (The
-fidelity bug is NOT the deaf-RX culprit — firmware uses are benign.)
+ro_sampled fixtures. Engine needs multi-case specs first.
 
 ## Shard twin — COMPLETE (2a3a2e7); hand shard_pio/ to Christian
 
@@ -70,4 +54,5 @@ fidelity bug is NOT the deaf-RX culprit — firmware uses are benign.)
 
 -0 pinger / -1 responder on [3][4][4][4], worktree
 Raven-Firmware.single-sm-tx-bench UNPUSHED @350ede86. Paused: SMT
-len-4, compress2, len-5 fleet, ticket 006 runner migration.
+len-4, compress2, len-5 fleet, ticket 006 runner migration. Old
+census run died (OOM) at 6.65B items pre-census — loss accepted.
