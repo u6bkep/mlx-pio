@@ -1628,13 +1628,16 @@ impl ProbeLog {
     }
 }
 
-/// Delay-pair divergence probe (`PIO_NARROW_DELAY_PAIR`, instrumented
-/// sequential search only). Mining for 008 stages 2/3: a cond-miss
-/// whose record differs from the prober in EXACTLY one delay-bit cond
-/// means two delay spellings reconverged to the same core state — the
-/// dominant conflict class (44% of the L=3 wall). Lock-step simulate
+/// Pair-race divergence probe (instrumented sequential search only).
+/// `PIO_NARROW_DELAY_PAIR` races cond-miss records differing from the
+/// prober in EXACTLY one delay-bit cond; `PIO_NARROW_WORD_PAIR` widens
+/// to ANY single decided-cond conflict in one searched slot (mining
+/// for 008 stage 3 — sizes the cross-opcode outcome-equivalence class
+/// by races, not fail-bit histograms). Verdicts tally per conflict
+/// kind: delay (bits within delay_mask only), arg (same opcode,
+/// non-delay bits), opcode (bits 15..13 differ). Lock-step simulate
 /// both spellings forward from the probe point to classify whether
-/// the record was over-conditioned on the delay value:
+/// the record was over-conditioned on the differing bits:
 ///   co_refuted  — identical captures, both refute the same cycle
 ///                 (sharing would have been valid for this item)
 ///   absorbed    — states differed (the delay delta was expressed)
@@ -1649,47 +1652,69 @@ impl ProbeLog {
 /// Tallies stream to stderr every 4096 checks — a time-boxed kill
 /// (50-min policy) loses nothing.
 #[derive(Default)]
-struct DelayPair {
-    checked: u64,
-    co_refuted: u64,
-    absorbed: u64,
-    diverged: u64,
-    one_refuted: u64,
-    demand_edge: u64,
-    unconsulted: u64,
-    horizon: u64,
+struct PairRace {
+    /// Accept any single-cond conflict (word pair), not just delay bits.
+    wide: bool,
+    /// All counters indexed by conflict kind: 0=delay, 1=arg, 2=opcode.
+    checked: [u64; 3],
+    co_refuted: [u64; 3],
+    absorbed: [u64; 3],
+    diverged: [u64; 3],
+    one_refuted: [u64; 3],
+    demand_edge: [u64; 3],
+    /// Demand edge reached with the states already divergent (the
+    /// equal-state case can share the joint fork recursively; the
+    /// divergent case cannot).
+    demand_edge_diff: [u64; 3],
+    unconsulted: [u64; 3],
+    horizon: [u64; 3],
     unbound_skip: u64,
+    /// Wide-mode candidate whose patched spelling violated a sibling
+    /// cond on the same slot (overlapping masks) — not raceable.
+    patch_skip: u64,
     /// co_refuted sub-classification: races whose window wrote NO pin
     /// latch on either machine (capture equality is then structural),
     /// and races that consulted NO external input (WAIT gpio/pin/irq,
     /// JMP PIN — the schedule-resync instructions).
-    co_latch_quiet: u64,
-    co_ext_free: u64,
+    co_latch_quiet: [u64; 3],
+    co_ext_free: [u64; 3],
     /// Summed cycles-from-probe until resolution, per class above.
-    cyc_co: u64,
-    cyc_ab: u64,
-    cyc_dv: u64,
+    cyc_co: [u64; 3],
+    cyc_ab: [u64; 3],
+    cyc_dv: [u64; 3],
 }
 
-impl DelayPair {
+const PAIR_KIND: [&str; 3] = ["delay", "arg", "opcode"];
+
+impl PairRace {
     fn print(&self, tag: &str) {
         let avg = |s: u64, n: u64| s as f64 / n.max(1) as f64;
+        for k in 0..3 {
+            if self.checked[k] == 0 {
+                continue;
+            }
+            eprintln!(
+                "pair-race {tag} [{}]: checked={} co_refuted={} (avg {:.1}cy, latch_quiet={}, ext_free={}) absorbed={} (avg {:.1}cy) diverged={} (avg {:.1}cy) one_refuted={} demand_edge={} (diff={}) unconsulted={} horizon={}",
+                PAIR_KIND[k],
+                self.checked[k],
+                self.co_refuted[k],
+                avg(self.cyc_co[k], self.co_refuted[k]),
+                self.co_latch_quiet[k],
+                self.co_ext_free[k],
+                self.absorbed[k],
+                avg(self.cyc_ab[k], self.absorbed[k]),
+                self.diverged[k],
+                avg(self.cyc_dv[k], self.diverged[k]),
+                self.one_refuted[k],
+                self.demand_edge[k],
+                self.demand_edge_diff[k],
+                self.unconsulted[k],
+                self.horizon[k],
+            );
+        }
         eprintln!(
-            "delay-pair {tag}: checked={} co_refuted={} (avg {:.1}cy, latch_quiet={}, ext_free={}) absorbed={} (avg {:.1}cy) diverged={} (avg {:.1}cy) one_refuted={} demand_edge={} unconsulted={} horizon={} unbound_skip={}",
-            self.checked,
-            self.co_refuted,
-            avg(self.cyc_co, self.co_refuted),
-            self.co_latch_quiet,
-            self.co_ext_free,
-            self.absorbed,
-            avg(self.cyc_ab, self.absorbed),
-            self.diverged,
-            avg(self.cyc_dv, self.diverged),
-            self.one_refuted,
-            self.demand_edge,
-            self.unconsulted,
-            self.horizon,
-            self.unbound_skip,
+            "pair-race {tag}: unbound_skip={} patch_skip={}",
+            self.unbound_skip, self.patch_skip
         );
     }
 
@@ -1710,9 +1735,9 @@ impl DelayPair {
             return;
         }
         // A record ALL of whose conds the prober satisfies except
-        // exactly one pure value conflict confined to a searched
-        // slot's delay bits.
-        let mut found: Option<(usize, u16)> = None;
+        // exactly one pure value conflict in a searched slot — confined
+        // to the slot's delay bits unless `wide`.
+        let mut found: Option<(usize, u16, u16)> = None;
         'sets: for &(mask, ref table) in &entry.sets {
             if mirror_blocked && mask & (SC_X | SC_Y) != 0 {
                 continue;
@@ -1721,7 +1746,7 @@ impl DelayPair {
             project_state(&it.st, mask, proj);
             if let Some(list) = table.get(proj.as_slice()) {
                 'recs: for i in 0..list.recs.len() {
-                    let mut cand: Option<(usize, u16)> = None;
+                    let mut cand: Option<(usize, u16, u16)> = None;
                     for &p in list.conds_of(i) {
                         let (s, m, v) = ((p >> 32) as usize, (p >> 16) as u16, p as u16);
                         if it.decided[s] & m != m {
@@ -1731,19 +1756,35 @@ impl DelayPair {
                         if conflict == 0 {
                             continue;
                         }
-                        if cand.is_some() || conflict & !delay_mask != 0 || s >= spec.slots as usize {
+                        if cand.is_some()
+                            || (!self.wide && conflict & !delay_mask != 0)
+                            || s >= spec.slots as usize
+                        {
                             continue 'recs;
                         }
-                        cand = Some((s, v & delay_mask));
+                        cand = Some((s, m, v));
                     }
-                    if let Some(c) = cand {
-                        found = Some(c);
+                    if let Some((s, m, v)) = cand {
+                        // The patched spelling must satisfy every cond
+                        // of this record — a sibling cond on the same
+                        // slot with an overlapping mask can be violated
+                        // by the patch.
+                        let patched = (it.value[s] & !m) | v;
+                        let ok = list.conds_of(i).iter().all(|&p| {
+                            let (s2, m2, v2) = ((p >> 32) as usize, (p >> 16) as u16, p as u16);
+                            s2 != s || patched & m2 == v2
+                        });
+                        if !ok {
+                            self.patch_skip += 1;
+                            continue 'recs;
+                        }
+                        found = Some((s, m, v));
                         break 'sets;
                     }
                 }
             }
         }
-        let Some((slot, want)) = found else { return };
+        let Some((slot, cmask, cval)) = found else { return };
         // An unbound prober stands for a program and its mirror from
         // the same state — the mirror's race is the mirrored question
         // with the same verdict, so racing the spelling as-is is a
@@ -1752,13 +1793,21 @@ impl DelayPair {
         if it.unbound {
             self.unbound_skip += 1;
         }
-        self.checked += 1;
 
         let mut cfg_a = spec.cfg.clone();
         cfg_a.code = it.value; // prober spelling
         let mut cfg_b = spec.cfg.clone();
         cfg_b.code = it.value;
-        cfg_b.code[slot] = (cfg_b.code[slot] & !delay_mask) | want; // record spelling
+        cfg_b.code[slot] = (cfg_b.code[slot] & !cmask) | cval; // record spelling
+        let delta = cfg_a.code[slot] ^ cfg_b.code[slot];
+        let kind = if delta & !delay_mask == 0 {
+            0 // delay
+        } else if delta >> 13 != 0 {
+            2 // opcode
+        } else {
+            1 // arg
+        };
+        self.checked[kind] += 1;
         let (mut sa, mut sb) = (it.st, it.st);
         let (mut na, mut nb) = (it.next_input, it.next_input);
         let preload = spec.inputs.len() <= 4;
@@ -1807,7 +1856,7 @@ impl DelayPair {
             if (fa && demand(it.decided[sa.pc as usize], cfg_a.code[sa.pc as usize], &cfg_a).is_some())
                 || (fb && demand(it.decided[sb.pc as usize], cfg_b.code[sb.pc as usize], &cfg_b).is_some())
             {
-                break "demand_edge";
+                break if differed { "demand_edge_diff" } else { "demand_edge" };
             }
             // Engine fork points demand() can't see: the delay
             // post-fork (undecided delay bits at a completing fetch)
@@ -1822,7 +1871,7 @@ impl DelayPair {
                 }
             };
             if fork_edge(fa, &sa, &cfg_a, ga) || fork_edge(fb, &sb, &cfg_b, gb) {
-                break "demand_edge";
+                break if differed { "demand_edge_diff" } else { "demand_edge" };
             }
             // External-schedule consults (WAIT any src, JMP PIN) by
             // whichever word can execute this cycle.
@@ -1863,29 +1912,30 @@ impl DelayPair {
         let dt = (cyc - start) as u64;
         match verdict {
             "co_refuted" => {
-                self.co_refuted += 1;
-                self.cyc_co += dt;
+                self.co_refuted[kind] += 1;
+                self.cyc_co[kind] += dt;
                 if !wrote_latch {
-                    self.co_latch_quiet += 1;
+                    self.co_latch_quiet[kind] += 1;
                 }
                 if !ext_consult {
-                    self.co_ext_free += 1;
+                    self.co_ext_free[kind] += 1;
                 }
             }
             "absorbed" => {
-                self.absorbed += 1;
-                self.cyc_ab += dt;
+                self.absorbed[kind] += 1;
+                self.cyc_ab[kind] += dt;
             }
             "diverged" => {
-                self.diverged += 1;
-                self.cyc_dv += dt;
+                self.diverged[kind] += 1;
+                self.cyc_dv[kind] += dt;
             }
-            "one_refuted" => self.one_refuted += 1,
-            "demand_edge" => self.demand_edge += 1,
-            "unconsulted" => self.unconsulted += 1,
-            _ => self.horizon += 1,
+            "one_refuted" => self.one_refuted[kind] += 1,
+            "demand_edge" => self.demand_edge[kind] += 1,
+            "demand_edge_diff" => self.demand_edge_diff[kind] += 1,
+            "unconsulted" => self.unconsulted[kind] += 1,
+            _ => self.horizon[kind] += 1,
         }
-        if self.checked % 4096 == 0 {
+        if self.checked.iter().sum::<u64>() % 4096 == 0 {
             self.print("tally");
         }
     }
@@ -2316,8 +2366,13 @@ fn search_impl(
     let mut dump = if memo_on && instrument { dump_open() } else { None };
     let mut probe_log = if memo_on && instrument { probe_log_open(spec.cycles) } else { None };
     let mut snap = if memo_on && instrument { snapshot_open() } else { None };
-    let mut delay_pair = if memo_on && instrument && std::env::var("PIO_NARROW_DELAY_PAIR").is_ok() {
-        Some(DelayPair::default())
+    let mut pair_race = if memo_on && instrument {
+        let wide = std::env::var("PIO_NARROW_WORD_PAIR").is_ok();
+        if wide || std::env::var("PIO_NARROW_DELAY_PAIR").is_ok() {
+            Some(PairRace { wide, ..Default::default() })
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -2458,7 +2513,7 @@ fn search_impl(
                         // Rides the probe log's miss sampling (needs
                         // both env vars set).
                         if outcome == PROBE_COND_MISS {
-                            if let Some(dp) = delay_pair.as_mut() {
+                            if let Some(dp) = pair_race.as_mut() {
                                 dp.check(spec, &irq_at, entry, &it, delay_mask, mirror_blocked, &mut proj);
                             }
                         }
@@ -2949,7 +3004,7 @@ fn search_impl(
         }
     }
     debug_assert!(frames.len() == 1, "unbalanced frame accounting");
-    if let Some(dp) = delay_pair.as_ref() {
+    if let Some(dp) = pair_race.as_ref() {
         dp.print("final");
     }
     if let Some(d) = dump.as_mut() {
