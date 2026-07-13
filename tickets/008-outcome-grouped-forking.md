@@ -105,11 +105,17 @@ STATUS "predicate-valued patterns".
    record-side idea is outcome-class conds (design B, big surgery).
    Next direction chosen instead: static pair canonicalization + 
    champion-family mining (user proposal, 2026-07-13 — see journal).
-4. ISR_CNT provenance (prov becomes a small field-SET: MOV→ISR
-   resets, OUT→ISR sets from a field, IN accumulates a field).
-   **NOW THE ACTIVE STAGE**, then the one-shot Codex engine review.
-4. ISR_CNT provenance (prov becomes a small field-SET: MOV→ISR
-   resets, OUT→ISR sets from a field, IN accumulates a field).
+4. **DONE (2026-07-13): ISR_CNT provenance.** `CntProv` = segment-
+   local field-set (base-pop flag + ≤4 deduped (slot,mask) BitCount
+   entries, overflow flushes into seg_mask): MOV→ISR/PUSH reset to
+   accounted, OUT→ISR sets from its BitCount, IN accumulates; reads
+   consult exactly the tracked sources; `word_state_reads` returns
+   SC_ISR_CNT for IN only under autopush (without it the old count
+   feeds nothing but the new count — the provenance carries it).
+   Mirrored in junk_walk. 12/12 gates green; like-for-like 150s
+   tx_a_l3_22_mine: items 88.2M→100.9M (+14% throughput), memo_hit
+   1.84M→1.98M, memo entries 656K→484K (−26%: records generalize
+   over isr_count). Next: the one-shot Codex engine review.
 
 ## The idea
 

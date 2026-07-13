@@ -899,7 +899,13 @@ fn word_state_reads(w: u16, cfg: &NCfg) -> u16 {
                 7 => SC_OSR,
                 _ => 0,
             };
-            src | SC_ISR | SC_ISR_CNT | if cfg.autopush { SC_RX } else { 0 }
+            // IN always reads its source and the old ISR data. The
+            // shift counter is a real READ (threshold compares) only
+            // with autopush on; without it the old count feeds nothing
+            // but the new count — that dependency rides `CntProv` and
+            // is consulted only if the counter is actually read later
+            // (008 stage 4).
+            src | SC_ISR | if cfg.autopush { SC_ISR_CNT | SC_RX } else { 0 }
         }
         3 => SC_OSR | SC_OSR_CNT | if cfg.autopull { SC_TX } else { 0 },
         4 => {
@@ -951,16 +957,130 @@ enum Prov {
     Accounted,
 }
 
+const CNT_PROV_CAP: usize = 4;
+
+/// Segment-local provenance of the ISR shift counter (008 stage 4) —
+/// its value is usually PROGRAM-determined: a completed PUSH or
+/// MOV→ISR resets it, OUT→ISR sets it to the OUT's BitCount, and IN
+/// saturating-adds its BitCount (probe census 2026-07-12: isr_count-
+/// only diffs were 35% of state misses). Like X/Y `Prov`, tracked from
+/// pop within one fork-free segment: a READ of the counter consults
+/// exactly the tracked sources — the SC_ISR_CNT state pattern iff the
+/// pop-time value still feeds it, plus the decided BitCount fields
+/// accumulated since — instead of unconditionally adding the state
+/// component. Unlike X/Y, an accumulation chain (several INs) needs a
+/// field SET, not one field.
+#[derive(Clone, Copy)]
+struct CntProv {
+    /// The pop-time counter still feeds the current value: no reset,
+    /// set, or consulted read has replaced it since the pop.
+    base_pop: bool,
+    /// Decided BitCount fields `(slot, mask)` folded into the value
+    /// since pop; deduped, bounded by `CNT_PROV_CAP` (overflow flushes
+    /// into the segment eagerly — over-approximating consultation only
+    /// adds record conditions, never unsoundness).
+    len: u8,
+    fields: [(u8, u16); CNT_PROV_CAP],
+}
+
+impl CntProv {
+    /// Pop-time init: the value is the pop state's counter.
+    fn fork() -> Self {
+        CntProv { base_pop: true, len: 0, fields: [(0, 0); CNT_PROV_CAP] }
+    }
+
+    /// Everything feeding the value is already consulted (or core):
+    /// a read adds nothing new.
+    fn accounted() -> Self {
+        CntProv { base_pop: false, len: 0, fields: [(0, 0); CNT_PROV_CAP] }
+    }
+
+    /// A read of the counter: consult the tracked sources into the
+    /// segment, after which the value is accounted.
+    fn consume(&mut self, seg_reads: &mut u16, seg_mask: &mut [u16; 32]) {
+        if self.base_pop {
+            *seg_reads |= SC_ISR_CNT;
+        }
+        self.flush(seg_mask);
+        self.base_pop = false;
+    }
+
+    /// Merge the tracked fields into the segment's consulted set.
+    fn flush(&mut self, seg_mask: &mut [u16; 32]) {
+        for &(s, m) in &self.fields[..self.len as usize] {
+            seg_mask[s as usize] |= m;
+        }
+        self.len = 0;
+    }
+
+    /// Completed reset (MOV→ISR, PUSH — an IFFULL guard-skip leaves
+    /// the counter, but the guard's read consulted it first, so both
+    /// arms end fully accounted).
+    fn reset(&mut self) {
+        *self = Self::accounted();
+    }
+
+    /// Completed OUT→ISR: the value IS this one decided field.
+    fn set_field(&mut self, slot: u8, mask: u16) {
+        *self = Self::accounted();
+        self.fields[0] = (slot, mask);
+        self.len = 1;
+    }
+
+    /// Completed IN: fold the decided BitCount field into the value
+    /// (the base and earlier fields keep feeding it through the
+    /// saturating add; an autopush zeroing is a function of the same
+    /// consulted sources).
+    fn accum_field(&mut self, slot: u8, mask: u16, seg_mask: &mut [u16; 32]) {
+        if self.fields[..self.len as usize].contains(&(slot, mask)) {
+            return; // revisited IN (loop): already tracked
+        }
+        if self.len as usize == CNT_PROV_CAP {
+            self.flush(seg_mask);
+        }
+        self.fields[self.len as usize] = (slot, mask);
+        self.len += 1;
+    }
+}
+
+/// How a COMPLETED execution of this word writes the ISR shift counter
+/// (mirrors `exec_op`): stalled executions skip their writes, so the
+/// caller applies this at completion only, exactly like
+/// `word_reg_writes`.
+#[derive(Clone, Copy)]
+enum CntEffect {
+    None,
+    /// MOV→ISR / PUSH: counter := 0 (or IFFULL guard-skip: unchanged —
+    /// covered, the guard consulted the counter this cycle).
+    Reset,
+    /// OUT→ISR: counter := the OUT's BitCount field.
+    Set,
+    /// IN: counter := min(counter + BitCount, 32), possibly zeroed by
+    /// an autopush whose threshold compare consulted the counter.
+    Accum,
+}
+
+fn word_cnt_writes(w: u16) -> CntEffect {
+    match (w >> 13) & 0x7 {
+        2 => CntEffect::Accum,
+        3 if (w >> 5) & 0x7 == 6 => CntEffect::Set,
+        4 if (w >> 7) & 1 == 0 => CntEffect::Reset,
+        5 if (w >> 5) & 0x7 == 6 => CntEffect::Reset,
+        _ => CntEffect::None,
+    }
+}
+
 /// Consume a word's state reads into the segment, routing X/Y through
-/// their provenance.
+/// their provenance and the ISR shift counter through `CntProv`.
 fn consume_reads(
     r: u16,
     x_prov: Prov,
     y_prov: Prov,
+    cnt_prov: &mut CntProv,
     seg_reads: &mut u16,
     seg_mask: &mut [u16; 32],
 ) {
-    *seg_reads |= r & !(SC_X | SC_Y);
+    *seg_reads |= r & !(SC_X | SC_Y | SC_ISR_CNT);
     for (bit, prov) in [(SC_X, x_prov), (SC_Y, y_prov)] {
         if r & bit != 0 {
             match prov {
@@ -969,6 +1089,9 @@ fn consume_reads(
                 Prov::Accounted => {}
             }
         }
+    }
+    if r & SC_ISR_CNT != 0 {
+        cnt_prov.consume(seg_reads, seg_mask);
     }
 }
 
@@ -2775,6 +2898,7 @@ fn junk_walk(
     seg_reads: &mut u16,
     mut x_prov: Prov,
     mut y_prov: Prov,
+    mut cnt_prov: CntProv,
     wcyc: &mut u64,
 ) -> bool {
     let mut it = *start;
@@ -2847,7 +2971,7 @@ fn junk_walk(
             }
             if memo_on {
                 let r = word_state_reads(exec_word, cfg);
-                consume_reads(r, x_prov, y_prov, &mut w_reads, &mut w_mask);
+                consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut w_reads, &mut w_mask);
             }
         }
         if it.unbound && peek_tick(&it.st, cfg) {
@@ -2889,6 +3013,17 @@ fn junk_walk(
             }
             if wy {
                 y_prov = p;
+            }
+            match word_cnt_writes(exec_word) {
+                CntEffect::Accum if !exec_pending => {
+                    cnt_prov.accum_field(fetch_pc as u8, 0x001F, &mut w_mask)
+                }
+                CntEffect::Set if !exec_pending => cnt_prov.set_field(fetch_pc as u8, 0x001F),
+                // Pending words are core — a Set/Reset from one leaves
+                // a core-derivable value; a pending Accum folds in a
+                // core-known count (provenance unchanged).
+                CntEffect::Set | CntEffect::Reset => cnt_prov.reset(),
+                CntEffect::Accum | CntEffect::None => {}
             }
         }
         // A completed delay — DECIDED or not — contributes NO cond:
@@ -3218,6 +3353,7 @@ fn search_impl(
         let mut seg_reads: u16 = 0;
         let mut x_prov = Prov::Fork;
         let mut y_prov = Prov::Fork;
+        let mut cnt_prov = CntProv::fork();
 
         while it.cycle < spec.cycles {
             // Deterministic per-cycle environment (idempotent, so a fork
@@ -3357,7 +3493,7 @@ fn search_impl(
                             // conditions even for values never pushed.
                             if memo_on {
                                 let r = word_state_reads(child_value, &cfg);
-                                consume_reads(r, x_prov, y_prov, &mut seg_reads, &mut seg_mask);
+                                consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut seg_reads, &mut seg_mask);
                             }
                             let w = capture_word(&scratch, &spec.capture_pins, spec.stim.mask, ext);
                             if w != spec.expected[it.cycle as usize] {
@@ -3471,7 +3607,7 @@ fn search_impl(
             let exec_pending = it.st.pending_exec.is_some();
             if memo_on && it.st.delay_count == 0 && peek_tick(&it.st, &cfg) {
                 let r = word_state_reads(exec_word, &cfg);
-                consume_reads(r, x_prov, y_prov, &mut seg_reads, &mut seg_mask);
+                consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut seg_reads, &mut seg_mask);
             }
 
             // Binding demand: an unbound item and its mirror twin
@@ -3575,6 +3711,18 @@ fn search_impl(
                 if wy {
                     y_prov = p;
                 }
+                match word_cnt_writes(exec_word) {
+                    CntEffect::Accum if !exec_pending => {
+                        cnt_prov.accum_field(fetch_pc as u8, 0x001F, &mut seg_mask)
+                    }
+                    CntEffect::Set if !exec_pending => cnt_prov.set_field(fetch_pc as u8, 0x001F),
+                    // Pending words are core — a Set/Reset from one
+                    // leaves a core-derivable value; a pending Accum
+                    // folds in a core-known count (provenance
+                    // unchanged).
+                    CntEffect::Set | CntEffect::Reset => cnt_prov.reset(),
+                    CntEffect::Accum | CntEffect::None => {}
+                }
             }
             // A FETCHED canonical nop (P3 only applies without side-set,
             // whose assertion would make delay splits observable).
@@ -3599,7 +3747,7 @@ fn search_impl(
                     stats.walk_calls += 1;
                     if junk_walk(
                         spec, &cfg, &irq_at, &it, delay_mask, memo_on,
-                        &mut seg_mask, &mut seg_reads, x_prov, y_prov,
+                        &mut seg_mask, &mut seg_reads, x_prov, y_prov, cnt_prov,
                         &mut stats.walk_cycles,
                     ) {
                         stats.refuted += 1;
