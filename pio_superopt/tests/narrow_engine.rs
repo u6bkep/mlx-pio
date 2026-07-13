@@ -7,10 +7,10 @@
 //! `cargo test --release --test narrow_engine -- --ignored tx_a --nocapture`
 
 use pio_superopt::encode::encode_insn;
-use pio_superopt::ir::{Insn, JmpCond, Op, SetDst, SideCfg, WaitSrc};
+use pio_superopt::ir::{Insn, JmpCond, Op, OutDst, SetDst, SideCfg, WaitSrc};
 use pio_superopt::narrow::engine::{mirror_word, run_spec, run_spec_oob, run_spec_state, search, EngineSpec};
 use pio_superopt::narrow::{NCfg, Stim};
-use pio_superopt::program::{Config, PinMap, Program};
+use pio_superopt::program::{Config, PinMap, Program, ShiftCfg};
 
 /// NCfg for a searchable space: config fields from `Config`, wrap from
 /// arguments, code irrelevant (the engine owns it).
@@ -1288,16 +1288,19 @@ fn champion_family_mine() {
     use std::hash::{Hash, Hasher};
     use std::io::Write;
 
-    let config = || Config {
-        pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 1, ..PinMap::default() },
-        ..Config::default()
-    };
     let side = SideCfg::NONE;
     let set = |data: u8, delay: u8| Insn { op: Op::Set { dst: SetDst::Pins, data }, delay, sideset: None };
+    let out1 = || Insn::plain(Op::Out { dst: OutDst::Pins, count: 1 });
+    let jmp = |cond: JmpCond, target: u8| Insn::plain(Op::Jmp { cond, target });
+    let pull_if = || Insn::plain(Op::Pull { if_empty: true, block: true });
 
     // (name, reference insns, ref wrap_top, search slots, search wrap
     // (bottom, top), cycles). References run under their OWN wrap so
     // the expected trace is well-defined; the search runs the bracket.
+    // DATA-DRIVEN entries additionally carry TX FIFO `inputs` and a
+    // shift config (autopull + threshold): the waveform is a function
+    // of the FIFO words, which the output-only entries never exercise
+    // (journal 2026-07-13 late evening — the census caveat).
     struct Entry {
         name: &'static str,
         reference: Vec<Insn>,
@@ -1305,14 +1308,89 @@ fn champion_family_mine() {
         slots: u8,
         wrap: (u8, u8),
         cycles: u32,
+        /// TX FIFO words (both the reference run and the search see
+        /// these). Non-empty = data-driven entry: the expected trace
+        /// is asserted to CHANGE when a consumed word changes.
+        inputs: Vec<u32>,
+        autopull: bool,
+        pull_threshold: u8,
     }
+    impl Default for Entry {
+        fn default() -> Self {
+            Entry {
+                name: "",
+                reference: vec![],
+                ref_wrap_top: 0,
+                slots: 0,
+                wrap: (0, 0),
+                cycles: 0,
+                inputs: vec![],
+                autopull: false,
+                pull_threshold: 32,
+            }
+        }
+    }
+    let config = |e: &Entry| Config {
+        pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 1, ..PinMap::default() },
+        shift: ShiftCfg {
+            autopull: e.autopull,
+            pull_threshold: e.pull_threshold,
+            ..ShiftCfg::default()
+        },
+        ..Config::default()
+    };
+    // Serializer payload: distinct low bytes (pull_threshold=8 =>
+    // exactly the low 8 bits of each word are shifted out, LSB first).
+    let payload = || vec![0xD3u32, 0x4A, 0xFF, 0x00];
     let battery = vec![
-        Entry { name: "sq2_l2", reference: vec![set(1, 0), set(0, 0)], ref_wrap_top: 1, slots: 2, wrap: (0, 1), cycles: 17 },
-        Entry { name: "sq4_l2", reference: vec![set(1, 1), set(0, 1)], ref_wrap_top: 1, slots: 2, wrap: (0, 1), cycles: 25 },
-        Entry { name: "pulse14_l2", reference: vec![set(1, 0), set(0, 2)], ref_wrap_top: 1, slots: 2, wrap: (0, 1), cycles: 25 },
-        Entry { name: "sq2_l3", reference: vec![set(1, 0), set(0, 0)], ref_wrap_top: 1, slots: 3, wrap: (0, 2), cycles: 17 },
-        Entry { name: "sq4_l3", reference: vec![set(1, 1), set(0, 1)], ref_wrap_top: 1, slots: 3, wrap: (0, 2), cycles: 25 },
-        Entry { name: "pulse14_l3", reference: vec![set(1, 0), set(0, 2)], ref_wrap_top: 1, slots: 3, wrap: (0, 2), cycles: 25 },
+        Entry { name: "sq2_l2", reference: vec![set(1, 0), set(0, 0)], ref_wrap_top: 1, slots: 2, wrap: (0, 1), cycles: 17, ..Entry::default() },
+        Entry { name: "sq4_l2", reference: vec![set(1, 1), set(0, 1)], ref_wrap_top: 1, slots: 2, wrap: (0, 1), cycles: 25, ..Entry::default() },
+        Entry { name: "pulse14_l2", reference: vec![set(1, 0), set(0, 2)], ref_wrap_top: 1, slots: 2, wrap: (0, 1), cycles: 25, ..Entry::default() },
+        Entry { name: "sq2_l3", reference: vec![set(1, 0), set(0, 0)], ref_wrap_top: 1, slots: 3, wrap: (0, 2), cycles: 17, ..Entry::default() },
+        Entry { name: "sq4_l3", reference: vec![set(1, 1), set(0, 1)], ref_wrap_top: 1, slots: 3, wrap: (0, 2), cycles: 25, ..Entry::default() },
+        Entry { name: "pulse14_l3", reference: vec![set(1, 0), set(0, 2)], ref_wrap_top: 1, slots: 3, wrap: (0, 2), cycles: 25, ..Entry::default() },
+        // DATA-DRIVEN serializers (protocol-representative: FIFO words
+        // shape the waveform). ser8_l2/ser8_l3: autopull bit-banger
+        // `out pins,1 / jmp 0` at 2 cycles/bit, threshold 8 => 16
+        // cycles/word; 44 cycles = 2 full words + 6 bits of the third.
+        // COST NOTE: the L=3 entries run the TIGHTENED (0,1) wrap
+        // bracket (slot 2 reachable only via JMP) — the full (0,2)
+        // bracket blew past 400s at 676M items with a data-driven
+        // trace (FIFO-state variety starves the memo; same wall as
+        // the tx_a L=3 brackets).
+        Entry {
+            name: "ser8_l2",
+            reference: vec![out1(), jmp(JmpCond::Always, 0)],
+            ref_wrap_top: 1, slots: 2, wrap: (0, 1), cycles: 44,
+            inputs: payload(), autopull: true, pull_threshold: 8,
+            ..Entry::default()
+        },
+        Entry {
+            name: "ser8_l3",
+            reference: vec![out1(), jmp(JmpCond::Always, 0)],
+            ref_wrap_top: 1, slots: 3, wrap: (0, 1), cycles: 44,
+            inputs: payload(), autopull: true, pull_threshold: 8,
+            ..Entry::default()
+        },
+        // Explicit-pull serializers: `pull ifempty block / out
+        // pins,1`, wrap 0..1 — PULL IFEMPTY is a 1-cycle no-op while
+        // the OSR still holds bits (osr_count < threshold), so the
+        // loop keeps the 2-cycles/bit cadence and refills exactly at
+        // each 8-bit word boundary.
+        Entry {
+            name: "ser8pull_l2",
+            reference: vec![pull_if(), out1()],
+            ref_wrap_top: 1, slots: 2, wrap: (0, 1), cycles: 44,
+            inputs: payload(), autopull: false, pull_threshold: 8,
+            ..Entry::default()
+        },
+        Entry {
+            name: "ser8pull_l3",
+            reference: vec![pull_if(), out1()],
+            ref_wrap_top: 1, slots: 3, wrap: (0, 1), cycles: 44,
+            inputs: payload(), autopull: false, pull_threshold: 8,
+            ..Entry::default()
+        },
     ];
 
     let mut dump = std::io::BufWriter::new(
@@ -1322,10 +1400,10 @@ fn champion_family_mine() {
     for e in &battery {
         // Expected trace from the reference under its own wrap.
         let mut ref_spec = EngineSpec {
-            cfg: cfg_for(config(), 0, e.ref_wrap_top),
+            cfg: cfg_for(config(e), 0, e.ref_wrap_top),
             slots: e.reference.len() as u8,
             cycles: e.cycles,
-            inputs: vec![],
+            inputs: e.inputs.clone(),
             output_pins: vec![0],
             capture_pins: vec![0],
             stim: Stim::default(),
@@ -1337,11 +1415,28 @@ fn champion_family_mine() {
         let reference = words_of(&e.reference, &side);
         ref_spec.expected = run_spec(&ref_spec, reference);
 
-        let mut s = EngineSpec {
-            cfg: cfg_for(config(), e.wrap.0, e.wrap.1),
+        // Data-driven entries must actually be data-driven: flipping
+        // the consumed bits of EITHER of the first two FIFO words must
+        // change the reference trace (proves the waveform is a
+        // function of the data and that >= 2 full words shift out).
+        if !e.inputs.is_empty() {
+            for w in 0..2 {
+                let mut alt = ref_spec.clone();
+                alt.inputs[w] ^= 0xFF;
+                assert_ne!(
+                    run_spec(&alt, reference),
+                    ref_spec.expected,
+                    "[{}] trace does not depend on FIFO word {w} — not a data-driven spec",
+                    e.name
+                );
+            }
+        }
+
+        let s = EngineSpec {
+            cfg: cfg_for(config(e), e.wrap.0, e.wrap.1),
             slots: e.slots,
             cycles: e.cycles,
-            inputs: vec![],
+            inputs: e.inputs.clone(),
             output_pins: vec![0],
             capture_pins: vec![0],
             stim: Stim::default(),
