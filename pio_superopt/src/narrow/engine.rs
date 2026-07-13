@@ -144,11 +144,6 @@ pub struct Stats {
     /// cost (walks ending Unclean are calls − look_refuted).
     pub walk_calls: u64,
     pub walk_cycles: u64,
-    /// Once-per-family walk (008 §3d): attempts, whole-family kills
-    /// (each counted inside `refuted` too), total simulated cycles.
-    pub fwalk_calls: u64,
-    pub fwalk_kills: u64,
-    pub fwalk_cycles: u64,
     /// Items refuted by a consulted-set memo hit (subtree skipped).
     pub memo_hits: u64,
     /// Probes whose key CORE matched at least one record (hit or not) —
@@ -1135,14 +1130,6 @@ impl RecList {
 #[derive(Default)]
 struct MemoEntry {
     sets: Vec<(u16, FxMap<Vec<u32>, RecList>)>,
-    /// Family-walk arming state (008 §3d): low 31 bits count this
-    /// entry's cond-misses, high bit = walk already attempted. The
-    /// walk fires ONCE, when the counter reaches FAM_WALK_ARM — only
-    /// mega-families (which carry ~65% of the killable miss-mass)
-    /// accumulate that many misses on one entry, so small unkillable
-    /// families and tiny split units never pay a failed walk. Cell:
-    /// bumped under the probe's immutable entry borrow.
-    fam_state: std::cell::Cell<u32>,
 }
 
 /// One frame of the fork tree, mirroring the DFS stack (LIFO makes each
@@ -1862,18 +1849,12 @@ impl FamilyProbe {
                 delay_mask,
                 preload: spec.inputs.len() <= 4,
                 unbound: it.unbound,
-                memo_on: false, // probe never records
                 root_cyc: it.cycle,
                 steps: 0,
                 leaves: 0,
                 cause: "",
-                w_mask: [0u16; 32],
-                w_reads: 0,
             };
-            let killed = fam_walk_rec(
-                &mut w, &mut wcfg, &mut decided, it.st, it.next_input, it.cycle,
-                Prov::Fork, Prov::Fork, 0,
-            );
+            let killed = fam_walk_rec(&mut w, &mut wcfg, &mut decided, it.st, it.next_input, it.cycle, 0);
             if killed {
                 self.walk_kills += 1;
                 self.walk_steps_kill += w.steps as u64;
@@ -1896,19 +1877,9 @@ impl FamilyProbe {
 
 /// Family-walk budget: whole-tree step cap and per-branch depth (the
 /// tree is a family wider than 3b's per-member walks, so the step cap
-/// is larger; branch DEPTH does not grow with family width). Probe
-/// measurement at cap 8192: 50% of failures were budget-capped with
-/// ZERO surviving branches — the bigger cap converts mega-families,
-/// and the once-per-entry firing bounds total cost regardless.
-const FAM_WALK_CAP: u32 = 32768;
+/// is larger; branch DEPTH does not grow with family width).
+const FAM_WALK_CAP: u32 = 8192;
 const FAM_WALK_DEPTH: u32 = 128;
-/// Cond-misses an entry must accumulate before its one family-walk
-/// attempt: the census says the killable 65% of miss-mass sits in
-/// mega-families (10K+ members) while the median family (~8) is not
-/// worth a failed 32K-step walk; small split units never reach this
-/// and stay walk-free.
-const FAM_WALK_ARM: u32 = 256;
-const FAM_TRIED: u32 = 1 << 31;
 
 struct FamWalk<'a> {
     spec: &'a EngineSpec,
@@ -1916,29 +1887,19 @@ struct FamWalk<'a> {
     delay_mask: u16,
     preload: bool,
     unbound: bool,
-    memo_on: bool,
     root_cyc: u32,
     steps: u32,
     leaves: u32,
     cause: &'static str,
-    /// Consulted accounting, mirroring the main loop's segment rules —
-    /// merged into the caller's segment ONLY on a kill, ANDed there
-    /// with the item's cond-eligible decided mask (walk-forked bits,
-    /// including the un-decided conflict, carry no conds: their whole
-    /// value sets were proven).
-    w_mask: [u16; 32],
-    w_reads: u16,
 }
 
 /// Single-machine bounded concrete DFS of an item's future (the 3b
-/// walk with the family twist): forks every edge — fetch demand via
-/// `values_into`, deferred taken-JMP target, delay post-fork at
+/// walk, resurrected as measurement): forks every edge — fetch demand
+/// via `values_into`, deferred taken-JMP target, delay post-fork at
 /// completion — over the full value enumeration (strict superset of
-/// the engine's children, so all-leaves-refute transfers with no
-/// theorem). The caller un-decides the conflicting cond's mask first,
-/// so a kill certifies the WHOLE family. True iff every branch
-/// refutes (capture mismatch or OOB fetch) within budget and depth.
-#[allow(clippy::too_many_arguments)]
+/// the engine's children). True iff every branch refutes (capture
+/// mismatch or OOB fetch) within budget and depth. No consulted
+/// accounting: this probe never records.
 fn fam_walk_rec(
     w: &mut FamWalk,
     cfg: &mut NCfg,
@@ -1946,8 +1907,6 @@ fn fam_walk_rec(
     mut st: NState,
     mut next_input: u32,
     mut cyc: u32,
-    mut x_prov: Prov,
-    mut y_prov: Prov,
     depth: u32,
 ) -> bool {
     loop {
@@ -1975,9 +1934,6 @@ fn fam_walk_rec(
         }
         let ext = stim_at(&w.spec.stim, cyc);
         let gpio_in = compose(&st, w.spec.stim.mask, ext);
-        if w.memo_on && st.stall != Stall::None {
-            w.w_reads |= stall_state_reads(st.stall);
-        }
         let fetching = peek_tick(&st, cfg) && will_fetch(&st, cfg, gpio_in);
         let fetch_pc = st.pc as usize;
         if fetching && fetch_pc >= w.spec.slots as usize {
@@ -1993,7 +1949,7 @@ fn fam_walk_rec(
                 let mut all = true;
                 for v in values {
                     cfg.code[fetch_pc] = (w0 & !field.mask) | v;
-                    if !fam_walk_rec(w, cfg, decided, st, next_input, cyc, x_prov, y_prov, depth + 1) {
+                    if !fam_walk_rec(w, cfg, decided, st, next_input, cyc, depth + 1) {
                         all = false;
                         break;
                     }
@@ -2002,38 +1958,25 @@ fn fam_walk_rec(
                 decided[fetch_pc] = d0;
                 return all;
             }
-            if w.memo_on {
-                w.w_mask[fetch_pc] |=
-                    fetch_footprint(decided[fetch_pc], cfg.code[fetch_pc], cfg) & decided[fetch_pc];
-            }
             let wd = cfg.code[fetch_pc];
-            if wd >> 13 == 0 && jmp_taken(wd, &st, cfg, gpio_in) {
-                if decided[fetch_pc] & 0x001F != 0x001F {
-                    let d0 = decided[fetch_pc];
-                    decided[fetch_pc] = d0 | 0x001F;
-                    let mut all = true;
-                    for t in 0..w.spec.slots as u16 {
-                        cfg.code[fetch_pc] = (wd & !0x001F) | t;
-                        if !fam_walk_rec(w, cfg, decided, st, next_input, cyc, x_prov, y_prov, depth + 1) {
-                            all = false;
-                            break;
-                        }
+            if wd >> 13 == 0
+                && decided[fetch_pc] & 0x001F != 0x001F
+                && jmp_taken(wd, &st, cfg, gpio_in)
+            {
+                let d0 = decided[fetch_pc];
+                decided[fetch_pc] = d0 | 0x001F;
+                let mut all = true;
+                for t in 0..w.spec.slots as u16 {
+                    cfg.code[fetch_pc] = (wd & !0x001F) | t;
+                    if !fam_walk_rec(w, cfg, decided, st, next_input, cyc, depth + 1) {
+                        all = false;
+                        break;
                     }
-                    cfg.code[fetch_pc] = wd;
-                    decided[fetch_pc] = d0;
-                    return all;
                 }
-                if w.memo_on {
-                    // Taken with a decided target: consulted.
-                    w.w_mask[fetch_pc] |= 0x001F;
-                }
+                cfg.code[fetch_pc] = wd;
+                decided[fetch_pc] = d0;
+                return all;
             }
-        }
-        let exec_word = st.pending_exec.unwrap_or(cfg.code[fetch_pc & 31]);
-        let exec_pending = st.pending_exec.is_some();
-        if w.memo_on && st.delay_count == 0 && peek_tick(&st, cfg) {
-            let r = word_state_reads(exec_word, cfg);
-            consume_reads(r, x_prov, y_prov, &mut w.w_reads, &mut w.w_mask);
         }
         if w.unbound && peek_tick(&st, cfg) {
             let demands_binding = if !will_execute(&st, cfg, gpio_in) {
@@ -2060,48 +2003,28 @@ fn fam_walk_rec(
         }
         cyc += 1;
         let completed = ticked && pre_delay == 0 && st.stall == Stall::None;
-        if w.memo_on && completed {
-            let (wx, wy, imm) = word_reg_writes(exec_word);
-            let p = if imm && !exec_pending {
-                Prov::Field(fetch_pc as u8, 0x001F)
-            } else {
-                Prov::Accounted
-            };
-            if wx {
-                x_prov = p;
+        if fetching && completed && w.delay_mask != 0 && decided[fetch_pc] & w.delay_mask != w.delay_mask {
+            if cyc >= w.spec.cycles {
+                // Final-cycle completion keeps delay a don't-care; the
+                // branch then survives at the loop top.
+                continue;
             }
-            if wy {
-                y_prov = p;
-            }
-        }
-        if fetching && completed && w.delay_mask != 0 {
-            if decided[fetch_pc] & w.delay_mask != w.delay_mask {
-                if cyc >= w.spec.cycles {
-                    // Final-cycle completion keeps delay a don't-care;
-                    // the branch then survives at the loop top.
-                    continue;
+            let (w0, d0) = (cfg.code[fetch_pc], decided[fetch_pc]);
+            let max = (w.delay_mask >> 8) as u16;
+            decided[fetch_pc] = d0 | w.delay_mask;
+            let mut all = true;
+            for v in 0..=max {
+                cfg.code[fetch_pc] = (w0 & !w.delay_mask) | (v << 8);
+                let mut stv = st;
+                stv.delay_count = v as u8;
+                if !fam_walk_rec(w, cfg, decided, stv, next_input, cyc, depth + 1) {
+                    all = false;
+                    break;
                 }
-                let (w0, d0) = (cfg.code[fetch_pc], decided[fetch_pc]);
-                let max = (w.delay_mask >> 8) as u16;
-                decided[fetch_pc] = d0 | w.delay_mask;
-                let mut all = true;
-                for v in 0..=max {
-                    cfg.code[fetch_pc] = (w0 & !w.delay_mask) | (v << 8);
-                    let mut stv = st;
-                    stv.delay_count = v as u8;
-                    if !fam_walk_rec(w, cfg, decided, stv, next_input, cyc, x_prov, y_prov, depth + 1) {
-                        all = false;
-                        break;
-                    }
-                }
-                cfg.code[fetch_pc] = w0;
-                decided[fetch_pc] = d0;
-                return all;
             }
-            if w.memo_on {
-                // Completion consults the (already decided) delay.
-                w.w_mask[fetch_pc] |= w.delay_mask;
-            }
+            cfg.code[fetch_pc] = w0;
+            decided[fetch_pc] = d0;
+            return all;
         }
     }
 }
@@ -3005,7 +2928,7 @@ fn search_impl(
         }
         if instrument && last_beat.elapsed().as_secs() >= 10 {
             eprintln!(
-                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} walks={} wcyc={} fw={}/{} fwcyc={} cyc={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
+                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} walks={} wcyc={} cyc={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
                 stats.items,
                 stats.forks,
                 stats.refuted,
@@ -3015,9 +2938,6 @@ fn search_impl(
                 stats.look_refuted,
                 stats.walk_calls,
                 stats.walk_cycles,
-                stats.fwalk_kills,
-                stats.fwalk_calls,
-                stats.fwalk_cycles,
                 stats.cycles_run,
                 stats.memo_hits,
                 stats.memo_entries,
@@ -3054,7 +2974,6 @@ fn search_impl(
         // UNBOUND item with x != y also stands for its mirror twin
         // rooted at the SWAPPED state — such a hit is only valid if the
         // record read neither X nor Y (then it covers the twin too).
-        let mut fam_kill: Option<(usize, u16)> = None;
         if memo_on {
             let core = key_core(it.cycle, it.next_input, &it.st);
             let mirror_blocked = it.unbound && it.st.x != it.st.y;
@@ -3096,30 +3015,7 @@ fn search_impl(
                 }
                 match outcome {
                     PROBE_STATE_MISS => stats.memo_state_misses += 1,
-                    PROBE_COND_MISS => {
-                        stats.memo_cond_misses += 1;
-                        // 008 §3d — family-walk arming: bump this
-                        // entry's miss counter; at FAM_WALK_ARM misses
-                        // (mega-families only — they carry the killable
-                        // mass) run the conflict finder once and arm
-                        // the walk (fired after the segment opens). A
-                        // kill inserts a record with the conflict
-                        // unconditioned, converting the rest of the
-                        // family to memo hits.
-                        let fs = entry.fam_state.get();
-                        if fs & FAM_TRIED == 0 {
-                            if fs + 1 >= FAM_WALK_ARM {
-                                entry.fam_state.set(FAM_TRIED);
-                                let mut ps = 0u64;
-                                fam_kill = find_single_conflict(
-                                    spec, entry, &it, delay_mask, true, mirror_blocked, &mut proj, &mut ps,
-                                )
-                                .map(|(s, m, _)| (s, m));
-                            } else {
-                                entry.fam_state.set(fs + 1);
-                            }
-                        }
-                    }
+                    PROBE_COND_MISS => stats.memo_cond_misses += 1,
                     _ => {}
                 }
             }
@@ -3177,83 +3073,6 @@ fn search_impl(
         let mut seg_reads: u16 = 0;
         let mut x_prov = Prov::Fork;
         let mut y_prov = Prov::Fork;
-
-        // 008 §3d: fire the family walk armed at the cond-miss above.
-        // The conflicting cond's mask is UN-DECIDED, so the walk's own
-        // fork machinery proves every family member; on a kill the
-        // merged record carries no cond on the conflict (nor on any
-        // walk-forked bits — their whole value sets were proven), and
-        // the family memo-hits from here on.
-        if let Some((slot, cmask)) = fam_kill {
-            stats.fwalk_calls += 1;
-            let mut wcfg = cfg.clone();
-            wcfg.code = it.value;
-            let mut decided = it.decided;
-            decided[slot] &= !cmask;
-            let eligible = decided;
-            let mut w = FamWalk {
-                spec,
-                irq_at: &irq_at,
-                delay_mask,
-                preload,
-                unbound: it.unbound,
-                memo_on,
-                root_cyc: it.cycle,
-                steps: 0,
-                leaves: 0,
-                cause: "",
-                w_mask: [0u16; 32],
-                w_reads: 0,
-            };
-            let killed = fam_walk_rec(
-                &mut w, &mut wcfg, &mut decided, it.st, it.next_input, it.cycle,
-                Prov::Fork, Prov::Fork, 0,
-            );
-            stats.fwalk_cycles += w.steps as u64;
-            if killed {
-                stats.fwalk_kills += 1;
-                stats.refuted += 1;
-                // Insert the generalized record at THIS core directly —
-                // the family's members arrive at this exact core, and
-                // converting them to memo hits is the entire point.
-                // (The parent-frame merge below feeds the ancestor
-                // records as usual, but the frame system alone would
-                // never key a record here.) Sound by the standard
-                // record argument with walk-forked fields playing the
-                // below-fork role: bits outside the conds were either
-                // never consulted or proven for ALL values.
-                if (stats.memo_entries as usize) < spec.memo_cap {
-                    let mut conds: Conds = Vec::new();
-                    for s in 0..spec.slots as usize {
-                        let m = w.w_mask[s] & eligible[s];
-                        if m != 0 {
-                            conds.push((s as u8, m, it.value[s] & m));
-                        }
-                    }
-                    let mut vals = Vec::new();
-                    project_state(&it.st, w.w_reads, &mut vals);
-                    let core = key_core(it.cycle, it.next_input, &it.st);
-                    let benefit = min_benefit.max(w.leaves);
-                    let entry = memo.entry(core).or_default();
-                    let table = match entry.sets.iter_mut().position(|(m, _)| *m == w.w_reads) {
-                        Some(i) => &mut entry.sets[i].1,
-                        None => {
-                            entry.sets.push((w.w_reads, FxMap::default()));
-                            &mut entry.sets.last_mut().unwrap().1
-                        }
-                    };
-                    let delta = table.entry(vals).or_default().insert(&conds, benefit);
-                    stats.memo_entries = (stats.memo_entries as i64 + delta) as u64;
-                }
-                seg_reads |= w.w_reads;
-                for s in 0..32 {
-                    seg_mask[s] |= w.w_mask[s] & eligible[s];
-                }
-                merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
-                close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
-                continue 'items;
-            }
-        }
 
         while it.cycle < spec.cycles {
             // Deterministic per-cycle environment (idempotent, so a fork
@@ -3751,9 +3570,6 @@ fn merge_stats(into: &mut Stats, s: &Stats) {
     into.look_refuted += s.look_refuted;
     into.walk_calls += s.walk_calls;
     into.walk_cycles += s.walk_cycles;
-    into.fwalk_calls += s.fwalk_calls;
-    into.fwalk_kills += s.fwalk_kills;
-    into.fwalk_cycles += s.fwalk_cycles;
     into.memo_hits += s.memo_hits;
     into.memo_core_matches += s.memo_core_matches;
     into.memo_state_misses += s.memo_state_misses;
