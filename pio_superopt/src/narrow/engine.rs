@@ -1143,6 +1143,30 @@ fn consume_reads(
     }
 }
 
+/// A segment is ending: flush every still-live field provenance (a
+/// decided immediate written into X/Y, or BitCount fields feeding the
+/// ISR counter, not yet read) into the segment's consulted set.
+///
+/// Soundness (review S1, 2026-07-13): provenance is SEGMENT-local —
+/// descendants past a fork read the register as a bare SC_* state
+/// component. That read is sound at the fork frame itself (its key
+/// state carries the written value), but it propagates to ENCLOSING
+/// frames as a state read patterned on THEIR key states, which predate
+/// the write — the immediate the subtree actually depended on would go
+/// unrecorded, and a prober with a different immediate would falsely
+/// hit. Consulting the field at segment end keeps the lazy
+/// imm-consults-only-when-read win within a segment while making every
+/// cross-segment dependency explicit. Over-consulting (the register may
+/// never be read again) only adds record conditions, never unsoundness.
+fn flush_prov(x_prov: Prov, y_prov: Prov, cnt_prov: &mut CntProv, seg_mask: &mut [u16; 32]) {
+    for p in [x_prov, y_prov] {
+        if let Prov::Field(s, m) = p {
+            seg_mask[s as usize] |= m;
+        }
+    }
+    cnt_prov.flush(seg_mask);
+}
+
 /// Which scratch registers a COMPLETED execution of this word definitely
 /// writes, and whether the written value is a code-immediate (SET's
 /// 5-bit data). Conditional writes that first READ the target (JMP
@@ -3096,6 +3120,9 @@ fn junk_walk(
         }
     };
     if refuted && memo_on {
+        // The walk is a segment tail ending here: flush its live field
+        // provenance like every other segment end (review S1).
+        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut w_mask);
         *seg_reads |= w_reads;
         for s in 0..32 {
             seg_mask[s] |= w_mask[s];
@@ -3448,6 +3475,7 @@ fn search_impl(
                 stats.refuted += 1;
                 stats.oob_refuted += 1;
                 if memo_on {
+                    flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
                     merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                     close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                 }
@@ -3567,6 +3595,7 @@ fn search_impl(
                         pushed += 1;
                     }
                     if memo_on {
+                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
                         merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                         if pushed > 0 {
                             frames.push(Frame {
@@ -3629,6 +3658,7 @@ fn search_impl(
                             pushed += 1;
                         }
                         if memo_on {
+                            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
                             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                             if pushed > 0 {
                                 frames.push(Frame {
@@ -3710,6 +3740,7 @@ fn search_impl(
                         pushed = 2;
                     }
                     if memo_on {
+                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
                         merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                         frames.push(Frame {
                             key: (it.cycle, it.next_input, it.st),
@@ -3738,6 +3769,7 @@ fn search_impl(
             if w != spec.expected[it.cycle as usize] {
                 stats.refuted += 1;
                 if memo_on {
+                    flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
                     merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                     close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                 }
@@ -3809,6 +3841,7 @@ fn search_impl(
                         stats.refuted += 1;
                         stats.look_refuted += 1;
                         if memo_on {
+                            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
                             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                             close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                         }
@@ -3846,6 +3879,7 @@ fn search_impl(
                         pushed = max as u32 + 1;
                     }
                     if memo_on {
+                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
                         merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                         frames.push(Frame {
                             key: (it.cycle, it.next_input, it.st),
@@ -3884,6 +3918,7 @@ fn search_impl(
             champion_cap_hit = true;
         }
         if memo_on {
+            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
             close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, true, spec.slots);
         }
