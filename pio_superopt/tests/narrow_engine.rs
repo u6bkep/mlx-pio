@@ -1268,3 +1268,153 @@ fn word_canon_battery_sound() {
         eprintln!("word_canon[{name}]: {merged} of 65536 words respelled, battery-verified");
     }
 }
+
+/// Champion-family mining for the static canonicalization program
+/// (journal 2026-07-13 afternoon). Runs a battery of solution-dense
+/// specs, enumerates FULL champion sets, fingerprints each champion's
+/// canonical program over an EXTENDED horizon (2x the spec trace —
+/// same-spec champions coincide on the spec trace by construction),
+/// and groups by fingerprint: a family with >1 champion is a
+/// missed-quotient candidate, raw material for pair-equivalence
+/// theorems (to be proven against the z3 mirror). Full dump (traces
+/// included, so offline analysis can also compare across battery
+/// entries and lengths) goes to
+/// /data/pio_optimization/runs/champ_mine.jsonl.
+/// `cargo test --release --test narrow_engine -- --ignored champion_family_mine --nocapture`
+#[test]
+#[ignore]
+fn champion_family_mine() {
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+    use std::io::Write;
+
+    let config = || Config {
+        pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 1, ..PinMap::default() },
+        ..Config::default()
+    };
+    let side = SideCfg::NONE;
+    let set = |data: u8, delay: u8| Insn { op: Op::Set { dst: SetDst::Pins, data }, delay, sideset: None };
+
+    // (name, reference insns, ref wrap_top, search slots, search wrap
+    // (bottom, top), cycles). References run under their OWN wrap so
+    // the expected trace is well-defined; the search runs the bracket.
+    struct Entry {
+        name: &'static str,
+        reference: Vec<Insn>,
+        ref_wrap_top: u8,
+        slots: u8,
+        wrap: (u8, u8),
+        cycles: u32,
+    }
+    let battery = vec![
+        Entry { name: "sq2_l2", reference: vec![set(1, 0), set(0, 0)], ref_wrap_top: 1, slots: 2, wrap: (0, 1), cycles: 17 },
+        Entry { name: "sq4_l2", reference: vec![set(1, 1), set(0, 1)], ref_wrap_top: 1, slots: 2, wrap: (0, 1), cycles: 25 },
+        Entry { name: "pulse14_l2", reference: vec![set(1, 0), set(0, 2)], ref_wrap_top: 1, slots: 2, wrap: (0, 1), cycles: 25 },
+        Entry { name: "sq2_l3", reference: vec![set(1, 0), set(0, 0)], ref_wrap_top: 1, slots: 3, wrap: (0, 2), cycles: 17 },
+        Entry { name: "sq4_l3", reference: vec![set(1, 1), set(0, 1)], ref_wrap_top: 1, slots: 3, wrap: (0, 2), cycles: 25 },
+        Entry { name: "pulse14_l3", reference: vec![set(1, 0), set(0, 2)], ref_wrap_top: 1, slots: 3, wrap: (0, 2), cycles: 25 },
+    ];
+
+    let mut dump = std::io::BufWriter::new(
+        std::fs::File::create("/data/pio_optimization/runs/champ_mine.jsonl").expect("dump file"),
+    );
+
+    for e in &battery {
+        // Expected trace from the reference under its own wrap.
+        let mut ref_spec = EngineSpec {
+            cfg: cfg_for(config(), 0, e.ref_wrap_top),
+            slots: e.reference.len() as u8,
+            cycles: e.cycles,
+            inputs: vec![],
+            output_pins: vec![0],
+            capture_pins: vec![0],
+            stim: Stim::default(),
+            irq_sets: vec![],
+            expected: vec![],
+            seed: vec![],
+            memo_cap: 0,
+        };
+        let reference = words_of(&e.reference, &side);
+        ref_spec.expected = run_spec(&ref_spec, reference);
+
+        let mut s = EngineSpec {
+            cfg: cfg_for(config(), e.wrap.0, e.wrap.1),
+            slots: e.slots,
+            cycles: e.cycles,
+            inputs: vec![],
+            output_pins: vec![0],
+            capture_pins: vec![0],
+            stim: Stim::default(),
+            irq_sets: vec![],
+            expected: ref_spec.expected.clone(),
+            seed: vec![],
+            memo_cap: 1 << 21,
+        };
+        let t = std::time::Instant::now();
+        let r = search(&s, 1 << 20);
+        assert_champions_sound(&s, &r.champions);
+
+        // Extended-horizon fingerprint: 2x the spec trace, plus the
+        // out-of-footprint flag (a program that walks OOB beyond the
+        // spec horizon is a distinct behavior class).
+        let mut ext = s.clone();
+        ext.cycles = e.cycles * 2;
+        let mut fams: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut lines = Vec::with_capacity(r.champions.len());
+        for (i, ch) in r.champions.iter().enumerate() {
+            let (trace, oob) = run_spec_oob(&ext, ch.words());
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            trace.hash(&mut h);
+            oob.hash(&mut h);
+            let f = h.finish();
+            fams.entry(f).or_default().push(i);
+            let dec: Vec<String> = (0..e.slots as usize).map(|s| format!("{:04x}", ch.decided[s])).collect();
+            let val: Vec<String> = (0..e.slots as usize).map(|s| format!("{:04x}", ch.value[s])).collect();
+            let tr: Vec<String> = trace.iter().map(|w| format!("{w:x}")).collect();
+            lines.push(format!(
+                "{{\"spec\":\"{}\",\"i\":{i},\"decided\":[{}],\"value\":[{}],\"binding_free\":{},\"oob\":{oob},\"fam\":\"{f:016x}\",\"trace\":[{}]}}",
+                e.name,
+                dec.iter().map(|d| format!("\"{d}\"")).collect::<Vec<_>>().join(","),
+                val.iter().map(|v| format!("\"{v}\"")).collect::<Vec<_>>().join(","),
+                ch.binding_free,
+                tr.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(","),
+            ));
+        }
+        for l in &lines {
+            writeln!(dump, "{l}").expect("dump write");
+        }
+
+        let mut sizes: Vec<usize> = fams.values().map(|v| v.len()).collect();
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        let multi: usize = fams.values().filter(|v| v.len() > 1).count();
+        eprintln!(
+            "champ-mine {}: items={} champions={} cap_hit={} in {:.1}s | families={} multi={} top_sizes={:?}",
+            e.name,
+            r.stats.items,
+            r.champions.len(),
+            r.champion_cap_hit,
+            t.elapsed().as_secs_f64(),
+            fams.len(),
+            multi,
+            &sizes[..sizes.len().min(8)],
+        );
+        // Print small multi-champion families in full — the readable
+        // theorem candidates; big ones go to the dump.
+        let mut shown = 0;
+        for (f, members) in &fams {
+            if members.len() < 2 || members.len() > 6 || shown >= 5 {
+                continue;
+            }
+            shown += 1;
+            eprintln!("  family {f:016x} ({} members):", members.len());
+            for &i in members {
+                let ch = &r.champions[i];
+                let w: Vec<String> = (0..e.slots as usize)
+                    .map(|s| format!("{:04x}/{:04x}", ch.value[s], ch.decided[s]))
+                    .collect();
+                eprintln!("    [{}] bf={}", w.join(" "), ch.binding_free);
+            }
+        }
+    }
+    eprintln!("champ-mine: dump at /data/pio_optimization/runs/champ_mine.jsonl");
+}

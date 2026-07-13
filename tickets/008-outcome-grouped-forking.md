@@ -65,6 +65,16 @@ STATUS "predicate-valued patterns".
    walk-side re-proof. Candidate: linear lock-step race transfer at
    cond-miss (no forking, ~44cy, kills the 7.4% flat-co_refute slice
    cheaply) — size its wall-clock before building.
+   **RE-EVALUATION TRIGGERS (user directive 2026-07-13): the 2x item
+   reduction (0..1 784M→388M, 1..1 716M→353M) is a SCALE-DEPENDENT
+   negative, not an absolute one. Re-run the 3b experiment (revert
+   the revert 95b1b32, gate on idle-box wall-clock) when EITHER
+   (a) searches move to substantially larger L — if the item
+   reduction compounds with depth while walk cost stays
+   leaf-depth-bounded, the trade flips — or (b) any hard
+   cycle-optimization pass lands on the evaluator (break-even is
+   steps/kill × ns/step vs items-saved × µs/item; a faster step()
+   moves it directly). Do not log-and-forget.**
 3c. **Adaptive walk budget (user, 2026-07-13) — MOOT while 3b is
    reverted**, but the two control knobs it would tune were
    identified empirically: where to fire (population kill-rate) and
