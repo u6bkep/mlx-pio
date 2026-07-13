@@ -1655,33 +1655,47 @@ impl ProbeLog {
 struct PairRace {
     /// Accept any single-cond conflict (word pair), not just delay bits.
     wide: bool,
+    /// Recurse through equal-state joint demand edges (fork both
+    /// machines with the same value, aggregate leaf verdicts) instead
+    /// of terminating there. Verdict lattice: BAD < INC < CO.
+    recurse: bool,
     /// All counters indexed by conflict kind: 0=delay, 1=arg, 2=opcode.
     checked: [u64; 3],
-    co_refuted: [u64; 3],
-    absorbed: [u64; 3],
-    diverged: [u64; 3],
-    one_refuted: [u64; 3],
-    demand_edge: [u64; 3],
-    /// Demand edge reached with the states already divergent (the
-    /// equal-state case can share the joint fork recursively; the
-    /// divergent case cannot).
-    demand_edge_diff: [u64; 3],
-    unconsulted: [u64; 3],
-    horizon: [u64; 3],
+    /// Aggregate CO: every leaf of the joint race tree co-refuted —
+    /// sharing the record with the prober would have been valid.
+    share_co: [u64; 3],
+    /// share_co sub-classification: race trees that wrote NO pin latch
+    /// (capture equality is structural) / consulted NO external input
+    /// (WAIT gpio/pin/irq, JMP PIN — schedule-resync instructions).
+    co_latch_quiet: [u64; 3],
+    co_ext_free: [u64; 3],
+    /// Aggregate BAD by first cause: a leaf's captures differed /
+    /// exactly one machine walked out of footprint.
+    bad_diverged: [u64; 3],
+    bad_one_refuted: [u64; 3],
+    /// Inconclusive by first cause: flat-mode equal-state demand edge /
+    /// demand edge with divergent states (no joint fork) / equal-state
+    /// edge whose two words demand different fields (conflict slot
+    /// executing) / trace end / step-or-depth budget.
+    inc_demand_eq: [u64; 3],
+    inc_demand_diff: [u64; 3],
+    inc_mismatch: [u64; 3],
+    inc_horizon: [u64; 3],
+    inc_budget: [u64; 3],
+    /// Leaf/tree telemetry: co-refuting leaves, their summed
+    /// cycles-from-probe, joint forks taken, absorption events (states
+    /// re-equalized after diverging).
+    leaves_co: [u64; 3],
+    cyc_leaf: [u64; 3],
+    joint_forks: [u64; 3],
+    absorb: [u64; 3],
+    /// Summed race-tree step counts (cost model for a lever built on
+    /// this walk shape).
+    steps_sum: [u64; 3],
     unbound_skip: u64,
     /// Wide-mode candidate whose patched spelling violated a sibling
     /// cond on the same slot (overlapping masks) — not raceable.
     patch_skip: u64,
-    /// co_refuted sub-classification: races whose window wrote NO pin
-    /// latch on either machine (capture equality is then structural),
-    /// and races that consulted NO external input (WAIT gpio/pin/irq,
-    /// JMP PIN — the schedule-resync instructions).
-    co_latch_quiet: [u64; 3],
-    co_ext_free: [u64; 3],
-    /// Summed cycles-from-probe until resolution, per class above.
-    cyc_co: [u64; 3],
-    cyc_ab: [u64; 3],
-    cyc_dv: [u64; 3],
 }
 
 const PAIR_KIND: [&str; 3] = ["delay", "arg", "opcode"];
@@ -1694,22 +1708,24 @@ impl PairRace {
                 continue;
             }
             eprintln!(
-                "pair-race {tag} [{}]: checked={} co_refuted={} (avg {:.1}cy, latch_quiet={}, ext_free={}) absorbed={} (avg {:.1}cy) diverged={} (avg {:.1}cy) one_refuted={} demand_edge={} (diff={}) unconsulted={} horizon={}",
+                "pair-race {tag} [{}]: checked={} share_co={} (latch_quiet={}, ext_free={}) bad_diverged={} bad_one_refuted={} inc_demand_eq={} inc_demand_diff={} inc_mismatch={} inc_horizon={} inc_budget={} | leaves_co={} (avg {:.1}cy) forks={} absorb={} steps_avg={:.0}",
                 PAIR_KIND[k],
                 self.checked[k],
-                self.co_refuted[k],
-                avg(self.cyc_co[k], self.co_refuted[k]),
+                self.share_co[k],
                 self.co_latch_quiet[k],
                 self.co_ext_free[k],
-                self.absorbed[k],
-                avg(self.cyc_ab[k], self.absorbed[k]),
-                self.diverged[k],
-                avg(self.cyc_dv[k], self.diverged[k]),
-                self.one_refuted[k],
-                self.demand_edge[k],
-                self.demand_edge_diff[k],
-                self.unconsulted[k],
-                self.horizon[k],
+                self.bad_diverged[k],
+                self.bad_one_refuted[k],
+                self.inc_demand_eq[k],
+                self.inc_demand_diff[k],
+                self.inc_mismatch[k],
+                self.inc_horizon[k],
+                self.inc_budget[k],
+                self.leaves_co[k],
+                avg(self.cyc_leaf[k], self.leaves_co[k]),
+                self.joint_forks[k],
+                self.absorb[k],
+                avg(self.steps_sum[k], self.checked[k]),
             );
         }
         eprintln!(
@@ -1808,135 +1824,295 @@ impl PairRace {
             1 // arg
         };
         self.checked[kind] += 1;
-        let (mut sa, mut sb) = (it.st, it.st);
-        let (mut na, mut nb) = (it.next_input, it.next_input);
-        let preload = spec.inputs.len() <= 4;
-        let start = it.cycle;
-        let mut cyc = it.cycle;
-        // The spellings start state-equal; the race is live only once
-        // the differing delay field is actually consulted (states
-        // diverge). Absorption = re-equalizing AFTER that.
-        let mut differed = false;
-        // Window facts for the co_refuted sub-classification.
-        let mut wrote_latch = false;
-        let mut ext_consult = false;
-        let verdict = loop {
-            if cyc >= spec.cycles {
-                break if differed { "horizon" } else { "unconsulted" };
-            }
-            if let Some(&m) = irq_at.get(&cyc) {
-                sa.irq_flags |= m;
-                sb.irq_flags |= m;
-            }
-            if !preload {
-                while (na as usize) < spec.inputs.len() && !sa.tx.is_full() {
-                    sa.tx.push(spec.inputs[na as usize]);
-                    na += 1;
-                }
-                while (nb as usize) < spec.inputs.len() && !sb.tx.is_full() {
-                    sb.tx.push(spec.inputs[nb as usize]);
-                    nb += 1;
-                }
-            }
-            let ext = stim_at(&spec.stim, cyc);
-            let ga = compose(&sa, spec.stim.mask, ext);
-            let gb = compose(&sb, spec.stim.mask, ext);
-            let fa = peek_tick(&sa, &cfg_a) && will_fetch(&sa, &cfg_a, ga);
-            let fb = peek_tick(&sb, &cfg_b) && will_fetch(&sb, &cfg_b, gb);
-            // Out-of-footprint fetch refutes (OOB rule).
-            let oa = fa && sa.pc as usize >= spec.slots as usize;
-            let ob = fb && sb.pc as usize >= spec.slots as usize;
-            if oa || ob {
-                break if oa && ob { "co_refuted" } else { "one_refuted" };
-            }
-            // An undecided field would fork here — the concrete race
-            // ends (words agree on all undecided bits, so a joint
-            // demand at equal states would stay joint; unequal states
-            // make this conservative).
-            if (fa && demand(it.decided[sa.pc as usize], cfg_a.code[sa.pc as usize], &cfg_a).is_some())
-                || (fb && demand(it.decided[sb.pc as usize], cfg_b.code[sb.pc as usize], &cfg_b).is_some())
-            {
-                break if differed { "demand_edge_diff" } else { "demand_edge" };
-            }
-            // Engine fork points demand() can't see: the delay
-            // post-fork (undecided delay bits at a completing fetch)
-            // and the deferred taken-JMP target fork (stage 1).
-            let fork_edge = |f: bool, st: &NState, cfg: &NCfg, g: u32| {
-                f && {
-                    let pc = st.pc as usize;
-                    it.decided[pc] & delay_mask != delay_mask
-                        || (cfg.code[pc] >> 13 == 0
-                            && it.decided[pc] & 0x001F != 0x001F
-                            && jmp_taken(cfg.code[pc], st, cfg, g))
-                }
-            };
-            if fork_edge(fa, &sa, &cfg_a, ga) || fork_edge(fb, &sb, &cfg_b, gb) {
-                break if differed { "demand_edge_diff" } else { "demand_edge" };
-            }
-            // External-schedule consults (WAIT any src, JMP PIN) by
-            // whichever word can execute this cycle.
-            for (st, cfg) in [(&sa, &cfg_a), (&sb, &cfg_b)] {
-                if st.delay_count == 0 && peek_tick(st, cfg) {
-                    let w = st.pending_exec.unwrap_or(cfg.code[st.pc as usize & 31]);
-                    if w >> 13 == 1 || (w >> 13 == 0 && (w >> 5) & 7 == 6) {
-                        ext_consult = true;
-                    }
-                }
-            }
-            let la = (sa.out_latch, sa.dir_latch, sb.out_latch, sb.dir_latch);
-            if clock_tick(&mut sa, &cfg_a) {
-                super::step(&mut sa, &cfg_a, ga);
-            }
-            if clock_tick(&mut sb, &cfg_b) {
-                super::step(&mut sb, &cfg_b, gb);
-            }
-            if (sa.out_latch, sa.dir_latch, sb.out_latch, sb.dir_latch) != la {
-                wrote_latch = true;
-            }
-            let ca = capture_word(&sa, &spec.capture_pins, spec.stim.mask, ext);
-            let cb = capture_word(&sb, &spec.capture_pins, spec.stim.mask, ext);
-            if ca != cb {
-                break "diverged";
-            }
-            let refuted = ca != spec.expected[cyc as usize];
-            cyc += 1;
-            if refuted {
-                break "co_refuted";
-            }
-            if sa != sb {
-                differed = true;
-            } else if differed {
-                break "absorbed";
-            }
+        let mut decided = it.decided;
+        let mut ctx = RaceCtx {
+            spec,
+            irq_at,
+            delay_mask,
+            preload: spec.inputs.len() <= 4,
+            recurse: self.recurse,
+            root_cyc: it.cycle,
+            steps: 0,
+            leaves_co: 0,
+            cyc_leaf: 0,
+            joint_forks: 0,
+            absorb: 0,
+            wrote_latch: false,
+            ext_consult: false,
+            bad_cause: "",
+            inc_cause: "",
         };
-        let dt = (cyc - start) as u64;
-        match verdict {
-            "co_refuted" => {
-                self.co_refuted[kind] += 1;
-                self.cyc_co[kind] += dt;
-                if !wrote_latch {
+        let rv = pair_race_walk(
+            &mut ctx,
+            &mut cfg_a,
+            &mut cfg_b,
+            &mut decided,
+            it.st,
+            it.st,
+            it.next_input,
+            it.next_input,
+            it.cycle,
+            0,
+        );
+        match rv {
+            RV_CO => {
+                self.share_co[kind] += 1;
+                if !ctx.wrote_latch {
                     self.co_latch_quiet[kind] += 1;
                 }
-                if !ext_consult {
+                if !ctx.ext_consult {
                     self.co_ext_free[kind] += 1;
                 }
             }
-            "absorbed" => {
-                self.absorbed[kind] += 1;
-                self.cyc_ab[kind] += dt;
-            }
-            "diverged" => {
-                self.diverged[kind] += 1;
-                self.cyc_dv[kind] += dt;
-            }
-            "one_refuted" => self.one_refuted[kind] += 1,
-            "demand_edge" => self.demand_edge[kind] += 1,
-            "demand_edge_diff" => self.demand_edge_diff[kind] += 1,
-            "unconsulted" => self.unconsulted[kind] += 1,
-            _ => self.horizon[kind] += 1,
+            RV_BAD => match ctx.bad_cause {
+                "one_refuted" => self.bad_one_refuted[kind] += 1,
+                _ => self.bad_diverged[kind] += 1,
+            },
+            _ => match ctx.inc_cause {
+                "demand_eq" => self.inc_demand_eq[kind] += 1,
+                "demand_diff" => self.inc_demand_diff[kind] += 1,
+                "mismatch" => self.inc_mismatch[kind] += 1,
+                "horizon" => self.inc_horizon[kind] += 1,
+                _ => self.inc_budget[kind] += 1,
+            },
         }
+        self.leaves_co[kind] += ctx.leaves_co;
+        self.cyc_leaf[kind] += ctx.cyc_leaf;
+        self.joint_forks[kind] += ctx.joint_forks;
+        self.absorb[kind] += ctx.absorb;
+        self.steps_sum[kind] += ctx.steps as u64;
         if self.checked.iter().sum::<u64>() % 4096 == 0 {
             self.print("tally");
+        }
+    }
+}
+
+/// Verdict lattice for the recursive pair race — aggregation over
+/// joint-fork children is `min()`.
+const RV_BAD: u8 = 0; // some leaf's outcomes genuinely differ
+const RV_INC: u8 = 1; // truth unknown (budget / divergent-state edge)
+const RV_CO: u8 = 2; // every leaf co-refuted: sharing was valid
+
+/// Total simulated cycles across the whole race tree, and joint-fork
+/// nesting depth. A capped race is INC, never a wrong verdict.
+const RACE_STEP_CAP: u32 = 16384;
+const RACE_DEPTH_CAP: u32 = 10;
+
+/// Borrowed context + per-race facts for `pair_race_walk`; the caller
+/// folds the facts into the per-kind tallies.
+struct RaceCtx<'a> {
+    spec: &'a EngineSpec,
+    irq_at: &'a FxMap<u32, u8>,
+    delay_mask: u16,
+    preload: bool,
+    recurse: bool,
+    root_cyc: u32,
+    steps: u32,
+    leaves_co: u64,
+    cyc_leaf: u64,
+    joint_forks: u64,
+    absorb: u64,
+    wrote_latch: bool,
+    ext_consult: bool,
+    bad_cause: &'static str,
+    inc_cause: &'static str,
+}
+
+impl RaceCtx<'_> {
+    fn bad(&mut self, cause: &'static str) -> u8 {
+        if self.bad_cause.is_empty() {
+            self.bad_cause = cause;
+        }
+        RV_BAD
+    }
+    fn inc(&mut self, cause: &'static str) -> u8 {
+        if self.inc_cause.is_empty() {
+            self.inc_cause = cause;
+        }
+        RV_INC
+    }
+}
+
+/// The fork the engine would take at a completing fetch, in engine
+/// order: fetch-time field demand, deferred taken-JMP target, delay
+/// post-fork. (The engine forks delay at completion, not fetch — the
+/// pre-fetch patch is equivalent because the word carries its delay
+/// and `step` consults it at completion; it only duplicates leaves
+/// when the instruction refutes before completing, costing budget.)
+enum RaceEdge {
+    None,
+    Demand(Field),
+    Target,
+    Delay,
+}
+
+fn race_edge(cfg: &NCfg, st: &NState, fetching: bool, g: u32, decided: &[u16; 32], delay_mask: u16) -> RaceEdge {
+    if !fetching {
+        return RaceEdge::None;
+    }
+    let pc = st.pc as usize;
+    let w = cfg.code[pc];
+    if let Some(f) = demand(decided[pc], w, cfg) {
+        return RaceEdge::Demand(f);
+    }
+    if w >> 13 == 0 && decided[pc] & 0x001F != 0x001F && jmp_taken(w, st, cfg, g) {
+        return RaceEdge::Target;
+    }
+    if decided[pc] & delay_mask != delay_mask {
+        return RaceEdge::Delay;
+    }
+    RaceEdge::None
+}
+
+/// Lock-step race of two one-slot-conflicting spellings from a shared
+/// core state, recursing through equal-state joint demand edges (both
+/// machines fork the SAME value — sound because the conflict bits are
+/// all decided, so the words agree on every undecided bit). Value
+/// enumeration is `values_into` for demanded fields and raw target /
+/// delay ranges for the deferred forks; engine canon prunes (P1/P2/P3/
+/// P4) are NOT applied, so the race explores a superset of the
+/// engine's subtree — spurious BAD on a pruned respelling undercounts
+/// shareability, never overcounts.
+#[allow(clippy::too_many_arguments)]
+fn pair_race_walk(
+    ctx: &mut RaceCtx,
+    cfg_a: &mut NCfg,
+    cfg_b: &mut NCfg,
+    decided: &mut [u16; 32],
+    mut sa: NState,
+    mut sb: NState,
+    mut na: u32,
+    mut nb: u32,
+    mut cyc: u32,
+    depth: u32,
+) -> u8 {
+    let mut differed = sa != sb || na != nb;
+    loop {
+        if ctx.steps >= RACE_STEP_CAP {
+            return ctx.inc("budget");
+        }
+        ctx.steps += 1;
+        if cyc >= ctx.spec.cycles {
+            return ctx.inc("horizon");
+        }
+        if let Some(&m) = ctx.irq_at.get(&cyc) {
+            sa.irq_flags |= m;
+            sb.irq_flags |= m;
+        }
+        if !ctx.preload {
+            while (na as usize) < ctx.spec.inputs.len() && !sa.tx.is_full() {
+                sa.tx.push(ctx.spec.inputs[na as usize]);
+                na += 1;
+            }
+            while (nb as usize) < ctx.spec.inputs.len() && !sb.tx.is_full() {
+                sb.tx.push(ctx.spec.inputs[nb as usize]);
+                nb += 1;
+            }
+        }
+        let ext = stim_at(&ctx.spec.stim, cyc);
+        let ga = compose(&sa, ctx.spec.stim.mask, ext);
+        let gb = compose(&sb, ctx.spec.stim.mask, ext);
+        let fa = peek_tick(&sa, cfg_a) && will_fetch(&sa, cfg_a, ga);
+        let fb = peek_tick(&sb, cfg_b) && will_fetch(&sb, cfg_b, gb);
+        // Out-of-footprint fetch refutes (OOB rule).
+        let oa = fa && sa.pc as usize >= ctx.spec.slots as usize;
+        let ob = fb && sb.pc as usize >= ctx.spec.slots as usize;
+        if oa || ob {
+            if oa && ob {
+                ctx.leaves_co += 1;
+                ctx.cyc_leaf += (cyc - ctx.root_cyc) as u64;
+                return RV_CO;
+            }
+            return ctx.bad("one_refuted");
+        }
+        let ea = race_edge(cfg_a, &sa, fa, ga, decided, ctx.delay_mask);
+        let eb = race_edge(cfg_b, &sb, fb, gb, decided, ctx.delay_mask);
+        if !matches!((&ea, &eb), (RaceEdge::None, RaceEdge::None)) {
+            if !ctx.recurse {
+                return ctx.inc(if differed { "demand_diff" } else { "demand_eq" });
+            }
+            if differed {
+                return ctx.inc("demand_diff");
+            }
+            if depth >= RACE_DEPTH_CAP {
+                return ctx.inc("budget");
+            }
+            // Equal states ⇒ equal pc; the two edges can still differ
+            // when the conflict slot itself is fetching (different
+            // words demand different fields) — no joint fork exists.
+            let pc = sa.pc as usize;
+            let (wa0, wb0, d0) = (cfg_a.code[pc], cfg_b.code[pc], decided[pc]);
+            let mut vals: Vec<u16> = Vec::new();
+            let fork_mask = match (ea, eb) {
+                (RaceEdge::Demand(a), RaceEdge::Demand(b)) if a.mask == b.mask && a.kind == b.kind => {
+                    a.values_into(cfg_a, &mut vals);
+                    a.mask
+                }
+                (RaceEdge::Target, RaceEdge::Target) => {
+                    vals.extend(0..ctx.spec.slots as u16);
+                    0x001F
+                }
+                (RaceEdge::Delay, RaceEdge::Delay) => {
+                    let max = ctx.delay_mask >> 8;
+                    vals.extend((0..=max).map(|v| v << 8));
+                    ctx.delay_mask
+                }
+                _ => return ctx.inc("mismatch"),
+            };
+            ctx.joint_forks += 1;
+            decided[pc] = d0 | fork_mask;
+            let mut agg = RV_CO;
+            for v in vals {
+                cfg_a.code[pc] = (wa0 & !fork_mask) | v;
+                cfg_b.code[pc] = (wb0 & !fork_mask) | v;
+                let rv = pair_race_walk(ctx, cfg_a, cfg_b, decided, sa, sb, na, nb, cyc, depth + 1);
+                agg = agg.min(rv);
+                if agg == RV_BAD {
+                    break;
+                }
+            }
+            cfg_a.code[pc] = wa0;
+            cfg_b.code[pc] = wb0;
+            decided[pc] = d0;
+            return agg;
+        }
+        // External-schedule consults (WAIT any src, JMP PIN) by
+        // whichever word can execute this cycle.
+        for (st, cfg) in [(&sa, &*cfg_a), (&sb, &*cfg_b)] {
+            if st.delay_count == 0 && peek_tick(st, cfg) {
+                let w = st.pending_exec.unwrap_or(cfg.code[st.pc as usize & 31]);
+                if w >> 13 == 1 || (w >> 13 == 0 && (w >> 5) & 7 == 6) {
+                    ctx.ext_consult = true;
+                }
+            }
+        }
+        let la = (sa.out_latch, sa.dir_latch, sb.out_latch, sb.dir_latch);
+        if clock_tick(&mut sa, cfg_a) {
+            super::step(&mut sa, cfg_a, ga);
+        }
+        if clock_tick(&mut sb, cfg_b) {
+            super::step(&mut sb, cfg_b, gb);
+        }
+        if (sa.out_latch, sa.dir_latch, sb.out_latch, sb.dir_latch) != la {
+            ctx.wrote_latch = true;
+        }
+        let ca = capture_word(&sa, &ctx.spec.capture_pins, ctx.spec.stim.mask, ext);
+        let cb = capture_word(&sb, &ctx.spec.capture_pins, ctx.spec.stim.mask, ext);
+        if ca != cb {
+            return ctx.bad("diverged");
+        }
+        let refuted = ca != ctx.spec.expected[cyc as usize];
+        cyc += 1;
+        if refuted {
+            ctx.leaves_co += 1;
+            ctx.cyc_leaf += (cyc - ctx.root_cyc) as u64;
+            return RV_CO;
+        }
+        if sa != sb || na != nb {
+            differed = true;
+        } else if differed {
+            ctx.absorb += 1;
+            differed = false;
         }
     }
 }
@@ -2368,8 +2544,9 @@ fn search_impl(
     let mut snap = if memo_on && instrument { snapshot_open() } else { None };
     let mut pair_race = if memo_on && instrument {
         let wide = std::env::var("PIO_NARROW_WORD_PAIR").is_ok();
-        if wide || std::env::var("PIO_NARROW_DELAY_PAIR").is_ok() {
-            Some(PairRace { wide, ..Default::default() })
+        let recurse = std::env::var("PIO_NARROW_PAIR_RECURSE").is_ok();
+        if wide || recurse || std::env::var("PIO_NARROW_DELAY_PAIR").is_ok() {
+            Some(PairRace { wide: wide || recurse, recurse, ..Default::default() })
         } else {
             None
         }
