@@ -18,28 +18,36 @@ log's mtime. **Magnitude gates need idle-box WALL-CLOCK, not item
 counts alone** (3b's item halving hid a 2.8x slowdown behind a
 contended baseline).
 
-## Ticket 008 — stages 1+2 landed; 3b TRIED AND REVERTED
+## Ticket 008 — stages 1+2 landed; walk chapter CLOSED (3b + 3d reverted)
 
 Stage 1 (12ec1cb): lazy JMP target demand. Stage 2 (89f97c9):
 junk-window collapse, 4.4x at L=3; delay-agnostic walk records
-(2a4c5fa). **Stage 3b (generalized subtree walk at cond-miss pops)
-REVERTED: items halved but wall-clock 2.8x WORSE** (0..1 27s→76s,
-2..2 10.3% vs 27% settled at 50min). Mechanism: the walk re-explores
-subtrees without memo/quotient/canon sharing (~563 steps/kill vs
-~100 break-even) and sibling pops re-walk overlapping futures. Full
-post-mortem + firing-policy lessons in ticket 008 §3b.
+(2a4c5fa). **3b (per-pop subtree walk) reverted: items halved,
+wall-clock 2.8x worse. 3d (once-per-family record generalization)
+reverted: ~zero cost but ZERO conversion** — census families group by
+(core, conflict slot+mask) while members differ freely on other
+decided bits, so the generalized record's conds (everything the
+family-wide walk consulted) match a near-empty sub-family. The 84.5%
+cond-miss transferability (probes KEPT: 96f0372/8e69ac8/456f829) is
+inherently PER-MEMBER; per-member re-proof is 3b. Full post-mortems:
+ticket 008 §3b/§3d. Remaining record-side idea = outcome-class conds
+(design B, big surgery) — parked.
 
-**What stands from the mining (probes KEPT, 96f0372+8e69ac8):**
-cross-opcode conflicts ≈ the whole post-stage-2 wall, and **84.5% of
-cond-miss subtrees provably co-refute** (770K joint-fork races, 100%
-latch-quiet). The transferability is real; the exploitable form is
-RECORD-side (weaken conds so probers hit without re-proving), not
-walk-side re-proof. Cheap candidate to size first: linear lock-step
-race transfer at cond-miss (no forking, ~44cy, covers the 7.4%
-flat-co_refute slice).
+## NEW DIRECTION (user, 2026-07-13): static canonicalization program
 
-**Next in 008:** stage 4 ISR_CNT provenance (now active); then
-one-shot Codex engine review (gpt-5.6-sol, single message).
+(1) Champion-rich targets at reachable lengths — solution-dense
+L=2-3 specs + existing exact censuses; dump full champion sets, group
+by EXTENDED-stimulus fingerprints (same-spec champions coincide on
+the spec trace by construction). (2) Pair canonicalization = 009 at
+arity 2: mine pair-enumeration fingerprint census + champion families
+for schema candidates, prove with the existing z3 mirror (bounded
+equivalence, UNSAT = theorem), land within-L sibling-dedup rules
+census-gated; length-reducing pair→single+delay = ladder subsumption
+(design doc first: wrap/jmp-target shifts). Static rules are blind to
+doomed-window equivalences (the wall) but shrink the space
+multiplicatively at zero runtime cost and compound toward L=4.
+Sequencing proposed to user; 008 stage 4 (ISR_CNT) + Codex review
+still queued.
 
 ## Emulator fidelity fixed (e4a4860, a810ec5) — holds
 

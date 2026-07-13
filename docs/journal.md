@@ -4,6 +4,42 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-13 (afternoon) — family-record lever tried & reverted; walk chapter CLOSED
+
+User approved the once-per-family walk-certified record generalization
+(built f5a7c2b on sizing that looked decisive: ~2K families, 65% of
+miss-mass killable, ~0.2s total walk cost). Three firing policies
+measured on the way (first-miss-per-entry: 7.5% kills + per-unit
+re-arming cost +50% wall in split; 256-miss threshold: 30% kills at
+~zero cost) and one real bug fixed (kills must insert the record at
+the ITEM's core — the frame system never keys one there). **Final
+verdict: zero conversion** (15-min sequential 2..2: 64 kills/190
+arms, items and hit-rate byte-flat) — REVERTED. Root cause is
+structural: census families group by (core, conflict slot+mask), but
+members differ freely on OTHER decided bits, and the walk's record
+must condition on everything its family-wide tree consulted — it
+covers only the near-empty sub-family agreeing with the walked item
+outside the conflict. **The 84.5% transferability is inherently
+per-member, and per-member re-proof is 3b — already uneconomical.
+The walk/record-generalization chapter is closed** (probes kept:
+PairRace 96f0372/8e69ac8, FamilyProbe 456f829). Remaining record-side
+idea = outcome-class conds (008 design B, big surgery) — parked.
+
+**Direction chosen (user, discussion): static canonicalization
+program** — (1) champion-rich targets at reachable lengths (censuses
+already give exact champion sets; solution-dense L=2-3 specs; group
+champions by extended-stimulus fingerprints, not just the spec
+trace); (2) pair canonicalization = 009 at arity 2 (within-L sibling
+dedup rules first; length-reducing pair→single+delay = ladder
+subsumption, needs a design doc for wrap/target shifts); (3) mine
+theorem candidates from output-grouped short-search dumps + pair
+enumeration fingerprint census, prove with the existing z3 mirror
+(bounded equivalence queries, UNSAT = theorem — no new prover).
+Static rules can't see the doomed-window (state-dependent)
+equivalences that dominate the wall, but they shrink the space
+multiplicatively everywhere at zero runtime cost and compound up the
+ladder toward L=4 rediscovery.
+
 ## 2026-07-13 (midday) — stage 3b REVERTED: item halving hid a 2.8x wall-clock loss
 
 The entry below celebrated 3b off a CONTENDED baseline (127s for

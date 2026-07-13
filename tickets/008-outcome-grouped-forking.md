@@ -70,26 +70,31 @@ STATUS "predicate-valued patterns".
    identified empirically: where to fire (population kill-rate) and
    when to give up (per-branch depth). Revisit only if a walk-shaped
    lever returns.
-3d. **SIZED 2026-07-13 (probe 456f829, 15-min 2..2 run): once-per-
-   family walk-certified record generalization.** Family census
-   (194M cond-misses): **95.2% single-conflict; distinct (core,
-   conflict-slot+mask) families ≈ only ~2K** (30 sampled at 1/64),
-   sizes wildly heavy-tailed (sampled mean 4K members, max 54.6K;
-   true mean ~96K/family — mega-families dominate the miss-mass).
-   Family walk (conflict mask UN-DECIDED, budget 8K, depth 128):
-   **65.4% of miss-mass killable at 6.4K steps/kill, ~119 leaves**;
-   failures = 50% budget-capped + 50% binding edges, ZERO surviving
-   branches, ZERO depth-cap. Economics: fired ONCE per family
-   (verdict cache), attempting every family costs ~15M steps ≈ 0.2s
-   total — noise — while converting ~65% of 184M single-conflict
-   misses/15min to memo hits (≈ item halving again, this time
-   without 3b's per-pop re-proof cost). Build notes: restore the
-   walk's consulted accounting (a1477f3 had it) so the kill inserts
-   the GENERALIZED record (walk-forked conflict bits carry no conds);
-   family verdict cache is per-worker, DFS-deterministic; raise
-   budget (16-32K) — budget failures are likely mega-families, the
-   most valuable; binding-edge families (17% of fired walks)
-   recoverable later by also walking the mirror twin.
+3d. **TRIED AND REVERTED (2026-07-13): once-per-family walk-certified
+   record generalization** (built f5a7c2b, reverted after the 15-min
+   conversion run). Sizing (probe 456f829): 95.2% of cond-misses are
+   single-conflict; ~2K distinct (core, conflict-slot+mask) families,
+   wildly heavy-tailed (true mean ~96K members); family walk with the
+   conflict UN-DECIDED kills 65.4% of miss-MASS at 6.4K steps.
+   Firing-policy iterations (each measured): first-miss-per-entry
+   arming = uniform-over-entries → 7.5% kills, and in split mode
+   re-arms per unit (+50% wall on 0..1); 256-miss threshold arming =
+   30% kills at ~zero cost. Kill path inserts the generalized record
+   directly at the item's core (the frame system alone never keys a
+   record there — first build bug). **CONVERSION VERDICT: zero.**
+   15-min sequential 2..2: 64 kills/190 arms, items and memo-hit rate
+   byte-flat vs baseline. **Root cause is structural, not tunable:
+   the census family groups members by (core, conflict slot+mask),
+   but members differ freely on OTHER decided bits; the walk's record
+   must carry conds on everything its (family-wide) tree consulted,
+   so it covers only the sub-family agreeing with the walked item
+   outside the conflict — nearly empty. The 84.5% transferability is
+   inherently PER-MEMBER (the pair race proved member-vs-record), and
+   per-member re-proof is 3b — already proven uneconomical.** The
+   walk/record-generalization chapter is CLOSED; the remaining
+   record-side idea is outcome-class conds (design B, big surgery).
+   Next direction chosen instead: static pair canonicalization + 
+   champion-family mining (user proposal, 2026-07-13 — see journal).
 4. ISR_CNT provenance (prov becomes a small field-SET: MOV→ISR
    resets, OUT→ISR sets from a field, IN accumulates a field).
    **NOW THE ACTIVE STAGE**, then the one-shot Codex engine review.
