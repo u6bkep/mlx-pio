@@ -2195,18 +2195,17 @@ fn junk_walk(
                 y_prov = p;
             }
         }
-        // A completed DECIDED delay is consulted (mirrors the main
-        // loop); an undecided one contributes no cond — the verdict is
-        // delay-independent — but it IS another shift point for the
-        // OOB horizon bound.
+        // A completed delay — DECIDED or not — contributes NO cond:
+        // the time-shift theorem makes the verdict independent of its
+        // value either way, so walk records are delay-AGNOSTIC (a
+        // reconvergent spelling with a different decided delay
+        // memo-hits instead of re-walking; measured pre-change: walks
+        // were 51% of engine cycles and decided-delay values were 50%
+        // of residual cond conflicts). Every crossing IS a shift point
+        // for the OOB horizon bound, since a prober's value may exceed
+        // the walked one by up to max_delay.
         if fetching && it.st.stall == Stall::None && delay_mask != 0 {
-            if it.decided[fetch_pc] & delay_mask == delay_mask {
-                if memo_on {
-                    w_mask[fetch_pc] |= delay_mask;
-                }
-            } else {
-                shift_points += 1;
-            }
+            shift_points += 1;
         }
     };
     if refuted && memo_on {
