@@ -4,6 +4,28 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-13 — memo purge-loop plateau fixed (perf finding 1/3)
+
+External perf review flagged the cap-hit purge in `close_child`: one
+bar-doubling + one full-table retain per qualifying insertion could
+retain nearly everything, making the NEXT insertion rescan the whole
+table (accidental O(insertions x memo_size)) and letting the table
+creep past `memo_cap`. Fix: purge extracted to `purge_memo` — the bar
+doubles and the retain repeats until the table is <= 7/8 of cap;
+if the bar saturates at u32::MAX with the table still over target
+(all survivors tie at max benefit) the whole table is cleared.
+Eviction is purely content-based (benefit vs bar; clear-all), never
+map-iteration-order-based, so split/sequential determinism holds.
+Table is now provably bounded by cap. Gates: 13/13 fast tests. New
+`tx_a_l3_22_mine_smallmemo` (#[ignore], memo_cap=1<<14, time-box
+externally) for purge-pressure measurement: 150s before/after on the
+2..2 bracket — 143.96M vs 144.39M items (+0.3%, noise), 10 purge
+passes each, max table 16,257/16,168 < 16,384 cap; the multi-pass
+path fired once early (purges=5, minben=128 at hb1 vs baseline 4/64)
+exactly where a single pass had left the table at ~94% of cap. This
+workload's benefit spread masks the worst case; the fix is hardening
+(bounded table + no rescan-per-insertion plateau) at zero cost.
+
 ## 2026-07-13 (late night) — wave 1 complete: 4/4 agent workstreams merged
 
 First parallel-worktree wave (user's new working mode), all merged

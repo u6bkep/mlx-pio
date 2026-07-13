@@ -1527,15 +1527,69 @@ fn merge_segment(fr: &mut Frame, seg_mask: &[u16; 32], seg_reads: u16, value: &[
     }
 }
 
-/// Account one completed child of the open frame; finalize frames whose
-/// subtrees are done — recording champion-free ones — and merge their
-/// (decided-filtered) conditions upward.
+/// Cap-hit purge: raise the benefit bar and evict until the table is
+/// comfortably under the cap.
 ///
 /// Records are benefit-gated: a subtree smaller than `min_benefit`
 /// items is not worth a table slot. When the table hits `memo_cap`,
-/// low-benefit records are purged and the bar quadruples — insertion
-/// never freezes, and the table converges on the records that each
-/// save the most work.
+/// the bar doubles and low-benefit records are purged, repeating
+/// until the table is at or below 7/8 of the cap — a single pass that
+/// retains nearly everything would otherwise make the NEXT qualifying
+/// insertion rescan the whole table again (O(insertions x memo_size)
+/// plateau) and let the table creep past the cap. Insertion never
+/// freezes, and the table converges on the records that each save the
+/// most work. If the bar saturates at u32::MAX and the table is still
+/// over target (every survivor ties at max benefit), the whole table
+/// is cleared: the memo is a failure-only cache, so dropping any —
+/// or all — records is sound, and both the benefit test and a full
+/// clear are functions of record content / search history alone,
+/// never of map iteration order, preserving split-vs-sequential
+/// determinism.
+fn purge_memo(
+    memo: &mut FxMap<KeyCore, MemoEntry>,
+    memo_cap: usize,
+    min_benefit: &mut u32,
+    stats: &mut Stats,
+) {
+    let target = memo_cap - memo_cap / 8;
+    loop {
+        let prev = *min_benefit;
+        *min_benefit = min_benefit.saturating_mul(2);
+        if *min_benefit == prev {
+            // Bar saturated: every remaining record ties at max
+            // benefit. Deterministic fallback — drop them all.
+            memo.clear();
+            stats.memo_entries = 0;
+            stats.memo_purges += 1;
+            return;
+        }
+        let mut kept = 0u64;
+        memo.retain(|_, entry| {
+            let mut any = false;
+            for (_, table) in entry.sets.iter_mut() {
+                table.retain(|_, list| {
+                    let n = list.retain_benefit(*min_benefit);
+                    kept += n as u64;
+                    n > 0
+                });
+                any |= !table.is_empty();
+            }
+            entry.sets.retain(|(_, t)| !t.is_empty());
+            any
+        });
+        stats.memo_entries = kept;
+        stats.memo_purges += 1;
+        if kept as usize <= target {
+            return;
+        }
+    }
+}
+
+/// Account one completed child of the open frame; finalize frames whose
+/// subtrees are done — recording champion-free ones — and merge their
+/// (decided-filtered) conditions upward. Records that clear the
+/// benefit bar go into the memo, purging on cap-hit (see
+/// [`purge_memo`]).
 fn close_child(
     frames: &mut Vec<Frame>,
     memo: &mut FxMap<KeyCore, MemoEntry>,
@@ -1579,24 +1633,7 @@ fn close_child(
                 if let Some(sn) = snap.as_mut() {
                     sn.write("purge", memo, *min_benefit, stats, frames);
                 }
-                // Purge low-benefit records; raise the bar.
-                *min_benefit = min_benefit.saturating_mul(2);
-                let mut kept = 0u64;
-                memo.retain(|_, entry| {
-                    let mut any = false;
-                    for (_, table) in entry.sets.iter_mut() {
-                        table.retain(|_, list| {
-                            let n = list.retain_benefit(*min_benefit);
-                            kept += n as u64;
-                            n > 0
-                        });
-                        any |= !table.is_empty();
-                    }
-                    entry.sets.retain(|(_, t)| !t.is_empty());
-                    any
-                });
-                stats.memo_entries = kept;
-                stats.memo_purges += 1;
+                purge_memo(memo, memo_cap, min_benefit, stats);
             }
             if benefit >= *min_benefit {
                 // The record's state pattern: fork-time values of the
