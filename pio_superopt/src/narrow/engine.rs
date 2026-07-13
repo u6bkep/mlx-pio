@@ -1214,6 +1214,24 @@ fn subsumes(a: &[u64], b: &[u64]) -> bool {
     true
 }
 
+/// One record's metadata: where its conds start in `packed`, its
+/// purge priority, and its binding domain.
+#[derive(Clone, Copy)]
+struct Rec {
+    /// Start of the record's conds in `packed`; record i ends where
+    /// record i+1 starts (the last at `packed.len()`).
+    start: u32,
+    benefit: u32,
+    /// True when any part of the recording frame's subtree executed
+    /// under a BOUND item (below a binding fork, or the fork itself):
+    /// the proof may depend on binding-asymmetric events crossed
+    /// concretely, so it refutes only the matching spelling. Such a
+    /// record must NOT refute an UNBOUND prober — the prober also
+    /// stands for its register-mirror twin, whose future diverges at
+    /// the asymmetric event and is unproven (S3, review 2026-07-13).
+    bound: bool,
+}
+
 /// A record list at one (core, read-mask, projected-values) key: every
 /// record's packed conds live in ONE contiguous buffer, so the probe's
 /// linear scan streams a single allocation instead of chasing a `Vec`
@@ -1222,9 +1240,7 @@ fn subsumes(a: &[u64], b: &[u64]) -> bool {
 #[derive(Default)]
 struct RecList {
     packed: Vec<u64>,
-    /// (start of the record's conds in `packed`, benefit); record i
-    /// ends where record i+1 starts (the last at `packed.len()`).
-    recs: Vec<(u32, u32)>,
+    recs: Vec<Rec>,
 }
 
 /// Max records per value-key: eviction keeps the highest benefits.
@@ -1241,8 +1257,8 @@ const REC_LIST_CAP: usize = 32;
 impl RecList {
     #[inline]
     fn conds_of(&self, i: usize) -> &[u64] {
-        let start = self.recs[i].0 as usize;
-        let end = self.recs.get(i + 1).map_or(self.packed.len(), |r| r.0 as usize);
+        let start = self.recs[i].start as usize;
+        let end = self.recs.get(i + 1).map_or(self.packed.len(), |r| r.start as usize);
         &self.packed[start..end]
     }
 
@@ -1260,7 +1276,7 @@ impl RecList {
                 d += 1;
                 continue;
             }
-            recs.push((packed.len() as u32, self.recs[i].1));
+            recs.push(Rec { start: packed.len() as u32, ..self.recs[i] });
             packed.extend_from_slice(self.conds_of(i));
         }
         self.packed = packed;
@@ -1269,16 +1285,21 @@ impl RecList {
 
     /// Insert a record with subsumption both ways and the list cap;
     /// returns the change in stored-record count (-cap evictions can
-    /// make it negative even on success).
-    fn insert(&mut self, conds: &Conds, benefit: u32) -> i64 {
+    /// make it negative even on success). Subsumption additionally
+    /// respects the binding domain: record A can only absorb record B
+    /// if A fires everywhere B would (`!A.bound || B.bound` — an
+    /// unbound-safe record serves strictly more probers than a bound
+    /// one). Skipping an absorption only costs list space, never
+    /// soundness.
+    fn insert(&mut self, conds: &Conds, benefit: u32, bound: bool) -> i64 {
         // An existing record that subsumes the new one fires strictly
         // more often: the new record adds nothing. Keep the higher
         // benefit as the survivor's purge priority.
         let new_packed: Vec<u64> = conds.iter().map(|&(s, m, v)| pack_cond(s, m, v)).collect();
         let mut benefit = benefit;
         for i in 0..self.recs.len() {
-            if subsumes(self.conds_of(i), &new_packed) {
-                self.recs[i].1 = self.recs[i].1.max(benefit);
+            if (!self.recs[i].bound || bound) && subsumes(self.conds_of(i), &new_packed) {
+                self.recs[i].benefit = self.recs[i].benefit.max(benefit);
                 return 0;
             }
         }
@@ -1287,29 +1308,30 @@ impl RecList {
         // frees room, so the cap only bites when `dead` is empty.
         let mut dead: Vec<usize> = Vec::new();
         for i in 0..self.recs.len() {
-            if subsumes(&new_packed, self.conds_of(i)) {
-                benefit = benefit.max(self.recs[i].1);
+            if (!bound || self.recs[i].bound) && subsumes(&new_packed, self.conds_of(i)) {
+                benefit = benefit.max(self.recs[i].benefit);
                 dead.push(i);
             }
         }
         if dead.is_empty() && self.recs.len() >= REC_LIST_CAP {
-            let (mi, &(_, mb)) = self
+            let (mi, mb) = self
                 .recs
                 .iter()
                 .enumerate()
-                .min_by_key(|&(_, &(_, b))| b)
+                .map(|(i, r)| (i, r.benefit))
+                .min_by_key(|&(_, b)| b)
                 .expect("cap > 0");
             if mb >= benefit {
                 return 0; // new record is the weakest: drop it
             }
             self.remove(&[mi]);
-            self.recs.push((self.packed.len() as u32, benefit));
+            self.recs.push(Rec { start: self.packed.len() as u32, benefit, bound });
             self.packed.extend_from_slice(&new_packed);
             return 0;
         }
         let removed = dead.len() as i64;
         self.remove(&dead);
-        self.recs.push((self.packed.len() as u32, benefit));
+        self.recs.push(Rec { start: self.packed.len() as u32, benefit, bound });
         self.packed.extend_from_slice(&new_packed);
         1 - removed
     }
@@ -1320,7 +1342,7 @@ impl RecList {
             .recs
             .iter()
             .enumerate()
-            .filter(|&(_, &(_, b))| b < bar)
+            .filter(|&(_, r)| r.benefit < bar)
             .map(|(i, _)| i)
             .collect();
         self.remove(&dead);
@@ -1358,7 +1380,16 @@ struct Frame {
     /// False when a record would be unsound: a binding fork below mixes
     /// runs from two root states (identity S, twin sigma(S)) under one
     /// key, or a value conflict surfaced in the consulted union.
+    /// Propagated to the parent at close (S2 fix): a poisoned child's
+    /// conds merge upward with clobbered/mixed-spelling values, so no
+    /// ancestor of a poisoned frame may record either.
     recordable: bool,
+    /// True when any part of this frame's subtree executed under a
+    /// BOUND item: the frame opened on a bound item, this IS a binding
+    /// fork's frame, or a binding fork closed below (propagated at
+    /// close). Stored on the record as `Rec::bound` — see there for
+    /// why such records must not refute unbound probers (S3 fix).
+    bound_seen: bool,
     /// `stats.items` when this frame opened; subtrees are contiguous in
     /// the DFS, so `stats.items - items_at_open` at finalize is exactly
     /// the subtree's item count — the record's benefit.
@@ -1482,12 +1513,18 @@ fn close_child(
                         &mut entry.sets.last_mut().unwrap().1
                     }
                 };
-                let delta = table.entry(vals).or_default().insert(&conds, benefit);
+                let delta = table.entry(vals).or_default().insert(&conds, benefit, f.bound_seen);
                 stats.memo_entries = (stats.memo_entries as i64 + delta) as u64;
             }
         }
         let parent = frames.last_mut().expect("synthetic root below every frame");
         parent.state_reads |= f.state_reads;
+        // Binding-domain and poison propagation (S2/S3 fixes): a
+        // subtree that touched bound items taints every ancestor's
+        // record the same way, and a poisoned frame's conds (merged
+        // below) are mixed-spelling — the parent must not record.
+        parent.bound_seen |= f.bound_seen;
+        parent.recordable &= f.recordable;
         for &(s, m, v) in &conds {
             parent.merge(s as usize, m, v);
         }
@@ -1760,7 +1797,7 @@ impl ProbeLog {
                     // condition of each record (cap 4).
                     let fails: Vec<String> = (0..list.recs.len().min(4))
                         .map(|i| {
-                            let benefit = list.recs[i].1;
+                            let benefit = list.recs[i].benefit;
                             let f = list.conds_of(i).iter().copied().find(|&p| {
                                 let (s, m, v) =
                                     ((p >> 32) as usize, (p >> 16) as u16, p as u16);
@@ -1882,6 +1919,9 @@ fn find_single_conflict(
         project_state(&it.st, mask, proj);
         if let Some(list) = table.get(proj.as_slice()) {
             'recs: for i in 0..list.recs.len() {
+                if list.recs[i].bound && it.unbound {
+                    continue; // mirrors the probe's binding-domain skip
+                }
                 let mut cand: Option<(usize, u16, u16)> = None;
                 for &p in list.conds_of(i) {
                     let (s, m, v) = ((p >> 32) as usize, (p >> 16) as u16, p as u16);
@@ -2838,7 +2878,7 @@ impl Snapshotter {
             for &(mask, ref table) in &entry.sets {
                 for (vals, list) in table {
                     for i in 0..list.recs.len() {
-                        let benefit = list.recs[i].1;
+                        let benefit = list.recs[i].benefit;
                         let conds_s: Vec<String> = list
                             .conds_of(i)
                             .iter()
@@ -2851,11 +2891,12 @@ impl Snapshotter {
                             .map_or("null".to_string(), |p| p.to_string());
                         let _ = writeln!(
                             w,
-                            "{{\"cycle\":{},\"ni\":{},\"pc\":{},\"delay\":{},\"stall\":\"{:?}\",\"pending\":{pending},\"clk\":{},\"out\":{},\"dir\":{},\"mask\":{mask},\"vals\":{:?},\"conds\":[{}],\"benefit\":{benefit}}}",
+                            "{{\"cycle\":{},\"ni\":{},\"pc\":{},\"delay\":{},\"stall\":\"{:?}\",\"pending\":{pending},\"clk\":{},\"out\":{},\"dir\":{},\"mask\":{mask},\"vals\":{:?},\"conds\":[{}],\"benefit\":{benefit},\"bound\":{}}}",
                             core.cycle, core.next_input, core.pc, core.delay_count,
                             core.stall, core.clk_acc, core.out_latch, core.dir_latch,
                             vals,
-                            conds_s.join(",")
+                            conds_s.join(","),
+                            list.recs[i].bound
                         );
                     }
                 }
@@ -3242,6 +3283,7 @@ fn search_impl(
         state_reads: 0,
         any_champion: false,
         recordable: false,
+        bound_seen: !root.unbound,
         items_at_open: 0,
     }];
 
@@ -3330,6 +3372,14 @@ fn search_impl(
                         stats.memo_recs_scanned += list.recs.len() as u64;
                         stats.memo_max_recs = stats.memo_max_recs.max(list.recs.len() as u64);
                         for i in 0..list.recs.len() {
+                            // S3 fix: a record proved under a bound
+                            // item refutes only its own spelling; an
+                            // unbound prober also stands for its
+                            // mirror twin, whose future the record
+                            // does not cover (see `Rec::bound`).
+                            if list.recs[i].bound && it.unbound {
+                                continue;
+                            }
                             let conds = list.conds_of(i);
                             if conds.iter().all(|&p| {
                                 let (s, m, v) =
@@ -3577,6 +3627,7 @@ fn search_impl(
                                 consulted_value: [0u16; 32],
                                 any_champion: false,
                                 recordable: true,
+                                bound_seen: !it.unbound,
                                 state_reads: 0,
                                 items_at_open: stats.items,
                             });
@@ -3639,6 +3690,7 @@ fn search_impl(
                                     consulted_value: [0u16; 32],
                                     any_champion: false,
                                     recordable: true,
+                                    bound_seen: !it.unbound,
                                     state_reads: 0,
                                     items_at_open: stats.items,
                                 });
@@ -3718,7 +3770,16 @@ fn search_impl(
                             consulted_mask: [0u16; 32],
                             consulted_value: [0u16; 32],
                             any_champion: false,
-                            recordable: true,
+                            // S2 fix: the two children run from two
+                            // roots (identity S, twin sigma(S)) with
+                            // two word spellings — the consulted union
+                            // does not describe one condition set at
+                            // one root, so this frame never records,
+                            // and (via close_child propagation)
+                            // neither does any ancestor.
+                            recordable: false,
+                            // Both children are bound from here on.
+                            bound_seen: true,
                             state_reads: 0,
                             items_at_open: stats.items,
                         });
@@ -3855,6 +3916,7 @@ fn search_impl(
                             consulted_value: [0u16; 32],
                             any_champion: false,
                             recordable: true,
+                            bound_seen: !it.unbound,
                             state_reads: 0,
                             items_at_open: stats.items,
                         });
