@@ -32,12 +32,16 @@ lose their undecided-delay conds). **L=3 0..1: 3.43B→785M items
 horizon-bounded per shift point (hole caught by the L=1 exact
 census). Post-collapse census: residual
 wall = SET-pair delay conds 50% + cross-opcode 41%; JMP-delay class
-GONE (47M→7K). **Demand hoisting tried and REVERTED** (+25% at L=3,
-mechanism not understood — see ticket 008 stage 3). Perf: no
-machinery tax (search_impl 73.8% flat). Next: cost-instrument the
-walk/frontier split, then cross-opcode outcome records; stage 4
-ISR_CNT provenance; then one-shot Codex engine review (gpt-5.6-sol).
-Gated 50-min 2..2 attempt running (txa_l3_22try.log).
+GONE (47M→7K). **Demand hoisting tried and REVERTED** (+25% at L=3);
+**delay-agnostic walk records landed 2a4c5fa (sound, measured
+~flat)**. Walk cost attributed: 51% of engine cycles, 90% refute.
+**MEASUREMENT LESSON: fail-bit histograms overstate class sizes —
+the '50% SET-delay wall' was ~3% of probers (28K/867K pair-races).
+Size the next class (cross-opcode outcome equivalence) by PAIR-RACE
+counts before building anything.** 2..2 baseline from the gated
+attempt: ~21% settled/25min at 28 threads (~2h full) — stage 3 needs
+~3x. b-srv0 (24c) available for parallel measurement (memory note).
+Then stage 4 ISR_CNT provenance + one-shot Codex engine review.
 
 ## Emulator fidelity fixed (e4a4860, a810ec5) — holds
 
