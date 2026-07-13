@@ -139,6 +139,11 @@ pub struct Stats {
     /// each is a whole delay-spelling family refuted by one
     /// representative walk (counted inside `refuted` too).
     pub look_refuted: u64,
+    /// junk_walk invocations and total cycles stepped inside them —
+    /// against `cycles_run` this attributes walk cost vs main-loop
+    /// cost (walks ending Unclean are calls − look_refuted).
+    pub walk_calls: u64,
+    pub walk_cycles: u64,
     /// Items refuted by a consulted-set memo hit (subtree skipped).
     pub memo_hits: u64,
     /// Probes whose key CORE matched at least one record (hit or not) —
@@ -2074,6 +2079,7 @@ fn junk_walk(
     seg_reads: &mut u16,
     mut x_prov: Prov,
     mut y_prov: Prov,
+    wcyc: &mut u64,
 ) -> bool {
     let mut it = *start;
     debug_assert_eq!(it.st.delay_count, 0, "walk starts at a completion");
@@ -2095,6 +2101,7 @@ fn junk_walk(
         if it.cycle >= end {
             return false; // horizon or cap: never conclude from a walk
         }
+        *wcyc += 1;
         if let Some(&m) = irq_at.get(&it.cycle) {
             it.st.irq_flags |= m;
         }
@@ -2345,7 +2352,7 @@ fn search_impl(
         }
         if instrument && last_beat.elapsed().as_secs() >= 10 {
             eprintln!(
-                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
+                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} walks={} wcyc={} cyc={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
                 stats.items,
                 stats.forks,
                 stats.refuted,
@@ -2353,6 +2360,9 @@ fn search_impl(
                 stats.canon_pruned,
                 stats.quotient_pruned,
                 stats.look_refuted,
+                stats.walk_calls,
+                stats.walk_cycles,
+                stats.cycles_run,
                 stats.memo_hits,
                 stats.memo_entries,
                 min_benefit,
@@ -2853,9 +2863,11 @@ fn search_impl(
                     // delay-spelling family when its window is clean
                     // (see junk_walk). Fires BEFORE the fork so the
                     // 8^k spelling subtree never exists.
+                    stats.walk_calls += 1;
                     if junk_walk(
                         spec, &cfg, &irq_at, &it, delay_mask, memo_on,
                         &mut seg_mask, &mut seg_reads, x_prov, y_prov,
+                        &mut stats.walk_cycles,
                     ) {
                         stats.refuted += 1;
                         stats.look_refuted += 1;
@@ -2967,6 +2979,8 @@ fn merge_stats(into: &mut Stats, s: &Stats) {
     into.quotient_pruned += s.quotient_pruned;
     into.oob_refuted += s.oob_refuted;
     into.look_refuted += s.look_refuted;
+    into.walk_calls += s.walk_calls;
+    into.walk_cycles += s.walk_cycles;
     into.memo_hits += s.memo_hits;
     into.memo_core_matches += s.memo_core_matches;
     into.memo_state_misses += s.memo_state_misses;
