@@ -8,7 +8,7 @@
 
 use pio_superopt::encode::encode_insn;
 use pio_superopt::ir::{Insn, JmpCond, Op, SetDst, SideCfg, WaitSrc};
-use pio_superopt::narrow::engine::{mirror_word, run_spec, run_spec_oob, search, EngineSpec};
+use pio_superopt::narrow::engine::{mirror_word, run_spec, run_spec_oob, run_spec_state, search, EngineSpec};
 use pio_superopt::narrow::{NCfg, Stim};
 use pio_superopt::program::{Config, PinMap, Program};
 
@@ -1354,25 +1354,59 @@ fn champion_family_mine() {
         let r = search(&s, 1 << 20);
         assert_champions_sound(&s, &r.champions);
 
-        // Extended-horizon fingerprint: 2x the spec trace, plus the
-        // out-of-footprint flag (a program that walks OOB beyond the
-        // spec horizon is a distinct behavior class).
+        // Extended-horizon, MULTI-CONTEXT fingerprint: 2x the spec
+        // trace under a battery of input contexts (the search specs
+        // are input-free, so a single-context fingerprint would group
+        // programs that only coincide on an empty FIFO — for protocol
+        // drivers the input data is as much of the behavior as the
+        // waveform). A family survives only if members agree under
+        // EVERY context. OOB flags included (walking out of footprint
+        // is a distinct behavior class).
         let mut ext = s.clone();
         ext.cycles = e.cycles * 2;
+        let input_battery: Vec<Vec<u32>> = vec![
+            vec![],
+            vec![0xA5A5_5A5A, 0x0F0F_F0F0, 0xDEAD_BEEF, 0x1234_5678],
+            vec![0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF],
+            vec![0x0000_0001, 0x8000_0000, 0x5555_5555, 0xCAFE_F00D],
+        ];
+        // Two family tiers: LOOSE = pin traces only (the externally
+        // observable behavior of the whole program — measures the
+        // redundancy prize); STRICT = traces + FINAL STATE per context
+        // (lemma-grade: an interchange rule is applied inside other
+        // programs, where downstream code reads registers/counters/
+        // FIFOs, so state must agree too).
         let mut fams: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut fams_strict: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut lines = Vec::with_capacity(r.champions.len());
         for (i, ch) in r.champions.iter().enumerate() {
-            let (trace, oob) = run_spec_oob(&ext, ch.words());
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            trace.hash(&mut h);
-            oob.hash(&mut h);
+            let mut hs = std::collections::hash_map::DefaultHasher::new();
+            let mut trace = Vec::new();
+            let mut oob = false;
+            for inputs in &input_battery {
+                let mut ctx = ext.clone();
+                ctx.inputs = inputs.clone();
+                let (t, o, fin) = run_spec_state(&ctx, ch.words());
+                t.hash(&mut h);
+                o.hash(&mut h);
+                t.hash(&mut hs);
+                o.hash(&mut hs);
+                fin.hash(&mut hs);
+                if inputs.is_empty() {
+                    trace = t;
+                    oob = o;
+                }
+            }
+            let fs = hs.finish();
+            fams_strict.entry(fs).or_default().push(i);
             let f = h.finish();
             fams.entry(f).or_default().push(i);
             let dec: Vec<String> = (0..e.slots as usize).map(|s| format!("{:04x}", ch.decided[s])).collect();
             let val: Vec<String> = (0..e.slots as usize).map(|s| format!("{:04x}", ch.value[s])).collect();
             let tr: Vec<String> = trace.iter().map(|w| format!("{w:x}")).collect();
             lines.push(format!(
-                "{{\"spec\":\"{}\",\"i\":{i},\"decided\":[{}],\"value\":[{}],\"binding_free\":{},\"oob\":{oob},\"fam\":\"{f:016x}\",\"trace\":[{}]}}",
+                "{{\"spec\":\"{}\",\"i\":{i},\"decided\":[{}],\"value\":[{}],\"binding_free\":{},\"oob\":{oob},\"fam\":\"{f:016x}\",\"sfam\":\"{fs:016x}\",\"trace\":[{}]}}",
                 e.name,
                 dec.iter().map(|d| format!("\"{d}\"")).collect::<Vec<_>>().join(","),
                 val.iter().map(|v| format!("\"{v}\"")).collect::<Vec<_>>().join(","),
@@ -1387,8 +1421,11 @@ fn champion_family_mine() {
         let mut sizes: Vec<usize> = fams.values().map(|v| v.len()).collect();
         sizes.sort_unstable_by(|a, b| b.cmp(a));
         let multi: usize = fams.values().filter(|v| v.len() > 1).count();
+        let mut ssizes: Vec<usize> = fams_strict.values().map(|v| v.len()).collect();
+        ssizes.sort_unstable_by(|a, b| b.cmp(a));
+        let smulti: usize = fams_strict.values().filter(|v| v.len() > 1).count();
         eprintln!(
-            "champ-mine {}: items={} champions={} cap_hit={} in {:.1}s | families={} multi={} top_sizes={:?}",
+            "champ-mine {}: items={} champions={} cap_hit={} in {:.1}s | loose: families={} multi={} top={:?} | strict(+state): families={} multi={} top={:?}",
             e.name,
             r.stats.items,
             r.champions.len(),
@@ -1396,12 +1433,16 @@ fn champion_family_mine() {
             t.elapsed().as_secs_f64(),
             fams.len(),
             multi,
-            &sizes[..sizes.len().min(8)],
+            &sizes[..sizes.len().min(6)],
+            fams_strict.len(),
+            smulti,
+            &ssizes[..ssizes.len().min(6)],
         );
-        // Print small multi-champion families in full — the readable
-        // theorem candidates; big ones go to the dump.
+        // Print small multi-champion STRICT families in full — the
+        // lemma-grade (state-inclusive) theorem candidates; big ones
+        // and the loose tier go to the dump.
         let mut shown = 0;
-        for (f, members) in &fams {
+        for (f, members) in &fams_strict {
             if members.len() < 2 || members.len() > 6 || shown >= 5 {
                 continue;
             }

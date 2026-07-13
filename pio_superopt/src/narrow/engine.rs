@@ -3823,3 +3823,65 @@ pub fn run_spec_oob(spec: &EngineSpec, code: [u16; 32]) -> (Vec<u32>, bool) {
     }
     (out, oob)
 }
+
+/// [`run_spec_oob`] plus the FINAL machine state. Interchange lemmas
+/// mined from behavior families must account for state, not just the
+/// pin trace: a whole program's only external observable is its pins,
+/// but a lemma is applied INSIDE other programs, where downstream code
+/// reads registers, shift counters, and FIFO state — so lemma-grade
+/// equivalence is outputs ∧ duration ∧ final state (over a context
+/// battery here; universally via the SMT mirror before engine use).
+pub fn run_spec_state(spec: &EngineSpec, code: [u16; 32]) -> (Vec<u32>, bool, NState) {
+    let mut cfg = spec.cfg.clone();
+    cfg.code = code;
+    let mut st = NState::new(&cfg);
+    for &p in &spec.output_pins {
+        st.dir_latch |= 1u32 << p;
+    }
+    let preload = spec.inputs.len() <= 4;
+    let mut next_input = 0usize;
+    if preload {
+        for &w in &spec.inputs {
+            st.tx.push(w);
+        }
+        next_input = spec.inputs.len();
+    }
+    let mut irq_at: FxMap<u32, u8> = FxMap::default();
+    for &(c, m) in &spec.irq_sets {
+        *irq_at.entry(c).or_insert(0u8) |= m;
+    }
+
+    let mut out = Vec::with_capacity(spec.cycles as usize);
+    let mut oob = false;
+    for cycle in 0..spec.cycles {
+        if let Some(&m) = irq_at.get(&cycle) {
+            st.irq_flags |= m;
+        }
+        if !preload {
+            while next_input < spec.inputs.len() && !st.tx.is_full() {
+                st.tx.push(spec.inputs[next_input]);
+                next_input += 1;
+            }
+        }
+        let ext = stim_at(&spec.stim, cycle);
+        let gpio_in = compose(&st, spec.stim.mask, ext);
+        oob |= peek_tick(&st, &cfg)
+            && will_fetch(&st, &cfg, gpio_in)
+            && st.pc >= spec.slots;
+        if clock_tick(&mut st, &cfg) {
+            super::step(&mut st, &cfg, gpio_in);
+        }
+        let levels = compose(&st, spec.stim.mask, ext);
+        let mut w = 0u32;
+        for (j, &p) in spec.capture_pins.iter().enumerate() {
+            if (levels >> p) & 1 != 0 {
+                w |= 1 << j;
+            }
+            if (st.dir_latch >> p) & 1 != 0 {
+                w |= 1 << (16 + j);
+            }
+        }
+        out.push(w);
+    }
+    (out, oob, st)
+}
