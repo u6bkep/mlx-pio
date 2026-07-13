@@ -3,7 +3,7 @@
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
 > Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-13 (night).
 
-## SOUNDNESS: all 6 review findings resolved; verdict campaign IN FLIGHT
+## SOUNDNESS: all 6 findings resolved; L=3 ladder RE-CERTIFIED
 
 Codex review (gpt-5.6-sol, one-shot) found 6 holes; all now fixed and
 merged with red-green adversarial micro-specs (gate suite 12 -> 17
@@ -21,9 +21,11 @@ merge + test comments); S5/S6 seeded-search guards (P2/P4 off in
 seeded slots; validate_seed whole-field check; 3 RED micro-specs).
 Purge plateau hardened (bounded multi-pass, provable cap). Early
 re-verify pre-S2/S3: 0..1 764.9M/29s, 1..1 698.4M/26s, verdicts hold.
-**Verdict campaign running (unit pio-verdicts,
-runs/verdict_campaign.log): 0..0 + all rest brackets on the fully
-repaired memo — lifts this caveat when 0..0/0..1/1..1 re-refute.**
+**Verdict campaign result: ALL THREE proven brackets RE-REFUTE on the
+repaired memo — 0..0 560.2M items/94s (was 5.33B/26min pre-stage-2:
+9.5x items, 17x wall from the day's compounded levers), 0..1
+781.9M/57s, 1..1 704.8M/38s. CAVEAT LIFTED for the proven brackets;
+2..2 settle-rate re-baseline in the same log.**
 
 ## Superposition (ticket 011) — v1 scope NEEDS RE-CUT after census
 
