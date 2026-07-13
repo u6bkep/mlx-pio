@@ -533,12 +533,32 @@ const NOP_CANON_MASK: u16 = 0xE0FF;
 /// (op none) are no-ops; (4) MOV from STATUS with status_n == 0 reads
 /// constant 0 ≡ NULL source; (5) SET to PINS/PINDIRS masks data to
 /// set_count bits (count 0 ⇒ no-op); (6) PUSH/PULL never read operand
-/// bits 0..4. The no-op representative is the class minimum:
+/// bits 0..4; (7) MOV op '::' on the NULL source is op none
+/// (reverse_bits(0) == 0); (8) a constant PC write takes the `pc_set`
+/// path exactly like a taken JMP-always: `mov pc, null` ≡ `jmp 0`
+/// (rep: the JMP — target 0 is enumerable in every space) and
+/// `jmp 31` ≡ `mov pc, !null` (rep: the MOV — the search never
+/// enumerates JMP targets outside the footprint, so the class canon
+/// must not leave the enumerated space); (9) when the SET window IS the
+/// OUT window (set_base == out_base, set_count == out_count <= 5), the
+/// all-zeros / all-ones SET PINS/PINDIRS performs the identical latch
+/// write as MOV PINS/PINDIRS from NULL / !NULL; (10) SET X/Y, 0 writes
+/// the same constant as MOV X/Y, NULL; (11) the IRQ wait bit is dead
+/// when the clear bit is set (`exec_op` reads `wait` only on the set
+/// path). The no-op representative is the class minimum:
 /// `mov pins, pins` (0xA000) when out_count == 0, else NOP_CANON.
 pub fn word_canon(w: u16, cfg: &NCfg) -> u16 {
     let ds = w & 0x1F00;
     let nop_rep = if cfg.out_count == 0 { 0xA000 | ds } else { NOP_CANON | ds };
     match (w >> 13) & 0x7 {
+        0 => {
+            // (8) `jmp 31` ≡ `mov pc, !null` (0xFFFF_FFFF & 0x1F).
+            if (w >> 5) & 0x7 == 0 && w & 0x001F == 0x001F {
+                0xA0AB | ds
+            } else {
+                w
+            }
+        }
         1 => {
             if (w >> 5) & 0x3 == 2 {
                 let r = super::resolve_irq_index((w & 0x1F) as u8, cfg.sm_id) as u16;
@@ -557,22 +577,35 @@ pub fn word_canon(w: u16, cfg: &NCfg) -> u16 {
         }
         4 => w & !0x001F,
         5 => {
-            let (dst, op, src) = ((w >> 5) & 0x7, (w >> 3) & 0x3, w & 0x7);
+            let (dst, mut op, mut src) = ((w >> 5) & 0x7, (w >> 3) & 0x3, w & 0x7);
             if (dst == 0 || dst == 3) && cfg.out_count == 0 {
                 return nop_rep;
             }
             if op == 0 && dst == src && (dst == 1 || dst == 2) {
                 return nop_rep;
             }
+            // (4) STATUS with status_n == 0 reads constant 0 ≡ NULL.
             if src == 5 && cfg.status_n == 0 {
-                (w & !0x0007) | 3
-            } else {
-                w
+                src = 3;
             }
+            // (7) '::' of the zero constant is the zero constant.
+            if src == 3 && op == 2 {
+                op = 0;
+            }
+            // (8) `mov pc, null` ≡ `jmp 0`; the !NULL twin keeps the
+            // MOV spelling (`jmp 31` folds INTO it below — a JMP
+            // target outside the footprint is never enumerated, so it
+            // cannot be a class representative).
+            if dst == 5 && src == 3 && op == 0 {
+                return ds;
+            }
+            (w & !0x001F) | (op << 3) | src
         }
         6 => {
             let r = super::resolve_irq_index((w & 0x1F) as u8, cfg.sm_id) as u16;
-            (w & !0x009F) | r
+            let c = (w & !0x009F) | r;
+            // (11) wait is consulted only when clear is unset.
+            if c & 0x0040 != 0 { c & !0x0020 } else { c }
         }
         7 => {
             let dst = (w >> 5) & 0x7;
@@ -581,7 +614,22 @@ pub fn word_canon(w: u16, cfg: &NCfg) -> u16 {
                     return nop_rep;
                 }
                 let m = (1u16 << cfg.set_count.min(5)) - 1;
-                (w & !0x001F) | (w & m)
+                let data = w & m;
+                // (9) window-coincident all-zeros/all-ones SET is the
+                // MOV PINS/PINDIRS, NULL / !NULL latch write.
+                if cfg.set_base == cfg.out_base
+                    && cfg.set_count == cfg.out_count
+                    && cfg.set_count <= 5
+                    && (data == 0 || data == m)
+                {
+                    let mov_dst = if dst == 0 { 0 } else { 3 << 5 };
+                    let mov_op = if data == 0 { 0 } else { 1 << 3 };
+                    return 0xA003 | ds | mov_dst | mov_op;
+                }
+                (w & !0x001F) | data
+            } else if (dst == 1 || dst == 2) && w & 0x001F == 0 {
+                // (10) SET X/Y, 0 ≡ MOV X/Y, NULL.
+                0xA003 | ds | (dst << 5)
             } else {
                 w
             }
