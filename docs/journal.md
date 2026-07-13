@@ -4,6 +4,34 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-13 (late evening) — two-tier census: input data & state both accounted
+
+User challenge: was 250K:1 an empty-FIFO artifact? Re-fingerprinted
+under a 4-context input battery + a STRICT tier adding the FINAL
+MACHINE STATE per context (df6bd51; run_spec_state added — lemma-grade
+equivalence is outputs ∧ duration ∧ state, since lemmas are applied
+inside programs whose downstream code reads state).
+**Input answer: NO artifact — 99.6-99.7% of the mega families survive
+input variation** (sq4_l3 top family 223,128→222,412; pulse14_l3
+248,978→248,262): these champions mostly never pull. Caveat stands
+for data-driven targets (nothing forced pulling here) → serializer
+specs still queued for the battery.
+**State answer: strict tier splits the mega families ~4-8x at the
+top, leaving still-enormous lemma-grade families** (sq4_l3: 190
+loose → 516 strict, top [62.6K, 43.3K, 34.4K, 27.8K]; pulse14_l3:
+67 → 549, top [71.4K, 62.2K, 34.4K x2]). The loose-minus-strict gap
+= output-equal/state-divergent programs = the deadness-conditioned
+world. Printed strict small families are directly readable
+conditioned lemmas: pin-writer spellings with equal state; jmp cond
+!x ≡ always under the x==0 loop invariant; OUT PINS count 26 ≡ 16
+under shift-counter saturation. User direction confirmed: lemmas
+must be state-inclusive; ALSO opened the data-plane-superposition
+design thread (put x/y/ISR/OSR/counters/FIFO — not control plane —
+in the item superposition with provenance-tag symbols; subsumes
+008-original outcome-grouping and gives multi-case specs; sizing
+first: field-kind fork attribution + strict-family field-diff
+classification).
+
 ## 2026-07-13 (evening) — champion-family census: 250,000:1 behavioral redundancy
 
 First step of the static canonicalization program (test
