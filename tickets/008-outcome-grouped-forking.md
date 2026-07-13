@@ -10,10 +10,24 @@ STATUS "predicate-valued patterns".
    consult time (taken execution), like delay. L=3 brackets −1.4/−1.6%
    items, L=2 +2% (vacuous jmp-to-ft walks to first-taken instead of
    dying at fetch — bounded; the untaken-fan saving scales with L).
-2. Outcome-grouped forking: value-set items (u32 bitmask per ≤5-bit
-   field, small fixed array per item, concrete-fork fallback), lazy
-   partition refinement at each re-consult via one-step outcome on a
-   scratch state.
+2. **RE-SCOPED by the delay-pair races (2026-07-12): time-shift-
+   invariant refutation lookahead ("junk-window collapse").**
+   Measured on 2..2 (28,672 sampled delay-conflict pairs, lock-step
+   races): 95.8% co_refuted at avg 60.5cy, of which 100% latch-quiet
+   and 99.95% external-free; ZERO diverged. Theorem: from state S, if
+   the walk (undecided delays as 0) to a capture/expected mismatch at
+   cycle F contains no pin-latch writes, no external-schedule
+   consults (WAIT any src, JMP PIN), and no non-delay fork edges,
+   then every spelling of every undecided delay field in the window
+   executes the same latch-quiet instruction sequence time-shifted ⇒
+   capture is the same static value on [t0,F] for all spellings ⇒
+   all refute at exactly F. Hook at the delay post-fork: one scratch
+   walk (cap ~128cy) refutes the entire 8^k delay-spelling subtree
+   outright; records carry NO delay conds (kills the 44% record wall
+   as a side effect). Walk must mirror the main loop's consulted/read
+   accounting for the memo. Fallback to normal forking on any unclean
+   window. The original value-set/outcome-class design attacks the
+   2.5% cond slice — demoted behind stage 3.
 3. Predicate-valued memo records on stage-2's interned partitions.
 4. ISR_CNT provenance (prov becomes a small field-SET: MOV→ISR
    resets, OUT→ISR sets from a field, IN accumulates a field).

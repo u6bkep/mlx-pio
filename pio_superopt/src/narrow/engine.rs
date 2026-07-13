@@ -135,6 +135,10 @@ pub struct Stats {
     /// (out-of-footprint execution is undefined behavior on hardware;
     /// counted inside `refuted` too).
     pub oob_refuted: u64,
+    /// Delay forks collapsed by the junk-window walk (008 stage 2):
+    /// each is a whole delay-spelling family refuted by one
+    /// representative walk (counted inside `refuted` too).
+    pub look_refuted: u64,
     /// Items refuted by a consulted-set memo hit (subtree skipped).
     pub memo_hits: u64,
     /// Probes whose key CORE matched at least one record (hit or not) —
@@ -1735,11 +1739,13 @@ impl DelayPair {
             }
         }
         let Some((slot, want)) = found else { return };
-        // An unbound prober stands for two programs; keep the race
-        // sample pure.
+        // An unbound prober stands for a program and its mirror from
+        // the same state — the mirror's race is the mirrored question
+        // with the same verdict, so racing the spelling as-is is a
+        // valid sample. Counted for the record (first 2..2 run: nearly
+        // ALL delay-conflict probers are unbound).
         if it.unbound {
             self.unbound_skip += 1;
-            return;
         }
         self.checked += 1;
 
@@ -2014,6 +2020,197 @@ fn fetch_footprint(decided: u16, value: u16, cfg: &NCfg) -> u16 {
     m
 }
 
+/// Does this word's execution read anything external-schedule-driven —
+/// stim pins or the cycle-scheduled IRQ environment? Such reads break
+/// the time-shift-invariance argument (their outcome depends on WHEN
+/// the instruction runs, not just machine state).
+fn reads_external(w: u16) -> bool {
+    match w >> 13 {
+        0 => (w >> 5) & 7 == 6, // JMP PIN
+        1 => true,              // WAIT gpio/pin/irq/jmppin
+        2 => (w >> 5) & 7 == 0, // IN PINS
+        5 => w & 7 == 0,        // MOV src PINS
+        6 => true,              // IRQ (flags are env-scheduled)
+        _ => false,
+    }
+}
+
+/// Cycle cap for the junk-window collapse walk (measured co-refutation
+/// distance on tx_a L=3: avg ~60 cycles).
+const JUNK_WALK_CAP: u32 = 192;
+
+/// 008 stage 2 — time-shift-invariant refutation lookahead
+/// ("junk-window collapse"), run at a delay post-fork BEFORE paying
+/// the fork. Walks the representative spelling (every undecided delay
+/// reads as 0 straight from the code word) up to `cap` cycles.
+/// Returns true — refuting the ENTIRE delay-spelling family outright —
+/// iff the walk hits a capture/expected mismatch or an out-of-
+/// footprint fetch through a CLEAN window: no pin-latch value changes,
+/// no external-schedule reads (`reads_external`), no fetch demand, no
+/// deferred-target or binding fork edge, no horizon/cap exit.
+///
+/// Soundness (mined on 2..2: 96% of delay-conflict pairs co-refute,
+/// 100% of those latch-quiet): in a clean window every spelling of
+/// every undecided delay executes the SAME instruction sequence, only
+/// time-shifted; with latches never changing value, the capture is one
+/// static word for all spellings, so the first expected-trace mismatch
+/// falls on the same absolute cycle for all of them — and a shifted
+/// spelling meets its own fork edges only at/after the representative
+/// refutation. An OOB fetch refutes shift-invariantly (same pc
+/// trajectory). On success the walk's consulted fields and state reads
+/// (accumulated exactly like the main loop's segment accounting, with
+/// undecided delay bits excluded BY the theorem) merge into the
+/// caller's segment; on an unclean exit nothing is merged and the
+/// caller forks normally.
+#[allow(clippy::too_many_arguments)]
+fn junk_walk(
+    spec: &EngineSpec,
+    cfg: &NCfg,
+    irq_at: &FxMap<u32, u8>,
+    start: &Item,
+    delay_mask: u16,
+    memo_on: bool,
+    seg_mask: &mut [u16; 32],
+    seg_reads: &mut u16,
+    mut x_prov: Prov,
+    mut y_prov: Prov,
+) -> bool {
+    let mut it = *start;
+    debug_assert_eq!(it.st.delay_count, 0, "walk starts at a completion");
+    let mut w_mask = [0u16; 32];
+    let mut w_reads = 0u16;
+    let preload = spec.inputs.len() <= 4;
+    let end = it.cycle.saturating_add(JUNK_WALK_CAP).min(spec.cycles);
+    // Undecided-delay completions crossed so far (the fork's own slot
+    // counts: its children shift by up to max_delay each). A capture
+    // mismatch refutes at the same ABSOLUTE cycle for every shifted
+    // spelling (static latches, absolute stim), but an OOB fetch is
+    // execution-POSITION-based: a spelling shifted past the horizon
+    // never leaves the footprint and is a valid program — so the OOB
+    // break is only family-valid when even the maximally shifted
+    // spelling still fetches OOB in-horizon.
+    let max_delay = (delay_mask >> 8) as u32;
+    let mut shift_points = 1u32;
+    let refuted = loop {
+        if it.cycle >= end {
+            return false; // horizon or cap: never conclude from a walk
+        }
+        if let Some(&m) = irq_at.get(&it.cycle) {
+            it.st.irq_flags |= m;
+        }
+        if !preload {
+            while (it.next_input as usize) < spec.inputs.len() && !it.st.tx.is_full() {
+                it.st.tx.push(spec.inputs[it.next_input as usize]);
+                it.next_input += 1;
+            }
+        }
+        let ext = stim_at(&spec.stim, it.cycle);
+        let gpio_in = compose(&it.st, spec.stim.mask, ext);
+        if memo_on && it.st.stall != Stall::None {
+            w_reads |= stall_state_reads(it.st.stall);
+        }
+        let fetching = peek_tick(&it.st, cfg) && will_fetch(&it.st, cfg, gpio_in);
+        let fetch_pc = it.st.pc as usize;
+        if fetching && fetch_pc >= spec.slots as usize {
+            if it.cycle + shift_points * max_delay < spec.cycles {
+                break true; // every shifted spelling also fetches OOB
+            }
+            return false; // a shifted spelling may outlive the horizon
+        }
+        if fetching {
+            if demand(it.decided[fetch_pc], it.value[fetch_pc], cfg).is_some() {
+                return false; // fetch-demand fork edge
+            }
+            if memo_on {
+                w_mask[fetch_pc] |=
+                    fetch_footprint(it.decided[fetch_pc], it.value[fetch_pc], cfg)
+                        & it.decided[fetch_pc];
+            }
+            let w = it.value[fetch_pc];
+            if w >> 13 == 0 && jmp_taken(w, &it.st, cfg, gpio_in) {
+                if it.decided[fetch_pc] & 0x001F != 0x001F {
+                    return false; // deferred-target fork edge
+                }
+                if memo_on {
+                    w_mask[fetch_pc] |= 0x001F;
+                }
+            }
+        }
+        let exec_word = it.st.pending_exec.unwrap_or(it.value[fetch_pc & 31]);
+        let exec_pending = it.st.pending_exec.is_some();
+        if it.st.delay_count == 0 && peek_tick(&it.st, cfg) {
+            if reads_external(exec_word) {
+                return false; // time-dependent read
+            }
+            if memo_on {
+                let r = word_state_reads(exec_word, cfg);
+                consume_reads(r, x_prov, y_prov, &mut w_reads, &mut w_mask);
+            }
+        }
+        if it.unbound && peek_tick(&it.st, cfg) {
+            let demands_binding = if !will_execute(&it.st, cfg, gpio_in) {
+                false
+            } else if let Some(w) = it.st.pending_exec {
+                word_touches_regs(w)
+            } else {
+                it.st.x != it.st.y && is_pull_empty_read(it.value[fetch_pc & 31], &it.st, cfg)
+            };
+            if demands_binding {
+                return false; // binding fork edge
+            }
+        }
+        let pre_delay = it.st.delay_count;
+        let ticked = clock_tick(&mut it.st, cfg);
+        let latches = (it.st.out_latch, it.st.dir_latch);
+        if ticked {
+            super::step(&mut it.st, cfg, gpio_in);
+        }
+        if (it.st.out_latch, it.st.dir_latch) != latches {
+            return false; // latch value change: window unclean
+        }
+        let w = capture_word(&it.st, &spec.capture_pins, spec.stim.mask, ext);
+        if w != spec.expected[it.cycle as usize] {
+            break true; // co-refutation of the whole family
+        }
+        it.cycle += 1;
+        let completed = ticked && pre_delay == 0 && it.st.stall == Stall::None;
+        if memo_on && completed {
+            let (wx, wy, imm) = word_reg_writes(exec_word);
+            let p = if imm && !exec_pending {
+                Prov::Field(fetch_pc as u8, 0x001F)
+            } else {
+                Prov::Accounted
+            };
+            if wx {
+                x_prov = p;
+            }
+            if wy {
+                y_prov = p;
+            }
+        }
+        // A completed DECIDED delay is consulted (mirrors the main
+        // loop); an undecided one contributes no cond — the verdict is
+        // delay-independent — but it IS another shift point for the
+        // OOB horizon bound.
+        if fetching && it.st.stall == Stall::None && delay_mask != 0 {
+            if it.decided[fetch_pc] & delay_mask == delay_mask {
+                if memo_on {
+                    w_mask[fetch_pc] |= delay_mask;
+                }
+            } else {
+                shift_points += 1;
+            }
+        }
+    };
+    if refuted && memo_on {
+        *seg_reads |= w_reads;
+        for s in 0..32 {
+            seg_mask[s] |= w_mask[s];
+        }
+    }
+    refuted
+}
+
 /// Exhaustive needed-narrowing search. Deterministic: DFS order is fixed
 /// by field order and value enumeration order (memo hits only skip
 /// subtrees that would have been fully refuted, so champions and
@@ -2148,13 +2345,14 @@ fn search_impl(
         }
         if instrument && last_beat.elapsed().as_secs() >= 10 {
             eprintln!(
-                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
+                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
                 stats.items,
                 stats.forks,
                 stats.refuted,
                 stats.prefiltered,
                 stats.canon_pruned,
                 stats.quotient_pruned,
+                stats.look_refuted,
                 stats.memo_hits,
                 stats.memo_entries,
                 min_benefit,
@@ -2650,6 +2848,23 @@ fn search_impl(
             if fetching && it.st.stall == Stall::None && delay_mask != 0 {
                 let undecided = it.decided[fetch_pc] & delay_mask != delay_mask;
                 if undecided && it.cycle < spec.cycles {
+                    // 008 stage 2 — junk-window collapse: one
+                    // representative walk refutes the whole
+                    // delay-spelling family when its window is clean
+                    // (see junk_walk). Fires BEFORE the fork so the
+                    // 8^k spelling subtree never exists.
+                    if junk_walk(
+                        spec, &cfg, &irq_at, &it, delay_mask, memo_on,
+                        &mut seg_mask, &mut seg_reads, x_prov, y_prov,
+                    ) {
+                        stats.refuted += 1;
+                        stats.look_refuted += 1;
+                        if memo_on {
+                            merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
+                            close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
+                        }
+                        continue 'items;
+                    }
                     let max = (1u16 << delay_bits) - 1;
                     let pushed;
                     // P3 delay-normal form: consecutive freshly-forked
@@ -2751,6 +2966,7 @@ fn merge_stats(into: &mut Stats, s: &Stats) {
     into.canon_pruned += s.canon_pruned;
     into.quotient_pruned += s.quotient_pruned;
     into.oob_refuted += s.oob_refuted;
+    into.look_refuted += s.look_refuted;
     into.memo_hits += s.memo_hits;
     into.memo_core_matches += s.memo_core_matches;
     into.memo_state_misses += s.memo_state_misses;
