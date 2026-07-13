@@ -1,71 +1,66 @@
 # STATUS — current frontier
 
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
-> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-13.
+> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-13 (night).
 
-## L=3 ladder: 3 of 6 REFUTED; monsters still gated on a real lever
+## Headline: realness tests point the monsters at DATA-PLANE SUPERPOSITION
 
-0..0 (5.33B items/26min), 0..1 (784.0M/27s), 1..1 (716.3M/24s)
-proven. Remaining: 2..2 / 1..2 / 0..2 (all-slots-live monsters).
-2..2 stage-2-engine baseline: 27% settled at the 50-min gate, 23.3B
-worker items (~3h full).
+Two measurements on the 2..2 wall (probes 2acc442, journal "night"):
+(1) **86.0%** of single-conflict cond-misses are output-equal but
+STATE-divergent (capture divergence 52/19.7M) — the wall is dead-state
+divergence downstream of data-plane forks; conditioned word-interchange
+lemmas cap at **13.3%**. (2) Fork attribution: Delay 44% (stage-2
+residue), **BitCount 28.6%, MovSrc 15.2%** — data-plane fields carry
+~35-45% of fork mass. **Next flagship: provenance-tag symbols for
+x/y/ISR/OSR/counters** (design → staged build; subsumes 008-original
+outcome-grouping; enables multi-case specs → RX flagship). Control
+plane (pc/delay/stall/latches/clkdiv) stays concrete.
 
-**Ops rules:** big searches serialized + gated — `systemd-run --user
--p MemoryMax=48G -p MemorySwapMax=0 -p RuntimeMaxSec=3000`. Any run
->50 min is too slow — build the lever instead. `systemctl --user`
-checks are unreliable from background monitor shells — watch the run
-log's mtime. **Magnitude gates need idle-box WALL-CLOCK, not item
-counts alone** (3b's item halving hid a 2.8x slowdown behind a
-contended baseline).
+## Working mode (user, 2026-07-13): parallel worktree waves
 
-## Ticket 008 — stages 1+2 landed; walk chapter CLOSED (3b + 3d reverted)
+Agents implement in isolated worktrees (specs + fast gates); merges
+serialize through review + idle-box verdict runs. Wave 1: pair census
+MERGED (47.2M canon-rep pairs → 684K strict fingerprints, ~69:1;
+99.68% mass cross-spelling — champion/L=4-side prize); 008 stage 4
+MERGED (912cb77: ISR_CNT CntProv provenance — bracket-neutral,
+−26% memo entries, first instance of the superposition tag pattern);
+009 gap check + data-driven serializer battery entries in flight.
 
-Stage 1 (12ec1cb): lazy JMP target demand. Stage 2 (89f97c9):
-junk-window collapse, 4.4x at L=3; delay-agnostic walk records
-(2a4c5fa). **3b (per-pop subtree walk) reverted: items halved,
-wall-clock 2.8x worse. 3d (once-per-family record generalization)
-reverted: ~zero cost but ZERO conversion** — census families group by
-(core, conflict slot+mask) while members differ freely on other
-decided bits, so the generalized record's conds (everything the
-family-wide walk consulted) match a near-empty sub-family. The 84.5%
-cond-miss transferability (probes KEPT: 96f0372/8e69ac8/456f829) is
-inherently PER-MEMBER; per-member re-proof is 3b. Full post-mortems:
-ticket 008 §3b/§3d. Remaining record-side idea = outcome-class conds
-(design B, big surgery) — parked.
+## L=3 ladder: 3 of 6 REFUTED; monsters await superposition
 
-## NEW DIRECTION (user, 2026-07-13): static canonicalization program
+0..0 (5.33B/26min), 0..1 (782.9M/29s), 1..1 (716.5M/26s, post-stage-4
+counts) proven. Monsters 2..2/1..2/0..2: 2..2 = 27% settled at the
+50-min gate on the stage-2 engine (~3h full).
 
-(1) Champion-rich targets at reachable lengths — solution-dense
-L=2-3 specs + existing exact censuses; dump full champion sets, group
-by EXTENDED-stimulus fingerprints (same-spec champions coincide on
-the spec trace by construction). (2) Pair canonicalization = 009 at
-arity 2: mine pair-enumeration fingerprint census + champion families
-for schema candidates, prove with the existing z3 mirror (bounded
-equivalence, UNSAT = theorem), land within-L sibling-dedup rules
-census-gated; length-reducing pair→single+delay = ladder subsumption
-(design doc first: wrap/jmp-target shifts). Static rules are blind to
-doomed-window equivalences (the wall) but shrink the space
-multiplicatively at zero runtime cost and compound toward L=4.
-Sequencing proposed to user; 008 stage 4 (ISR_CNT) + Codex review
-still queued.
+## Ticket 008: stages 1,2,4 landed; walk chapter closed (3b/3d
+reverted, post-mortems in ticket; 3b has USER-DIRECTED re-evaluation
+triggers: larger L, or any evaluator cycle-optimization pass).
 
-## Emulator fidelity fixed (e4a4860, a810ec5) — holds
+## Champion-family census (canonicalization program, step 1 done)
 
-MOV→ISR/OSR resets shift counter, OUT→ISR sets it, PUSH IFFULL/PULL
-IFEMPTY are guards. NOP_CANON = mov x,x. Old ≤4-word impossibility
-proof carries a caveat.
+Solution-dense battery: champion sets collapse ~250,000:1 (L=3);
+input variation splits only ~0.3% (output-only specs — serializer
+entries in flight); strict (+final state) tier still leaves 62K-71K
+member lemma-grade families. Readable conditioned lemmas surfaced
+(pin-writer spellings; jmp !x ≡ always @x==0; OUT count saturation).
+Dumps: runs/champ_mine.jsonl, runs/pair_census.jsonl.
 
-## Next (in expected-value order)
+## Ops rules
 
-1. **2..2 / monsters under stage 3b** → all-six-refuted ⇒ L=4 ladder.
-2. **008 stage 3c/4** + Codex engine review.
-3. **Ticket 010 + multi-case specs** (flagship RX prereq).
+Big searches serialized + gated (`systemd-run --user -p MemoryMax=48G
+-p MemorySwapMax=0 -p RuntimeMaxSec=3000`); >50 min = too slow, build
+the lever. Magnitude gates = idle-box WALL-CLOCK + item counts (±2s
+bracket noise observed; byte-identical code measured 24-49s across
+box states). `systemctl --user` unreliable from monitor shells — use
+log mtime. Worktree agents: smokes ≤150s single-threaded only.
 
-## Flagship (unchanged): phase-invariant RX
+## Queued
 
-Spec/oracle must quantify duty skew (±8ns measured / ±24 design) ×
-parked phase; battery = pio_harness/tests/rx_bench_repro.rs +
-ro_sampled fixtures. Engine needs multi-case specs first.
+Superposition design doc + staged build (flagship); Codex one-shot
+engine review (gpt-5.6-sol, single message, after wave 1 settles);
+ladder-subsumption design doc (length-reducing pair rules); monsters
+verdict once superposition lands. Then ticket 010 / multi-case specs
+→ phase-invariant RX.
 
 ## Shard twin — COMPLETE (2a3a2e7); hand shard_pio/ to Christian
 
