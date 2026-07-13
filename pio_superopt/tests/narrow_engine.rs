@@ -847,6 +847,37 @@ fn tx_a_l3_22_mine() {
     );
 }
 
+/// Purge-pressure variant of the mine: same 2..2 bracket but with a
+/// deliberately tiny memo cap (16K entries) so cap-hit purges fire
+/// constantly. Used to measure purge-loop behavior (counts, table
+/// size vs cap, wall clock) — time-box externally (e.g. `timeout
+/// 150`). `cargo test --release --test narrow_engine -- --ignored
+/// tx_a_l3_22_mine_smallmemo --nocapture`
+#[test]
+#[ignore]
+fn tx_a_l3_22_mine_smallmemo() {
+    let (mut spec4, side) = tx_a_spec(460);
+    let reference = tx_a_words(&side);
+    spec4.expected = run_spec(&spec4, reference);
+
+    let (mut s, _) = tx_a_spec(460);
+    s.slots = 3;
+    s.cfg.wrap_bottom = 2;
+    s.cfg.wrap_top = 2;
+    s.expected = spec4.expected;
+    s.memo_cap = 1 << 14;
+    let r = search(&s, 5);
+    eprintln!(
+        "L=3 wrap 2..2 (smallmemo): items={} refuted={} memo_hit={} memo_ent={} purges={} champions={}",
+        r.stats.items,
+        r.stats.refuted,
+        r.stats.memo_hits,
+        r.stats.memo_entries,
+        r.stats.memo_purges,
+        r.stats.champions_found
+    );
+}
+
 /// --ignored tx_a_l3_first --nocapture`
 #[test]
 #[ignore]

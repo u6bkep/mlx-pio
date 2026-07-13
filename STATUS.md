@@ -16,8 +16,11 @@ in flight: adversarial micro-spec + fix agents for S1 and S2/S3; then
 re-run all L=3 verdicts (0..0 26min + fast brackets). Full review
 text in the session transcript; findings being folded into tickets.
 Review also cleared: word_canon lemmas 7-11, CntProv local soundness,
-core determinism. Perf findings queued: purge-loop O(n²) plateau,
-per-unit workspace rebuild in split mode, probe projection caching.
+core determinism. Perf findings: purge-loop O(n²) plateau FIXED
+(purge now re-raises the bar until <=7/8 cap; deterministic clear-all
+fallback at u32::MAX saturation; table provably bounded by cap);
+still queued: per-unit workspace rebuild in split mode, probe
+projection caching.
 
 ## Headline: realness tests point the monsters at DATA-PLANE SUPERPOSITION
 
