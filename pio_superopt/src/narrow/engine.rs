@@ -144,12 +144,6 @@ pub struct Stats {
     /// cost (walks ending Unclean are calls − look_refuted).
     pub walk_calls: u64,
     pub walk_cycles: u64,
-    /// Generalized subtree walk (008 stage 3b): calls, whole-subtree
-    /// kills (each counted inside `refuted` too), and total simulated
-    /// cycles stepped inside walks.
-    pub swalk_calls: u64,
-    pub swalk_kills: u64,
-    pub swalk_cycles: u64,
     /// Items refuted by a consulted-set memo hit (subtree skipped).
     pub memo_hits: u64,
     /// Probes whose key CORE matched at least one record (hit or not) —
@@ -2449,269 +2443,6 @@ fn junk_walk(
     refuted
 }
 
-/// Generalized subtree walk (008 stage 3b, "junk-wall collapse"), run
-/// at a fork point BEFORE paying the fork. A bounded concrete DFS of
-/// the item's entire future: emulator steps only, forking every edge
-/// (fetch demand, deferred taken-JMP target, delay post-fork) over the
-/// FULL value enumeration — a strict superset of the engine's children
-/// (the canon prunes P1/P2/P3/P4, side pre-filter, and 009 sibling
-/// dedup all subset `values_into`), so "every walk leaf refutes"
-/// directly implies every engine leaf refutes: no theorem, the walk
-/// observes each refutation. Returns true — killing the item without
-/// forking — iff every branch hits a capture/expected mismatch or an
-/// out-of-footprint fetch within the step budget. Any surviving branch
-/// (horizon), budget exhaustion, or binding fork edge returns false
-/// and the caller forks normally.
-///
-/// Mined on 2..2 (recursive pair races, deep region): 84.5% of
-/// cross-opcode conflict subtrees fully co-refute, ~200 single-machine
-/// steps typical, budget-cap misses 29/770K at 16K steps.
-///
-/// Unlike junk_walk this needs no clean window: latch writes and
-/// external-schedule reads execute concretely. Consulted accounting
-/// matches the main loop; bits the WALK forked (undecided in the item)
-/// merge as no conds at all — they are universally quantified by the
-/// enumeration — via the final AND with the item's own decided mask.
-/// Binding edges abort exactly as in junk_walk: a completed walk saw
-/// no asymmetric event, so P1 mirror symmetry transfers the refutation
-/// to the unbound item's twin.
-const SUB_WALK_CAP: u32 = 768;
-/// Per-BRANCH depth cap, cycles from the walk root. A failed walk's
-/// cost is dominated by branches that must be walked far to disprove
-/// a kill; mined kill-tree leaves refute at ~63cy from the probe
-/// point, so a branch alive past this depth predicts an unkillable
-/// subtree — abort the walk there instead of grinding to the global
-/// budget. (Ungated fork-site firing measured 18% kills at 416 avg
-/// steps: walks cost more simulated cycles than the whole main loop.
-/// Firing at cond-miss pops targets the measured 84.5% population.)
-const SUB_WALK_DEPTH: u32 = 128;
-
-#[allow(clippy::too_many_arguments)]
-fn subtree_walk(
-    spec: &EngineSpec,
-    cfg: &NCfg,
-    irq_at: &FxMap<u32, u8>,
-    start: &Item,
-    delay_mask: u16,
-    memo_on: bool,
-    seg_mask: &mut [u16; 32],
-    seg_reads: &mut u16,
-    x_prov: Prov,
-    y_prov: Prov,
-    wcyc: &mut u64,
-) -> bool {
-    let mut wcfg = cfg.clone();
-    wcfg.code = start.value;
-    let mut decided = start.decided;
-    let mut w_mask = [0u16; 32];
-    let mut w_reads = 0u16;
-    let mut steps = 0u32;
-    let ok = sub_walk_rec(
-        spec,
-        irq_at,
-        delay_mask,
-        memo_on,
-        start.unbound,
-        start.cycle,
-        &mut wcfg,
-        &mut decided,
-        &mut w_mask,
-        &mut w_reads,
-        &mut steps,
-        start.st,
-        start.next_input,
-        start.cycle,
-        x_prov,
-        y_prov,
-    );
-    *wcyc += steps as u64;
-    if ok && memo_on {
-        *seg_reads |= w_reads;
-        for s in 0..32 {
-            seg_mask[s] |= w_mask[s] & start.decided[s];
-        }
-    }
-    ok
-}
-
-#[allow(clippy::too_many_arguments)]
-fn sub_walk_rec(
-    spec: &EngineSpec,
-    irq_at: &FxMap<u32, u8>,
-    delay_mask: u16,
-    memo_on: bool,
-    unbound: bool,
-    root_cyc: u32,
-    cfg: &mut NCfg,
-    decided: &mut [u16; 32],
-    w_mask: &mut [u16; 32],
-    w_reads: &mut u16,
-    steps: &mut u32,
-    mut st: NState,
-    mut next_input: u32,
-    mut cyc: u32,
-    mut x_prov: Prov,
-    mut y_prov: Prov,
-) -> bool {
-    let preload = spec.inputs.len() <= 4;
-    loop {
-        if *steps >= SUB_WALK_CAP || cyc >= spec.cycles || cyc - root_cyc >= SUB_WALK_DEPTH {
-            return false; // budget / surviving branch / branch alive too deep
-        }
-        *steps += 1;
-        if let Some(&m) = irq_at.get(&cyc) {
-            st.irq_flags |= m;
-        }
-        if !preload {
-            while (next_input as usize) < spec.inputs.len() && !st.tx.is_full() {
-                st.tx.push(spec.inputs[next_input as usize]);
-                next_input += 1;
-            }
-        }
-        let ext = stim_at(&spec.stim, cyc);
-        let gpio_in = compose(&st, spec.stim.mask, ext);
-        if memo_on && st.stall != Stall::None {
-            *w_reads |= stall_state_reads(st.stall);
-        }
-        let fetching = peek_tick(&st, cfg) && will_fetch(&st, cfg, gpio_in);
-        let fetch_pc = st.pc as usize;
-        if fetching && fetch_pc >= spec.slots as usize {
-            return true; // OOB refutes this branch (exact: concrete execution)
-        }
-        if fetching {
-            if let Some(field) = demand(decided[fetch_pc], cfg.code[fetch_pc], cfg) {
-                let mut values = Vec::new();
-                field.values_into(cfg, &mut values);
-                let (w0, d0) = (cfg.code[fetch_pc], decided[fetch_pc]);
-                decided[fetch_pc] = d0 | field.mask;
-                let mut all = true;
-                for v in values {
-                    cfg.code[fetch_pc] = w0 | v;
-                    if !sub_walk_rec(
-                        spec, irq_at, delay_mask, memo_on, unbound, root_cyc, cfg, decided, w_mask,
-                        w_reads, steps, st, next_input, cyc, x_prov, y_prov,
-                    ) {
-                        all = false;
-                        break;
-                    }
-                }
-                cfg.code[fetch_pc] = w0;
-                decided[fetch_pc] = d0;
-                return all;
-            }
-            if memo_on {
-                w_mask[fetch_pc] |=
-                    fetch_footprint(decided[fetch_pc], cfg.code[fetch_pc], cfg) & decided[fetch_pc];
-            }
-            let w = cfg.code[fetch_pc];
-            if w >> 13 == 0 && jmp_taken(w, &st, cfg, gpio_in) {
-                if decided[fetch_pc] & 0x001F != 0x001F {
-                    // Deferred-target fork: every in-footprint target.
-                    let d0 = decided[fetch_pc];
-                    decided[fetch_pc] = d0 | 0x001F;
-                    let mut all = true;
-                    for t in 0..spec.slots as u16 {
-                        cfg.code[fetch_pc] = w | t;
-                        if !sub_walk_rec(
-                            spec, irq_at, delay_mask, memo_on, unbound, root_cyc, cfg, decided, w_mask,
-                            w_reads, steps, st, next_input, cyc, x_prov, y_prov,
-                        ) {
-                            all = false;
-                            break;
-                        }
-                    }
-                    cfg.code[fetch_pc] = w;
-                    decided[fetch_pc] = d0;
-                    return all;
-                }
-                if memo_on {
-                    w_mask[fetch_pc] |= 0x001F;
-                }
-            }
-        }
-        let exec_word = st.pending_exec.unwrap_or(cfg.code[fetch_pc & 31]);
-        let exec_pending = st.pending_exec.is_some();
-        if st.delay_count == 0 && peek_tick(&st, cfg) {
-            if memo_on {
-                let r = word_state_reads(exec_word, cfg);
-                consume_reads(r, x_prov, y_prov, w_reads, w_mask);
-            }
-        }
-        if unbound && peek_tick(&st, cfg) {
-            let demands_binding = if !will_execute(&st, cfg, gpio_in) {
-                false
-            } else if let Some(w) = st.pending_exec {
-                word_touches_regs(w)
-            } else {
-                st.x != st.y && is_pull_empty_read(cfg.code[fetch_pc & 31], &st, cfg)
-            };
-            if demands_binding {
-                return false; // binding fork edge
-            }
-        }
-        let pre_delay = st.delay_count;
-        let ticked = clock_tick(&mut st, cfg);
-        if ticked {
-            super::step(&mut st, cfg, gpio_in);
-        }
-        let w = capture_word(&st, &spec.capture_pins, spec.stim.mask, ext);
-        if w != spec.expected[cyc as usize] {
-            return true; // leaf refuted
-        }
-        cyc += 1;
-        let completed = ticked && pre_delay == 0 && st.stall == Stall::None;
-        if memo_on && completed {
-            let (wx, wy, imm) = word_reg_writes(exec_word);
-            let p = if imm && !exec_pending {
-                Prov::Field(fetch_pc as u8, 0x001F)
-            } else {
-                Prov::Accounted
-            };
-            if wx {
-                x_prov = p;
-            }
-            if wy {
-                y_prov = p;
-            }
-        }
-        if fetching && st.stall == Stall::None && delay_mask != 0 {
-            if decided[fetch_pc] & delay_mask != delay_mask {
-                if cyc >= spec.cycles {
-                    // Completion on the final cycle keeps delay a
-                    // don't-care; the branch then survives (loop top).
-                    continue;
-                }
-                // Delay post-fork at completion, mirroring the engine:
-                // patch the word for later re-fetches AND set the live
-                // delay counter for this completion.
-                let (w0, d0) = (cfg.code[fetch_pc], decided[fetch_pc]);
-                let max = (delay_mask >> 8) as u16;
-                decided[fetch_pc] = d0 | delay_mask;
-                let mut all = true;
-                for v in 0..=max {
-                    cfg.code[fetch_pc] = (w0 & !delay_mask) | (v << 8);
-                    let mut stv = st;
-                    stv.delay_count = v as u8;
-                    if !sub_walk_rec(
-                        spec, irq_at, delay_mask, memo_on, unbound, root_cyc, cfg, decided, w_mask,
-                        w_reads, steps, stv, next_input, cyc, x_prov, y_prov,
-                    ) {
-                        all = false;
-                        break;
-                    }
-                }
-                cfg.code[fetch_pc] = w0;
-                decided[fetch_pc] = d0;
-                return all;
-            }
-            if memo_on {
-                // Completion consults the (already decided) delay.
-                w_mask[fetch_pc] |= delay_mask;
-            }
-        }
-    }
-}
-
 /// Exhaustive needed-narrowing search. Deterministic: DFS order is fixed
 /// by field order and value enumeration order (memo hits only skip
 /// subtrees that would have been fully refuted, so champions and
@@ -2852,7 +2583,7 @@ fn search_impl(
         }
         if instrument && last_beat.elapsed().as_secs() >= 10 {
             eprintln!(
-                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} walks={} wcyc={} sw={}/{} swcyc={} cyc={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
+                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} walks={} wcyc={} cyc={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
                 stats.items,
                 stats.forks,
                 stats.refuted,
@@ -2862,9 +2593,6 @@ fn search_impl(
                 stats.look_refuted,
                 stats.walk_calls,
                 stats.walk_cycles,
-                stats.swalk_kills,
-                stats.swalk_calls,
-                stats.swalk_cycles,
                 stats.cycles_run,
                 stats.memo_hits,
                 stats.memo_entries,
@@ -2901,7 +2629,6 @@ fn search_impl(
         // UNBOUND item with x != y also stands for its mirror twin
         // rooted at the SWAPPED state — such a hit is only valid if the
         // record read neither X nor Y (then it covers the twin too).
-        let mut sw_fire = false;
         if memo_on {
             let core = key_core(it.cycle, it.next_input, &it.st);
             let mirror_blocked = it.unbound && it.st.x != it.st.y;
@@ -2946,7 +2673,6 @@ fn search_impl(
                     PROBE_COND_MISS => stats.memo_cond_misses += 1,
                     _ => {}
                 }
-                sw_fire = outcome == PROBE_COND_MISS;
             }
             if let Some(pl) = probe_log.as_mut() {
                 if pl.count(it.cycle, outcome) {
@@ -2992,27 +2718,6 @@ fn search_impl(
         let mut seg_reads: u16 = 0;
         let mut x_prov = Prov::Fork;
         let mut y_prov = Prov::Fork;
-
-        // 008 stage 3b — generalized subtree walk at a COND-MISS pop: a
-        // record already refuted a sibling subtree from this exact core
-        // state, differing only in decided program bits (mined: 84.5%
-        // of these subtrees fully co-refute). Bounded concrete DFS of
-        // the item's own future — every branch refutes within the
-        // per-branch depth ⇒ the item dies without forking.
-        if sw_fire {
-            stats.swalk_calls += 1;
-            if subtree_walk(
-                spec, &cfg, &irq_at, &it, delay_mask, memo_on,
-                &mut seg_mask, &mut seg_reads, x_prov, y_prov,
-                &mut stats.swalk_cycles,
-            ) {
-                stats.refuted += 1;
-                stats.swalk_kills += 1;
-                merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
-                close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
-                continue 'items;
-            }
-        }
 
         while it.cycle < spec.cycles {
             // Deterministic per-cycle environment (idempotent, so a fork
@@ -3403,11 +3108,6 @@ fn search_impl(
                         }
                         continue 'items;
                     }
-                    // NOTE (stage 3b): no subtree walk here — the item
-                    // state is post-completion, so a walk from it covers
-                    // only the delay=0 spelling of the just-completed
-                    // slot, not the 8 children. The children get walk
-                    // coverage at their own next fork points.
                     let max = (1u16 << delay_bits) - 1;
                     let pushed;
                     // P3 delay-normal form: consecutive freshly-forked
@@ -3512,9 +3212,6 @@ fn merge_stats(into: &mut Stats, s: &Stats) {
     into.look_refuted += s.look_refuted;
     into.walk_calls += s.walk_calls;
     into.walk_cycles += s.walk_cycles;
-    into.swalk_calls += s.swalk_calls;
-    into.swalk_kills += s.swalk_kills;
-    into.swalk_cycles += s.swalk_cycles;
     into.memo_hits += s.memo_hits;
     into.memo_core_matches += s.memo_core_matches;
     into.memo_state_misses += s.memo_state_misses;

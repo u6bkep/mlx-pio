@@ -37,31 +37,9 @@ STATUS "predicate-valued patterns".
    cycle-local side pre-filter) made it WORSE (1.09B) — hypothesis
    wrong, mechanism not understood. Lesson: don't reorder fork
    decisions past the cycle-local prunes without cost attribution.
-3b. **RE-SCOPED by the recursive pair races (2026-07-13): generalized
-   subtree walk ("junk-wall collapse").** Cross-opcode conflict class
-   race-sized honestly (PairRace probe, 96f0372 + 8e69ac8): 770K
-   opcode-conflict races on 2..2, deep region — **84.5% share_co**
-   (whole joint subtree co-refutes, 100.0% latch-quiet), 2.2% bad
-   (nearly all one-side-OOB; true capture divergence 37/770K), 13.3%
-   mismatch (conflict slot executes, different field demands), budget
-   binds 29/770K at 16K steps. steps_avg=391 two-machine ⇒ ~200
-   single-machine. KEY INSIGHT: the race observes the prober refute
-   at every leaf — the record machine is redundant. Lever = bounded
-   concrete DFS of the item's own subtree at fork points (emulator
-   steps only, enumerate fork values, superset of engine enumeration
-   since canon prunes not applied): all leaves refute within budget ⇒
-   kill item without forking. No record needed, no theorem — direct
-   observation. Binding edge / surviving leaf / budget ⇒ fall back.
-   Keeps stage-2 junk_walk as the cheap fast path for pure delay
-   families. Undecided (walk-forked) bits contribute NO conds
-   (universally quantified); decided consulted bits merge as usual.
-   **Stage 3c (user, 2026-07-13): adaptive walk budget** — make the
-   step cap a runtime tunable driven by a value heuristic (kill-rate ×
-   steps-per-kill EMA per firing site), with occasional exploratory
-   deep walks during a run to re-probe whether longer walks pay.
-   Build after fixed-budget 3b proves out.
-4. ISR_CNT provenance (prov becomes a small field-SET: MOV→ISR
-   resets, OUT→ISR sets from a field, IN accumulates a field).
+   Next lever must start from a perf + item-class profile of the
+   stage-2 engine on 2..2; then predicate-valued records
+   (cross-opcode outcome classes, 45% of residual wall).
 4. ISR_CNT provenance (prov becomes a small field-SET: MOV→ISR
    resets, OUT→ISR sets from a field, IN accumulates a field).
 
