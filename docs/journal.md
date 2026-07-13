@@ -4,6 +4,50 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-13 (day) — 008 stage 3b: generalized subtree walk, 2x on stage 2
+
+**Morning: race-sized the cross-opcode class honestly** (the delay
+chapter's measurement lesson applied). PairRace probe = DelayPair
+generalized to ANY single decided-cond conflict, verdicts per kind
+(delay/arg/opcode), commit 96f0372. Flat 20-min deep mine on 2..2:
+opcode conflicts are 99.5% of raceable cond-misses, but 92% end
+INCONCLUSIVE at a demand edge — with states still EQUAL in all but
+24/709K. So the probe learned joint forks (8e69ac8): at an
+equal-state demand edge both machines fork the SAME value (sound:
+conflict bits all decided) and leaf verdicts aggregate (BAD<INC<CO).
+Deep-region result: **share_co 84.5% of 770K races, 100.0%
+latch-quiet, true divergence 37, budget-bind 29/770K at 16K steps,
+steps_avg 391 (~200 single-machine)**.
+
+**Key insight:** the race observes the PROBER refute at every leaf —
+the record machine is redundant. Lever = single-machine bounded
+concrete DFS ("generalized junk walk"): enumerate every fork edge
+over the full value set (superset of engine children: P1/P2/P3/P4,
+side pre-filter, 009 dedup all subset values_into) and kill the item
+when every branch refutes. No theorem — direct observation. User
+approved; also queued stage 3c: adaptive walk budgets (runtime
+kill-rate×cost heuristic + occasional deep probe walks).
+
+**Firing policy took three measured iterations** (a1477f3):
+1. Ungated at fetch-demand + target fork sites: 18% kills, 416 avg
+   steps, swcyc>main-loop cyc; split 0..1 catastrophically regressed
+   (652M items live at 11min vs 784M total baseline). Killed.
+2. Remaining-trace≤128 gate: NEVER fires — the search refutes early,
+   it.cycle never approaches the horizon. Dead code.
+3. **Cond-miss pop firing + per-branch depth cap 128** (failure cost
+   = proving a branch survives; bound it at ~2x the mined 63cy leaf
+   depth): 89% kill rate, search becomes walk-dominated (main loop
+   cyc 33M vs walk 10.7B in the smoke; junk_walk nearly extinct).
+
+**Magnitude gate: L=3 0..1 784.0M→388.1M items in 76s; 1..1
+716.3M→353.1M in 68s; champions=0 both; all 12 fast gates pass**
+(both exact censuses, memo on/off, split-vs-sequential). 2..2 gated
+attempt launched on the 3b engine (txa_l3_swalk_gate2.log).
+Commits: 96f0372, 8e69ac8, a1477f3.
+
+Ops note: `systemctl --user is-active` is unreliable from background
+monitor shells (false inactive) — watch the run log's mtime instead.
+
 ## 2026-07-13 (small hours, later) — hoisting tried & reverted; wall re-censused
 
 Post-collapse mining (fresh 15-min instrumented 2..2 run): the old
