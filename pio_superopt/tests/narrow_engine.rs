@@ -586,6 +586,91 @@ fn memo_on_off_equivalence() {
     }
 }
 
+/// S1 soundness gate (external review, 2026-07-13): `Prov::Field`
+/// provenance is SEGMENT-LOCAL (reset to `Prov::Fork` at every item
+/// pop) while `fetch_footprint` deliberately omits SET's 5-bit
+/// immediate. When a decided `set x, imm` executes, a fork on an
+/// UNRELATED field ends the segment, and a descendant segment reads X,
+/// the read arrives at enclosing frames as a bare SC_X state read. An
+/// enclosing frame whose KEY state predates the SET (x already washed,
+/// immediate-independent) then records with NO condition on the
+/// immediate field — and a later sibling carrying a DIFFERENT decided
+/// immediate falsely hits the record, refuting a subtree that contains
+/// a champion.
+///
+/// Forced topology (4 slots, everything seeded except three fields):
+///   slot0: set x, <imm undecided>        — the sibling fork (F_set)
+///   slot1: jmp pin, <target undecided>   — stim pin LOW on pass 1
+///          (untaken: target stays undecided, no fork), HIGH on pass 2
+///          (taken: deferred-target fork = the segment cut landing
+///          between the re-executed SET and the read)
+///   slot2: mov x, null; <delay undecided> — washes X, then its delay
+///          post-fork is the ENCLOSING frame: key state has x == 0,
+///          immediate-independent, with the immediate already decided
+///   slot3: mov pins, x                   — the read, reached only via
+///          the pass-2 jmp target
+/// Trace = the witness run (imm=2, target=3, delay=0): survivors must
+/// emit x & 3 == 2 at cycle 6, so verdicts DIFFER by immediate. Memo
+/// off finds the imm ≡ 2 (mod 4) champions; the DFS explores imm=31
+/// first, whose fully-refuted subtree records at the delay-fork frame —
+/// if that record lacks the immediate cond, every later imm ≡ 2
+/// sibling's delay=0 child falsely hits it and the champions vanish.
+#[test]
+fn memo_set_immediate_conditions_survive_fork_boundary() {
+    let config = Config {
+        pins: PinMap { out_base: 0, out_count: 2, in_base: 0, ..PinMap::default() },
+        jmp_pin: 4,
+        ..Config::default()
+    };
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config, 0, 3),
+        slots: 4,
+        cycles: 8,
+        inputs: vec![],
+        output_pins: vec![0, 1],
+        capture_pins: vec![0, 1],
+        stim: Stim { mask: 1 << 4, values: vec![0, 0, 0, 0, 0, 1 << 4] },
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![
+            (0, 0xFFE0, 0xE020), // set x, <imm undecided>; delay 0
+            (1, 0xFFE0, 0x00C0), // jmp pin, <target undecided>; delay 0
+            (2, 0xE0FF, 0xA023), // mov x, null; <delay undecided>
+            (3, 0xFFFF, 0xA001), // mov pins, x
+        ],
+        memo_cap: 0,
+    };
+    // Witness: imm=2, target=3, delay=0. Pass 1 (pin low) falls
+    // through the jmp and washes X; pass 2 (pin high, cycle 5) takes
+    // the jmp straight from the re-executed SET to the reader, which
+    // emits x & 3 == 2 at cycle 6.
+    let mut w = words_of(&[], &SideCfg::NONE);
+    w[0] = 0xE022;
+    w[1] = 0x00C3;
+    w[2] = 0xA023;
+    w[3] = 0xA001;
+    spec.expected = run_spec(&spec, w);
+    let off = search(&spec, 1000);
+    assert_champions_sound(&spec, &off.champions);
+    assert!(off.stats.champions_found > 0, "witness not rediscovered with memo off");
+    spec.memo_cap = 1 << 20;
+    let on = search(&spec, 1000);
+    assert_eq!(
+        off.champions, on.champions,
+        "memo changed the champion set: SET-immediate provenance lost across a fork boundary (S1)"
+    );
+    assert_eq!(off.stats.champions_found, on.stats.champions_found);
+    assert_eq!(off.champion_cap_hit, on.champion_cap_hit);
+    eprintln!(
+        "s1 gate: off items={} champs={} | on items={} champs={} hits={}",
+        off.stats.items,
+        off.stats.champions_found,
+        on.stats.items,
+        on.stats.champions_found,
+        on.stats.memo_hits
+    );
+}
+
 /// The P1 binding fork, exercised end to end. PULL nonblocking on an
 /// empty TX FIFO reads PHYSICAL X — the one register asymmetry in the
 /// ISA — so an item whose x != y must fork into its two register
