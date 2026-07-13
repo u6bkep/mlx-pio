@@ -4,6 +4,38 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-13 (evening) — champion-family census: 250,000:1 behavioral redundancy
+
+First step of the static canonicalization program (test
+champion_family_mine, 0f58474; dump champ_mine.jsonl 265MB with full
+extended traces). Solution-dense battery, full champion enumeration,
+extended-horizon (2x) fingerprint grouping:
+sq2_l2 217→1 family; sq4_l2 224→1; pulse14_l2 217→1;
+**sq4_l3 223,223 champions → 37 families, top = 223,128 (99.96%)**;
+**pulse14_l3 248,978 → 1 family**. sq2_l3 = 0 champions (correct
+parity impossibility: a wrap-0..2 loop cannot toggle at period 2 —
+proven in 0.3s). 36 sq4_l3 tail families (95 champions) match the
+spec trace but DIVERGE on the extended horizon — spec-coincident
+impostors; the extended fingerprint is mandatory for theorem mining.
+
+Mega-family structure (analyze_champ_fams.py): multiplicity is NOT
+delay spelling (sq4_l3: 223,128 distinct even modulo delay fields;
+all 8 opcodes appear in every slot; 88 opcode shapes). It decomposes
+as (a) DEAD-EFFECT instructions — OUT/IN/MOV/SET/IRQ/passing-WAIT
+whose written state is never observed downstream — each ≡ nop with
+the same latency; (b) equivalent pin-writers (set pins,1 ≡ mov
+pins,!null ≡ mov pins,!x @x=0 ≡ mov pins,!osr @osr=0); (c) delay
+placement across dead runs (P3 generalization / static time-shift).
+KEY IMPLICATION: the engine's demand mechanism forks decode fields at
+EXECUTION even when the write target is dead — "consulted ≠
+mattered" on the champion side, the same gap as the memo cond wall.
+Class (a) dominates and is CONTEXT-dependent (deadness), which static
+pair lemmas cannot fold — it is exactly ticket 008's ORIGINAL design
+(outcome-grouped forking / value-set items), now with a measured
+250,000:1 prize on solution-dense specs. Static lemmas still own the
+state-independent slice (b): why does 009's word quotient NOT fold
+set pins,1 with mov pins,!null? — cheap gap-check queued first.
+
 ## 2026-07-13 (afternoon) — family-record lever tried & reverted; walk chapter CLOSED
 
 User approved the once-per-family walk-certified record generalization
