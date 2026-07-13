@@ -1651,6 +1651,384 @@ impl ProbeLog {
 ///   horizon     — trace end reached after the delta was expressed
 /// Tallies stream to stderr every 4096 checks — a time-boxed kill
 /// (50-min policy) loses nothing.
+/// Scan `entry` for a record ALL of whose conds the prober satisfies
+/// except exactly one value conflict in one searched slot — confined
+/// to the slot's delay bits unless `wide`. The patched spelling must
+/// satisfy every cond of that record (a sibling cond on the same slot
+/// with an overlapping mask can be violated by the patch —
+/// `patch_skip` counts those). Returns the conflicting cond.
+#[allow(clippy::too_many_arguments)]
+fn find_single_conflict(
+    spec: &EngineSpec,
+    entry: &MemoEntry,
+    it: &Item,
+    delay_mask: u16,
+    wide: bool,
+    mirror_blocked: bool,
+    proj: &mut Vec<u32>,
+    patch_skip: &mut u64,
+) -> Option<(usize, u16, u16)> {
+    for &(mask, ref table) in &entry.sets {
+        if mirror_blocked && mask & (SC_X | SC_Y) != 0 {
+            continue;
+        }
+        proj.clear();
+        project_state(&it.st, mask, proj);
+        if let Some(list) = table.get(proj.as_slice()) {
+            'recs: for i in 0..list.recs.len() {
+                let mut cand: Option<(usize, u16, u16)> = None;
+                for &p in list.conds_of(i) {
+                    let (s, m, v) = ((p >> 32) as usize, (p >> 16) as u16, p as u16);
+                    if it.decided[s] & m != m {
+                        continue 'recs; // undecided demand, not a pure pair
+                    }
+                    let conflict = (it.value[s] & m) ^ v;
+                    if conflict == 0 {
+                        continue;
+                    }
+                    if cand.is_some()
+                        || (!wide && conflict & !delay_mask != 0)
+                        || s >= spec.slots as usize
+                    {
+                        continue 'recs;
+                    }
+                    cand = Some((s, m, v));
+                }
+                if let Some((s, m, v)) = cand {
+                    let patched = (it.value[s] & !m) | v;
+                    let ok = list.conds_of(i).iter().all(|&p| {
+                        let (s2, m2, v2) = ((p >> 32) as usize, (p >> 16) as u16, p as u16);
+                        s2 != s || patched & m2 == v2
+                    });
+                    if !ok {
+                        *patch_skip += 1;
+                        continue 'recs;
+                    }
+                    return Some((s, m, v));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Family census + family-walk probe (`PIO_NARROW_FAMILY_CENSUS`,
+/// instrumented sequential search only; measurement only — the search
+/// is unchanged). Sizes the walk-certified record generalization
+/// (ticket 008 §3b post-mortem):
+///
+/// (1) FAMILY SIZE — how many single-conflict cond-miss probers share
+/// one (record core, conflict slot+mask) family. The lever would pay
+/// ONE family walk and convert every later member into a memo hit, so
+/// this distribution IS the economic case. Families are hash-sampled:
+/// ALL members of 1/2^shift of families are counted — unbiased sizes
+/// at bounded memory (`PIO_NARROW_FAMILY_CENSUS=<shift>`).
+///
+/// (2) `PIO_NARROW_FAMILY_WALK=<stride>` — every stride-th
+/// single-conflict miss, run the single-machine subtree walk with the
+/// conflicting mask UN-DECIDED (the lever's exact proof obligation:
+/// the walk's own demand/target/delay fork machinery re-forks those
+/// bits over all legal values, so a kill certifies the WHOLE family)
+/// and tally kill rate, steps, and failure causes.
+struct FamilyProbe {
+    sample_mask: u64,
+    families: FxMap<u64, u32>,
+    misses: u64,
+    single: u64,
+    patch_skip: u64,
+    walk_stride: u64,
+    walk_calls: u64,
+    walk_kills: u64,
+    walk_steps_kill: u64,
+    walk_steps_fail: u64,
+    walk_leaves_kill: u64,
+    fail_budget: u64,
+    fail_depth: u64,
+    fail_surv: u64,
+    fail_bind: u64,
+}
+
+impl FamilyProbe {
+    fn new(shift: u32, walk_stride: u64) -> Self {
+        FamilyProbe {
+            sample_mask: (1u64 << shift.min(32)) - 1,
+            families: FxMap::default(),
+            misses: 0,
+            single: 0,
+            patch_skip: 0,
+            walk_stride,
+            walk_calls: 0,
+            walk_kills: 0,
+            walk_steps_kill: 0,
+            walk_steps_fail: 0,
+            walk_leaves_kill: 0,
+            fail_budget: 0,
+            fail_depth: 0,
+            fail_surv: 0,
+            fail_bind: 0,
+        }
+    }
+
+    fn print(&self, tag: &str) {
+        let mut hist = [0u64; 16];
+        let (mut members, mut max) = (0u64, 0u32);
+        for &c in self.families.values() {
+            members += c as u64;
+            max = max.max(c);
+            hist[(32 - c.leading_zeros()).min(15) as usize] += 1;
+        }
+        let fams = self.families.len() as u64;
+        eprintln!(
+            "family-census {tag}: misses={} single={} ({:.1}%) patch_skip={} | sampled(1/{}) fams={} members={} mean={:.1} max={} hist(2^k)={:?}",
+            self.misses,
+            self.single,
+            self.single as f64 * 100.0 / self.misses.max(1) as f64,
+            self.patch_skip,
+            self.sample_mask + 1,
+            fams,
+            members,
+            members as f64 / fams.max(1) as f64,
+            max,
+            &hist[1..12],
+        );
+        if self.walk_stride > 0 {
+            eprintln!(
+                "family-walk {tag}: calls={} kills={} ({:.1}%) steps_kill_avg={:.0} steps_fail_avg={:.0} leaves_kill_avg={:.1} fail{{budget={} depth={} surv={} bind={}}}",
+                self.walk_calls,
+                self.walk_kills,
+                self.walk_kills as f64 * 100.0 / self.walk_calls.max(1) as f64,
+                self.walk_steps_kill as f64 / self.walk_kills.max(1) as f64,
+                self.walk_steps_fail as f64 / (self.walk_calls - self.walk_kills).max(1) as f64,
+                self.walk_leaves_kill as f64 / self.walk_kills.max(1) as f64,
+                self.fail_budget,
+                self.fail_depth,
+                self.fail_surv,
+                self.fail_bind,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check(
+        &mut self,
+        spec: &EngineSpec,
+        irq_at: &FxMap<u32, u8>,
+        entry: &MemoEntry,
+        it: &Item,
+        cfg: &NCfg,
+        core: &KeyCore,
+        delay_mask: u16,
+        mirror_blocked: bool,
+        proj: &mut Vec<u32>,
+    ) {
+        self.misses += 1;
+        let Some((slot, cmask, _cval)) = find_single_conflict(
+            spec, entry, it, delay_mask, true, mirror_blocked, proj, &mut self.patch_skip,
+        ) else {
+            return;
+        };
+        self.single += 1;
+        // Family key: (record core state, conflict slot+mask).
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        core.hash(&mut h);
+        (slot as u8, cmask).hash(&mut h);
+        let key = h.finish();
+        if key & self.sample_mask == 0 {
+            *self.families.entry(key).or_insert(0) += 1;
+        }
+        if self.walk_stride > 0 && self.single % self.walk_stride == 0 {
+            self.walk_calls += 1;
+            let mut wcfg = cfg.clone();
+            wcfg.code = it.value;
+            let mut decided = it.decided;
+            decided[slot] &= !cmask; // the family walk's whole point
+            let mut w = FamWalk {
+                spec,
+                irq_at,
+                delay_mask,
+                preload: spec.inputs.len() <= 4,
+                unbound: it.unbound,
+                root_cyc: it.cycle,
+                steps: 0,
+                leaves: 0,
+                cause: "",
+            };
+            let killed = fam_walk_rec(&mut w, &mut wcfg, &mut decided, it.st, it.next_input, it.cycle, 0);
+            if killed {
+                self.walk_kills += 1;
+                self.walk_steps_kill += w.steps as u64;
+                self.walk_leaves_kill += w.leaves as u64;
+            } else {
+                self.walk_steps_fail += w.steps as u64;
+                match w.cause {
+                    "budget" => self.fail_budget += 1,
+                    "depth" => self.fail_depth += 1,
+                    "binding" => self.fail_bind += 1,
+                    _ => self.fail_surv += 1,
+                }
+            }
+        }
+        if self.single % (1 << 21) == 0 {
+            self.print("tally");
+        }
+    }
+}
+
+/// Family-walk budget: whole-tree step cap and per-branch depth (the
+/// tree is a family wider than 3b's per-member walks, so the step cap
+/// is larger; branch DEPTH does not grow with family width).
+const FAM_WALK_CAP: u32 = 8192;
+const FAM_WALK_DEPTH: u32 = 128;
+
+struct FamWalk<'a> {
+    spec: &'a EngineSpec,
+    irq_at: &'a FxMap<u32, u8>,
+    delay_mask: u16,
+    preload: bool,
+    unbound: bool,
+    root_cyc: u32,
+    steps: u32,
+    leaves: u32,
+    cause: &'static str,
+}
+
+/// Single-machine bounded concrete DFS of an item's future (the 3b
+/// walk, resurrected as measurement): forks every edge — fetch demand
+/// via `values_into`, deferred taken-JMP target, delay post-fork at
+/// completion — over the full value enumeration (strict superset of
+/// the engine's children). True iff every branch refutes (capture
+/// mismatch or OOB fetch) within budget and depth. No consulted
+/// accounting: this probe never records.
+fn fam_walk_rec(
+    w: &mut FamWalk,
+    cfg: &mut NCfg,
+    decided: &mut [u16; 32],
+    mut st: NState,
+    mut next_input: u32,
+    mut cyc: u32,
+    depth: u32,
+) -> bool {
+    loop {
+        if w.steps >= FAM_WALK_CAP {
+            w.cause = "budget";
+            return false;
+        }
+        if cyc >= w.spec.cycles {
+            w.cause = "surviving";
+            return false;
+        }
+        if cyc - w.root_cyc >= FAM_WALK_DEPTH {
+            w.cause = "depth";
+            return false;
+        }
+        w.steps += 1;
+        if let Some(&m) = w.irq_at.get(&cyc) {
+            st.irq_flags |= m;
+        }
+        if !w.preload {
+            while (next_input as usize) < w.spec.inputs.len() && !st.tx.is_full() {
+                st.tx.push(w.spec.inputs[next_input as usize]);
+                next_input += 1;
+            }
+        }
+        let ext = stim_at(&w.spec.stim, cyc);
+        let gpio_in = compose(&st, w.spec.stim.mask, ext);
+        let fetching = peek_tick(&st, cfg) && will_fetch(&st, cfg, gpio_in);
+        let fetch_pc = st.pc as usize;
+        if fetching && fetch_pc >= w.spec.slots as usize {
+            w.leaves += 1;
+            return true; // OOB refutes this branch
+        }
+        if fetching {
+            if let Some(field) = demand(decided[fetch_pc], cfg.code[fetch_pc], cfg) {
+                let mut values = Vec::new();
+                field.values_into(cfg, &mut values);
+                let (w0, d0) = (cfg.code[fetch_pc], decided[fetch_pc]);
+                decided[fetch_pc] = d0 | field.mask;
+                let mut all = true;
+                for v in values {
+                    cfg.code[fetch_pc] = (w0 & !field.mask) | v;
+                    if !fam_walk_rec(w, cfg, decided, st, next_input, cyc, depth + 1) {
+                        all = false;
+                        break;
+                    }
+                }
+                cfg.code[fetch_pc] = w0;
+                decided[fetch_pc] = d0;
+                return all;
+            }
+            let wd = cfg.code[fetch_pc];
+            if wd >> 13 == 0
+                && decided[fetch_pc] & 0x001F != 0x001F
+                && jmp_taken(wd, &st, cfg, gpio_in)
+            {
+                let d0 = decided[fetch_pc];
+                decided[fetch_pc] = d0 | 0x001F;
+                let mut all = true;
+                for t in 0..w.spec.slots as u16 {
+                    cfg.code[fetch_pc] = (wd & !0x001F) | t;
+                    if !fam_walk_rec(w, cfg, decided, st, next_input, cyc, depth + 1) {
+                        all = false;
+                        break;
+                    }
+                }
+                cfg.code[fetch_pc] = wd;
+                decided[fetch_pc] = d0;
+                return all;
+            }
+        }
+        if w.unbound && peek_tick(&st, cfg) {
+            let demands_binding = if !will_execute(&st, cfg, gpio_in) {
+                false
+            } else if let Some(pw) = st.pending_exec {
+                word_touches_regs(pw)
+            } else {
+                st.x != st.y && is_pull_empty_read(cfg.code[fetch_pc & 31], &st, cfg)
+            };
+            if demands_binding {
+                w.cause = "binding";
+                return false;
+            }
+        }
+        let pre_delay = st.delay_count;
+        let ticked = clock_tick(&mut st, cfg);
+        if ticked {
+            super::step(&mut st, cfg, gpio_in);
+        }
+        let cap = capture_word(&st, &w.spec.capture_pins, w.spec.stim.mask, ext);
+        if cap != w.spec.expected[cyc as usize] {
+            w.leaves += 1;
+            return true; // leaf refuted
+        }
+        cyc += 1;
+        let completed = ticked && pre_delay == 0 && st.stall == Stall::None;
+        if fetching && completed && w.delay_mask != 0 && decided[fetch_pc] & w.delay_mask != w.delay_mask {
+            if cyc >= w.spec.cycles {
+                // Final-cycle completion keeps delay a don't-care; the
+                // branch then survives at the loop top.
+                continue;
+            }
+            let (w0, d0) = (cfg.code[fetch_pc], decided[fetch_pc]);
+            let max = (w.delay_mask >> 8) as u16;
+            decided[fetch_pc] = d0 | w.delay_mask;
+            let mut all = true;
+            for v in 0..=max {
+                cfg.code[fetch_pc] = (w0 & !w.delay_mask) | (v << 8);
+                let mut stv = st;
+                stv.delay_count = v as u8;
+                if !fam_walk_rec(w, cfg, decided, stv, next_input, cyc, depth + 1) {
+                    all = false;
+                    break;
+                }
+            }
+            cfg.code[fetch_pc] = w0;
+            decided[fetch_pc] = d0;
+            return all;
+        }
+    }
+}
+
 #[derive(Default)]
 struct PairRace {
     /// Accept any single-cond conflict (word pair), not just delay bits.
@@ -1750,57 +2128,11 @@ impl PairRace {
         if delay_mask == 0 {
             return;
         }
-        // A record ALL of whose conds the prober satisfies except
-        // exactly one pure value conflict in a searched slot — confined
-        // to the slot's delay bits unless `wide`.
-        let mut found: Option<(usize, u16, u16)> = None;
-        'sets: for &(mask, ref table) in &entry.sets {
-            if mirror_blocked && mask & (SC_X | SC_Y) != 0 {
-                continue;
-            }
-            proj.clear();
-            project_state(&it.st, mask, proj);
-            if let Some(list) = table.get(proj.as_slice()) {
-                'recs: for i in 0..list.recs.len() {
-                    let mut cand: Option<(usize, u16, u16)> = None;
-                    for &p in list.conds_of(i) {
-                        let (s, m, v) = ((p >> 32) as usize, (p >> 16) as u16, p as u16);
-                        if it.decided[s] & m != m {
-                            continue 'recs; // undecided demand, not a pure pair
-                        }
-                        let conflict = (it.value[s] & m) ^ v;
-                        if conflict == 0 {
-                            continue;
-                        }
-                        if cand.is_some()
-                            || (!self.wide && conflict & !delay_mask != 0)
-                            || s >= spec.slots as usize
-                        {
-                            continue 'recs;
-                        }
-                        cand = Some((s, m, v));
-                    }
-                    if let Some((s, m, v)) = cand {
-                        // The patched spelling must satisfy every cond
-                        // of this record — a sibling cond on the same
-                        // slot with an overlapping mask can be violated
-                        // by the patch.
-                        let patched = (it.value[s] & !m) | v;
-                        let ok = list.conds_of(i).iter().all(|&p| {
-                            let (s2, m2, v2) = ((p >> 32) as usize, (p >> 16) as u16, p as u16);
-                            s2 != s || patched & m2 == v2
-                        });
-                        if !ok {
-                            self.patch_skip += 1;
-                            continue 'recs;
-                        }
-                        found = Some((s, m, v));
-                        break 'sets;
-                    }
-                }
-            }
-        }
-        let Some((slot, cmask, cval)) = found else { return };
+        let Some((slot, cmask, cval)) = find_single_conflict(
+            spec, entry, it, delay_mask, self.wide, mirror_blocked, proj, &mut self.patch_skip,
+        ) else {
+            return;
+        };
         // An unbound prober stands for a program and its mirror from
         // the same state — the mirror's race is the mirrored question
         // with the same verdict, so racing the spelling as-is is a
@@ -2553,6 +2885,19 @@ fn search_impl(
     } else {
         None
     };
+    let mut family = if memo_on && instrument {
+        std::env::var("PIO_NARROW_FAMILY_CENSUS").ok().map(|v| {
+            let shift = v.parse().unwrap_or(6);
+            let stride = std::env::var("PIO_NARROW_FAMILY_WALK")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            eprintln!("narrow-search: family census on (1/{} of families, walk stride {stride})", 1u64 << shift);
+            FamilyProbe::new(shift, stride)
+        })
+    } else {
+        None
+    };
     let mut memo: FxMap<KeyCore, MemoEntry> = FxMap::default();
     // Records must beat this subtree size to earn a slot; quadruples at
     // every cap purge.
@@ -2672,6 +3017,16 @@ fn search_impl(
                     PROBE_STATE_MISS => stats.memo_state_misses += 1,
                     PROBE_COND_MISS => stats.memo_cond_misses += 1,
                     _ => {}
+                }
+            }
+            // Family census runs on EVERY cond-miss (not the probe
+            // log's sampled subset) — family sizes must not be
+            // undercounted by sampling.
+            if outcome == PROBE_COND_MISS {
+                if let Some(f) = family.as_mut() {
+                    if let Some(entry) = memo.get(&core) {
+                        f.check(spec, &irq_at, entry, &it, &cfg, &core, delay_mask, mirror_blocked, &mut proj);
+                    }
                 }
             }
             if let Some(pl) = probe_log.as_mut() {
@@ -3183,6 +3538,9 @@ fn search_impl(
     debug_assert!(frames.len() == 1, "unbalanced frame accounting");
     if let Some(dp) = pair_race.as_ref() {
         dp.print("final");
+    }
+    if let Some(f) = family.as_ref() {
+        f.print("final");
     }
     if let Some(d) = dump.as_mut() {
         d.finish(&stats);
