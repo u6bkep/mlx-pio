@@ -3,24 +3,38 @@
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
 > Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-13 (night).
 
-## SOUNDNESS ALERT (Codex review, 2026-07-13 late night)
+## SOUNDNESS: all 6 review findings resolved; verdict campaign IN FLIGHT
 
-One-shot gpt-5.6-sol review found 4 credible memo soundness holes;
-**all L=3 verdicts carry a caveat until fixed + re-run**: S1
-cross-fork Prov::Field loss (SET-immediate conds omitted, mechanism
-confirmed); S2 binding frames recordable with mixed-root proofs; S3
-bound records refuting unbound probers at x==y; **S4 decided-delay
-walk records — CONFIRMED + FIXED (1544a45)**. S5/S6 = seeded-search
-canonicity/mirror holes (resynthesis-track scope, documented). Wave 3
-in flight: adversarial micro-spec + fix agents for S1 and S2/S3; then
-re-run all L=3 verdicts (0..0 26min + fast brackets). Full review
-text in the session transcript; findings being folded into tickets.
-Review also cleared: word_canon lemmas 7-11, CntProv local soundness,
-core determinism. Perf findings: purge-loop O(n²) plateau FIXED
-(purge now re-raises the bar until <=7/8 cap; deterministic clear-all
-fallback at u32::MAX saturation; table provably bounded by cap);
-still queued: per-unit workspace rebuild in split mode, probe
-projection caching.
+Codex review (gpt-5.6-sol, one-shot) found 6 holes; all now fixed and
+merged with red-green adversarial micro-specs (gate suite 12 -> 17
+tests incl. new narrow_soundness.rs): S4 decided-delay walk records
+(1544a45, confirmed by re-derivation); S1 cross-fork Prov::Field loss
+(RED: memo-off 8 champions vs memo-on 0; flush_prov at all segment
+ends); S3 bound-record-refutes-unbound-prober (RED: champion vanished
+memo-on; Rec::bound flag, -3% hits); S2 binding-frame mixed-root
+records (confirmed flow-gap, REFUTED-as-exploitable by an
+identity-completeness argument — 4 blocked constructions — but fixed
+conservatively anyway: binding frames unrecordable + upward
+recordability poisoning, **-41% memo hits on 2..2 — REVIEWABLE
+RELAXATION CANDIDATE after verdicts**, argument documented in the S2/S3
+merge + test comments); S5/S6 seeded-search guards (P2/P4 off in
+seeded slots; validate_seed whole-field check; 3 RED micro-specs).
+Purge plateau hardened (bounded multi-pass, provable cap). Early
+re-verify pre-S2/S3: 0..1 764.9M/29s, 1..1 698.4M/26s, verdicts hold.
+**Verdict campaign running (unit pio-verdicts,
+runs/verdict_campaign.log): 0..0 + all rest brackets on the fully
+repaired memo — lifts this caveat when 0..0/0..1/1..1 re-refute.**
+
+## Superposition (ticket 011) — v1 scope NEEDS RE-CUT after census
+
+Dead-demand census (merged ff6a4b3): **BitCount (28.6% of fork mass)
+is ~0% dead** — shift chains re-read within cycles; dead-demand
+deletion gets nothing there (needs 008-B outcome-predicate reads).
+Collapsible = MOV->reg copies (75% dead x ~15.4% mass ~= 11.5%) +
+SetData (~100% dead, tiny). Amend ticket 011 v1 before building:
+target = MOV/SetData class; BitCount + the 86% state-div wall class
+need outcome-predicate read semantics (008-B), not laziness. The
+suspicious exact 0.7500 MovSrc dead fraction needs a structural look.
 
 ## Headline: realness tests point the monsters at DATA-PLANE SUPERPOSITION
 
