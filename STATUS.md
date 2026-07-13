@@ -3,6 +3,22 @@
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
 > Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-13 (night).
 
+## SOUNDNESS ALERT (Codex review, 2026-07-13 late night)
+
+One-shot gpt-5.6-sol review found 4 credible memo soundness holes;
+**all L=3 verdicts carry a caveat until fixed + re-run**: S1
+cross-fork Prov::Field loss (SET-immediate conds omitted, mechanism
+confirmed); S2 binding frames recordable with mixed-root proofs; S3
+bound records refuting unbound probers at x==y; **S4 decided-delay
+walk records — CONFIRMED + FIXED (1544a45)**. S5/S6 = seeded-search
+canonicity/mirror holes (resynthesis-track scope, documented). Wave 3
+in flight: adversarial micro-spec + fix agents for S1 and S2/S3; then
+re-run all L=3 verdicts (0..0 26min + fast brackets). Full review
+text in the session transcript; findings being folded into tickets.
+Review also cleared: word_canon lemmas 7-11, CntProv local soundness,
+core determinism. Perf findings queued: purge-loop O(n²) plateau,
+per-unit workspace rebuild in split mode, probe projection caching.
+
 ## Headline: realness tests point the monsters at DATA-PLANE SUPERPOSITION
 
 Two measurements on the 2..2 wall (probes 2acc442, journal "night"):
