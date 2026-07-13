@@ -4,6 +4,31 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-13 (late night) — wave 1 complete: 4/4 agent workstreams merged
+
+First parallel-worktree wave (user's new working mode), all merged
+and gated on the combined tree:
+1. **Pair census** (b17eb1e): 47.2M canon-rep pairs → 684K strict
+   fingerprints, 99.68% mass cross-spelling.
+2. **008 stage 4** (912cb77): ISR_CNT CntProv provenance —
+   bracket-neutral, −26% memo entries; first provenance-tag instance.
+3. **009 gap fix** (97a9a2d): word_canon is a hand-audited whitelist
+   (no lemma prover ever existed); 5 new schemas close the enumerable
+   gap 680 groups → 8; battery blind spots fixed. Structural finding:
+   cross-opcode word classes are INVISIBLE to fork-sibling dedup
+   (opcode forks first) — quotient fixes are champion-side.
+4. **Serializer battery** (bd6f0ac): data-driven specs are ~3 ORDERS
+   OF MAGNITUDE less champion-dense (340 autopull / 2 explicit-pull
+   champions vs 223K-249K output-only) — FIFO data makes registers
+   live and kills the dead-effect class. The 250K:1 prize is
+   output-only-specific; protocol targets concentrate the case on the
+   refutation-wall lever (superposition). Data-driven L=3 full
+   brackets blow up (memo starved by FIFO-state variety).
+Combined verdict run: 0..1 763.5M/28s, 1..1 698.1M/25s (−2.5% items
+vs stage-2 baseline, wall neutral, verdicts hold); 2..2 frontier
+shrank 1,721,320 → 1,679,192 units. Wave 2: superposition design doc
+(flagship) + Codex one-shot engine review.
+
 ## 2026-07-13 (night) — realness tests: the monsters' wall belongs to superposition
 
 User course-correction: "are you deciding where to spend effort, or
