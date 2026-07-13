@@ -228,6 +228,13 @@ struct Item {
     /// binding fork turns the twin into its own ordinary item by
     /// mirroring the decided words and swapping x/y.
     unbound: bool,
+    /// Dead-demand census tag (PIO_NARROW_DEAD_DEMAND, ticket 011):
+    /// packed `dd_pack` word, 0 = no tag (always 0 when the census is
+    /// off — every hook tests this first, so the flag-off cost is one
+    /// always-false register test). `dd_id` is the tracked fork's
+    /// DFS-monotone id for first-outcome-per-fork counting.
+    dd: u32,
+    dd_id: u32,
 }
 
 /// A forkable bit-field of one slot: contiguous `mask`, candidate raw
@@ -286,6 +293,197 @@ pub const FORK_KIND_NAMES: [&str; 19] = [
     "PushPullBits", "MovDst", "MovOp", "MovSrc", "IrqBits", "IrqIdx", "SetDst", "SetData",
     "Delay", "JmpTarget",
 ];
+
+// ---------------------------------------------------------------------
+// Dead-demand census (ticket 011's gating measurement), enabled by
+// `PIO_NARROW_DEAD_DEMAND=1`. Measurement only — no search behavior
+// changes; with the flag off every hook is one always-false test
+// (`Item.dd` stays 0).
+//
+// At each DATA-PLANE fetch-demand fork — a forked field whose value
+// feeds only register/counter state (`dd_classify`) — the pushed
+// children are tagged with the SC mask of the registers the field
+// feeds. The tag is PENDING until the tagged instruction completes
+// (so its own operand reads don't count as reads of the write), then
+// armed. The fork resolves on the FIRST outcome seen in DFS order:
+//
+//   live — an armed tag's mask intersected a `word_state_reads`
+//          consult (main-loop exec read, pin-write pre-filter
+//          lookahead, junk_walk read before a family co-refutation),
+//          or a memo hit whose record rmask intersected it;
+//   dead — the item refuted (trace / OOB / walk / all-values-filtered
+//          leaf) or closed as a champion with the tag still unread.
+//
+// Fork ids are DFS-monotone and subtrees contiguous, and a new fork is
+// only tracked while no tag is live on the item, so a watermark admits
+// exactly ONE outcome per tracked fork (first-outcome-seen — the
+// stated approximation of per-fork accounting). A second qualifying
+// fork while a tag is live is `nested_untracked` — unless it is a
+// later field of the SAME still-pending instruction (e.g. MovOp then
+// MovSrc, OutDst then BitCount), which merges into the one tag: those
+// fields share the written register's fate, and each merged kind's
+// `tracked` counter gets the shared outcome.
+//
+// Known biases, all pushing toward LIVE (the measured dead fraction is
+// a lower bound): `word_state_reads` over-approximates (stall-persist
+// re-reads, PULL's unconditional SC_X|SC_Y, OUT's unconditional
+// SC_OSR_CNT); overwrites never clear a tag (a read of the
+// overwritten register still counts live); merged chains use the
+// union mask. Memo hits resolve live only on an rmask intersection —
+// anything else is `memo_unresolved` (no attribution), because record
+// reads of provenance-routed registers surface as program conds, not
+// rmask bits, and cannot be attributed soundly in either direction.
+
+const DD_PRESENT: u32 = 1 << 31;
+const DD_PENDING: u32 = 1 << 30;
+const DD_NKIND: usize = 7;
+const DD_KIND_NAMES: [&str; DD_NKIND] =
+    ["SetData", "BitCount/IN", "BitCount/OUT", "MovSrc", "MovOp", "InSrc", "OutDst"];
+
+/// Pack a census tag: SC mask (bits 0..=5, same encoding as the low
+/// SC_* constants), kind bitmap (bits 8..=14), pc (bits 16..=20),
+/// pending (30), present (31).
+fn dd_pack(mask: u16, kind: u8, pc: u8) -> u32 {
+    DD_PRESENT | DD_PENDING | (mask as u32 & 0x3F) | (1u32 << (8 + kind)) | ((pc as u32 & 0x1F) << 16)
+}
+
+/// Data-plane classification of a fetch-demand fork: `Some((kind,
+/// mask))` when the forked field's value feeds ONLY register/counter
+/// state (never a pin latch, pc, or pending_exec). Fields decided
+/// before this one in demand order (opcode, dst selectors) are read
+/// from the partial word. `mask == 0` marks OutDst, whose fed register
+/// differs per child value (`dd_outdst_mask`).
+fn dd_classify(kind: FieldKind, w: u16) -> Option<(u8, u16)> {
+    match kind {
+        FieldKind::SetData => match (w >> 5) & 0x7 {
+            1 => Some((0, SC_X)),
+            2 => Some((0, SC_Y)),
+            _ => None, // pins/pindirs: latch-feeding
+        },
+        FieldKind::BitCount => match (w >> 13) & 0x7 {
+            // IN: the count feeds the new ISR value and the shift
+            // counter's accumulation.
+            2 => Some((1, SC_ISR | SC_ISR_CNT)),
+            // OUT: the count feeds the residual OSR + its counter,
+            // plus the destination register; a non-register dst
+            // (pins/pindirs/pc/exec) makes the field latch/control-
+            // feeding — not data-plane.
+            _ => match (w >> 5) & 0x7 {
+                1 => Some((2, SC_OSR | SC_OSR_CNT | SC_X)),
+                2 => Some((2, SC_OSR | SC_OSR_CNT | SC_Y)),
+                3 => Some((2, SC_OSR | SC_OSR_CNT)),
+                6 => Some((2, SC_OSR | SC_OSR_CNT | SC_ISR | SC_ISR_CNT)),
+                _ => None,
+            },
+        },
+        FieldKind::MovSrc | FieldKind::MovOp => {
+            let k = if kind == FieldKind::MovSrc { 3 } else { 4 };
+            match (w >> 5) & 0x7 {
+                1 => Some((k, SC_X)),
+                2 => Some((k, SC_Y)),
+                // MOV→ISR/OSR resets the counter to 0 regardless of
+                // src/op — the counter is not field-fed.
+                6 => Some((k, SC_ISR)),
+                7 => Some((k, SC_OSR)),
+                _ => None, // pins/pindirs/pc/exec dst
+            }
+        }
+        FieldKind::InSrc => Some((5, SC_ISR)),
+        FieldKind::OutDst => Some((6, 0)),
+        _ => None,
+    }
+}
+
+/// Which registers an OutDst CHILD's chosen destination makes the
+/// field feed. Non-register dsts (pins/pindirs/pc/exec) and null (the
+/// selector feeds nothing observable) are untagged.
+fn dd_outdst_mask(raw: u16) -> u16 {
+    match raw {
+        1 => SC_X,
+        2 => SC_Y,
+        6 => SC_ISR | SC_ISR_CNT, // OUT→ISR also sets the counter
+        _ => 0,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DdOutcome {
+    LiveRead,
+    LiveMemo,
+    DeadRefute,
+    DeadChamp,
+}
+
+#[derive(Default)]
+struct DeadDemand {
+    next_id: u32,
+    /// Highest fork id with a counted outcome; ids at/below it already
+    /// resolved (first-outcome-per-fork, see module comment).
+    watermark: u32,
+    tracked: [u64; DD_NKIND],
+    live_read: [u64; DD_NKIND],
+    live_memo: [u64; DD_NKIND],
+    dead_refute: [u64; DD_NKIND],
+    dead_champ: [u64; DD_NKIND],
+    nested_untracked: [u64; DD_NKIND],
+    memo_unresolved: [u64; DD_NKIND],
+}
+
+impl DeadDemand {
+    fn open() -> Option<Box<DeadDemand>> {
+        std::env::var("PIO_NARROW_DEAD_DEMAND").ok()?;
+        eprintln!("narrow-search: dead-demand census on (ticket 011; per-fork = first-outcome-seen)");
+        Some(Box::default())
+    }
+
+    fn print(&self, tag: &str) {
+        eprintln!("dead-demand[{tag}]: kind tracked live(read/memo) dead(refute/champ) nested memo-unres open dead-frac");
+        for k in 0..DD_NKIND {
+            let live = self.live_read[k] + self.live_memo[k];
+            let dead = self.dead_refute[k] + self.dead_champ[k];
+            let open = self.tracked[k].saturating_sub(live + dead);
+            let frac = if live + dead > 0 { dead as f64 / (live + dead) as f64 } else { f64::NAN };
+            eprintln!(
+                "  {:<12} {} {}({}/{}) {}({}/{}) {} {} {} {:.4}",
+                DD_KIND_NAMES[k],
+                self.tracked[k],
+                live,
+                self.live_read[k],
+                self.live_memo[k],
+                dead,
+                self.dead_refute[k],
+                self.dead_champ[k],
+                self.nested_untracked[k],
+                self.memo_unresolved[k],
+                open,
+                frac,
+            );
+        }
+    }
+}
+
+/// Count one fork outcome, first-outcome-per-fork via the watermark.
+/// Callers pre-test `it.dd & DD_PRESENT != 0` so the census-off path
+/// never reaches here.
+#[inline]
+fn dd_note(dd: &mut Option<Box<DeadDemand>>, tag: u32, id: u32, out: DdOutcome) {
+    if let Some(d) = dd.as_mut() {
+        if id > d.watermark {
+            d.watermark = id;
+            let arr = match out {
+                DdOutcome::LiveRead => &mut d.live_read,
+                DdOutcome::LiveMemo => &mut d.live_memo,
+                DdOutcome::DeadRefute => &mut d.dead_refute,
+                DdOutcome::DeadChamp => &mut d.dead_champ,
+            };
+            for k in 0..DD_NKIND {
+                if tag & (1 << (8 + k)) != 0 {
+                    arr[k] += 1;
+                }
+            }
+        }
+    }
+}
 
 /// Which scratch registers a candidate field value names (for P1-lite).
 fn names_regs(kind: FieldKind, v: u16) -> (bool, bool) {
@@ -3114,6 +3312,11 @@ fn junk_walk(
     mut y_prov: Prov,
     mut cnt_prov: CntProv,
     wcyc: &mut u64,
+    // Dead-demand census out-param: set when the walk's executing
+    // words read the start item's armed tag registers. Only meaningful
+    // to the caller when the walk refutes (a read seen before the
+    // family co-refutation is a live outcome).
+    dd_read: &mut bool,
 ) -> bool {
     let mut it = *start;
     debug_assert_eq!(it.st.delay_count, 0, "walk starts at a completion");
@@ -3186,6 +3389,13 @@ fn junk_walk(
             if memo_on {
                 let r = word_state_reads(exec_word, cfg);
                 consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut w_reads, &mut w_mask);
+            }
+            // Dead-demand census (walk starts at a completion, so a
+            // present tag is always armed here).
+            if it.dd & DD_PRESENT != 0
+                && word_state_reads(exec_word, cfg) & (it.dd as u16 & 0x3F) != 0
+            {
+                *dd_read = true;
             }
         }
         if it.unbound && peek_tick(&it.st, cfg) {
@@ -3313,6 +3523,8 @@ fn search_impl(
         named: false,
         prev_nop_submax: false,
         unbound: true,
+        dd: 0,
+        dd_id: 0,
     };
     for s in spec.slots as usize..32 {
         root.decided[s] = 0xFFFF;
@@ -3412,6 +3624,9 @@ fn search_impl(
         None
     };
     let mut memo: FxMap<KeyCore, MemoEntry> = FxMap::default();
+    // Dead-demand census (ticket 011 gating measurement), env-gated
+    // and instrument-only like the other diagnostic channels.
+    let mut dd = if instrument { DeadDemand::open() } else { None };
     // Records must beat this subtree size to earn a slot; quadruples at
     // every cap purge.
     let mut min_benefit: u32 = 4;
@@ -3468,6 +3683,9 @@ fn search_impl(
                 stats.champions_found,
                 stack.len()
             );
+            if let Some(d) = dd.as_ref() {
+                d.print("beat");
+            }
             last_beat = std::time::Instant::now();
         }
         cfg.code = it.value;
@@ -3574,6 +3792,24 @@ fn search_impl(
             }
             if let Some((conds, rmask)) = hit {
                 stats.memo_hits += 1;
+                // Dead-demand census: the record's rmask is the skipped
+                // subtree's state-read union — an intersection with an
+                // ARMED tag proves the register would be read (live).
+                // Anything else is unresolvable here (pending tags mix
+                // in the instruction's own reads; provenance-routed
+                // reads surface as conds, not rmask bits) and is
+                // counted memo_unresolved without attribution.
+                if it.dd & DD_PRESENT != 0 {
+                    if it.dd & DD_PENDING == 0 && rmask & (it.dd as u16 & 0x3F) != 0 {
+                        dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::LiveMemo);
+                    } else if let Some(d) = dd.as_mut() {
+                        for k in 0..DD_NKIND {
+                            if it.dd & (1 << (8 + k)) != 0 {
+                                d.memo_unresolved[k] += 1;
+                            }
+                        }
+                    }
+                }
                 if let Some(d) = dump.as_mut() {
                     d.hit(&(it.cycle, it.next_input, it.st), &conds, &it.decided, &it.value, spec.slots);
                 }
@@ -3631,6 +3867,9 @@ fn search_impl(
             if fetching && fetch_pc >= spec.slots as usize {
                 stats.refuted += 1;
                 stats.oob_refuted += 1;
+                if it.dd & DD_PRESENT != 0 {
+                    dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::DeadRefute);
+                }
                 if memo_on {
                     flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
                     merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
@@ -3645,6 +3884,39 @@ fn search_impl(
                             & it.decided[fetch_pc];
                 }
                 if let Some(field) = demand(it.decided[fetch_pc], it.value[fetch_pc], &cfg) {
+                    // Dead-demand census: classify the fork. A fresh
+                    // qualifying fork tags its children (dd_fresh); a
+                    // qualifying fork on an item whose PENDING tag is
+                    // this same instruction merges into that tag (the
+                    // fields share the written register's fate); any
+                    // other live tag makes it nested_untracked.
+                    let mut dd_fresh: Option<(u8, u16)> = None;
+                    let mut dd_forked = false;
+                    if dd.is_some() {
+                        if let Some((k, m)) = dd_classify(field.kind, it.value[fetch_pc]) {
+                            let d = dd.as_mut().expect("checked");
+                            if it.dd & DD_PRESENT != 0 {
+                                if it.dd & DD_PENDING != 0
+                                    && ((it.dd >> 16) as u8 & 0x1F) == fetch_pc as u8
+                                {
+                                    // Every SIBLING of the original
+                                    // fork re-merges this field on its
+                                    // own descent, but only the first
+                                    // (pre-watermark) descent can still
+                                    // produce the chain's outcome —
+                                    // count tracked once per chain.
+                                    if it.dd_id > d.watermark {
+                                        d.tracked[k as usize] += 1;
+                                    }
+                                    it.dd |= (1 << (8 + k)) | (m as u32 & 0x3F);
+                                } else {
+                                    d.nested_untracked[k as usize] += 1;
+                                }
+                            } else {
+                                dd_fresh = Some((k, m));
+                            }
+                        }
+                    }
                     values.clear();
                     field.values_into(&cfg, &mut values);
                     sib_ids.clear();
@@ -3739,6 +4011,21 @@ fn search_impl(
                                 let r = word_state_reads(child_value, &cfg);
                                 consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut seg_reads, &mut seg_mask);
                             }
+                            // Dead-demand census: the lookahead READS
+                            // the candidate word's sources even when
+                            // the value is filtered — a superposition
+                            // engine would have to collapse the tag to
+                            // run this filter, so an armed-tag
+                            // intersection is a live outcome. The tag
+                            // itself stays: pushed children own their
+                            // copies (the watermark dedups counting).
+                            if it.dd & DD_PRESENT != 0
+                                && it.dd & DD_PENDING == 0
+                                && word_state_reads(child_value, &cfg) & (it.dd as u16 & 0x3F)
+                                    != 0
+                            {
+                                dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::LiveRead);
+                            }
                             let w = capture_word(&scratch, &spec.capture_pins, spec.stim.mask, ext);
                             if w != spec.expected[it.cycle as usize] {
                                 stats.prefiltered += 1;
@@ -3749,10 +4036,30 @@ fn search_impl(
                         child.decided[fetch_pc] |= field.mask;
                         child.value[fetch_pc] |= v;
                         child.named |= nx | ny;
+                        // Dead-demand census: tag the child (OutDst's
+                        // fed register depends on the child's value).
+                        if let Some((k, m)) = dd_fresh {
+                            let mask = if m != 0 { m } else { dd_outdst_mask(raw) };
+                            if mask != 0 {
+                                let d = dd.as_mut().expect("dd_fresh implies census on");
+                                if !dd_forked {
+                                    d.tracked[k as usize] += 1;
+                                    d.next_id += 1;
+                                    dd_forked = true;
+                                }
+                                child.dd = dd_pack(mask, k, fetch_pc as u8);
+                                child.dd_id = d.next_id;
+                            }
+                        }
                         stack.push(child);
                         stats.forks += 1;
                         stats.fork_kinds[kind_idx(field.kind)] += 1;
                         pushed += 1;
+                    }
+                    // Census: an all-values-filtered fork ends this
+                    // item's subtree — a still-live tag was never read.
+                    if pushed == 0 && it.dd & DD_PRESENT != 0 {
+                        dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::DeadRefute);
                     }
                     if memo_on {
                         flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
@@ -3824,6 +4131,11 @@ fn search_impl(
                             stats.fork_kinds[18] += 1;
                             pushed += 1;
                         }
+                        // Census: every target filtered ends this
+                        // item's subtree with the tag unread.
+                        if pushed == 0 && it.dd & DD_PRESENT != 0 {
+                            dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::DeadRefute);
+                        }
                         if memo_on {
                             flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
                             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
@@ -3861,6 +4173,22 @@ fn search_impl(
             if memo_on && it.st.delay_count == 0 && peek_tick(&it.st, &cfg) {
                 let r = word_state_reads(exec_word, &cfg);
                 consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut seg_reads, &mut seg_mask);
+            }
+            // Dead-demand census: this cycle's executing word reads an
+            // ARMED tag's register — the fork is live. Pending tags
+            // skip this (the tagged instruction's own operand reads
+            // are not reads of its write). Delay ticks and stall
+            // re-checks never reach here's mask: the tag holds only
+            // register/counter SC bits, and stall_state_reads returns
+            // FIFO/IRQ bits only.
+            if it.dd & DD_PRESENT != 0
+                && it.dd & DD_PENDING == 0
+                && it.st.delay_count == 0
+                && peek_tick(&it.st, &cfg)
+                && word_state_reads(exec_word, &cfg) & (it.dd as u16 & 0x3F) != 0
+            {
+                dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::LiveRead);
+                it.dd = 0;
             }
 
             // Binding demand: an unbound item and its mirror twin
@@ -3907,6 +4235,15 @@ fn search_impl(
                     let mut pushed = 1;
                     if twin_differs {
                         std::mem::swap(&mut twin.st.x, &mut twin.st.y);
+                        // Census: the twin's mirrored words rename
+                        // x<->y, so a tag's fed register renames too.
+                        if twin.dd & DD_PRESENT != 0 && twin.dd & (SC_X | SC_Y) as u32 != 0 {
+                            let m = twin.dd & 0x3F;
+                            let sw = (m & !((SC_X | SC_Y) as u32))
+                                | ((m & SC_X as u32) << 1)
+                                | ((m & SC_Y as u32) >> 1);
+                            twin.dd = (twin.dd & !0x3F) | sw;
+                        }
                         stack.push(twin);
                         stats.forks += 1;
                         pushed = 2;
@@ -3937,9 +4274,27 @@ fn search_impl(
             }
             stats.cycles_run += 1;
 
+            // Dead-demand census: arm a pending tag the moment its
+            // instruction completes — the write has now happened, so
+            // reads from the NEXT consult on count. Must precede the
+            // capture check: a refutation on the completion cycle is a
+            // written-never-read outcome, not an unresolved one.
+            if it.dd & DD_PENDING != 0
+                && ticked
+                && pre_delay == 0
+                && it.st.stall == Stall::None
+                && !exec_pending
+                && ((it.dd >> 16) as u8 & 0x1F) == fetch_pc as u8
+            {
+                it.dd &= !DD_PENDING;
+            }
+
             let w = capture_word(&it.st, &spec.capture_pins, spec.stim.mask, ext);
             if w != spec.expected[it.cycle as usize] {
                 stats.refuted += 1;
+                if it.dd & DD_PRESENT != 0 {
+                    dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::DeadRefute);
+                }
                 if memo_on {
                     flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
                     merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
@@ -4005,13 +4360,23 @@ fn search_impl(
                     // (see junk_walk). Fires BEFORE the fork so the
                     // 8^k spelling subtree never exists.
                     stats.walk_calls += 1;
+                    let mut dd_walk_read = false;
                     if junk_walk(
                         spec, &cfg, &irq_at, &it, delay_mask, memo_on,
                         &mut seg_mask, &mut seg_reads, x_prov, y_prov, cnt_prov,
-                        &mut stats.walk_cycles,
+                        &mut stats.walk_cycles, &mut dd_walk_read,
                     ) {
                         stats.refuted += 1;
                         stats.look_refuted += 1;
+                        // Census: the whole delay family resolves here.
+                        if it.dd & DD_PRESENT != 0 {
+                            let out = if dd_walk_read {
+                                DdOutcome::LiveRead
+                            } else {
+                                DdOutcome::DeadRefute
+                            };
+                            dd_note(&mut dd, it.dd, it.dd_id, out);
+                        }
                         if memo_on {
                             flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
                             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
@@ -4080,6 +4445,12 @@ fn search_impl(
         }
 
         stats.champions_found += 1;
+        // Dead-demand census: a champion closing with a live tag never
+        // read the register — the dead-effect (don't-care-widening)
+        // class, tallied separately from refutation-side deadness.
+        if it.dd & DD_PRESENT != 0 {
+            dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::DeadChamp);
+        }
         if champions.len() < champion_cap {
             champions.push(Champion {
                 decided: it.decided,
@@ -4110,6 +4481,9 @@ fn search_impl(
             .map(|(n, c)| format!("{n}={c}"))
             .collect();
         eprintln!("narrow-search: fork attribution: {}", named.join(" "));
+    }
+    if let Some(d) = dd.as_ref() {
+        d.print("final");
     }
     if let Some(d) = dump.as_mut() {
         d.finish(&stats);
@@ -4456,4 +4830,18 @@ pub fn run_spec_state(spec: &EngineSpec, code: [u16; 32]) -> (Vec<u32>, bool, NS
         out.push(w);
     }
     (out, oob, st)
+}
+
+#[cfg(test)]
+mod item_size {
+    /// Item is Copy and forked by struct copy; ticket 011 measured 252
+    /// bytes pre-census. The dead-demand tag (dd + dd_id, 8 bytes)
+    /// must not push it past the budget — a fork is still a small
+    /// stack copy.
+    #[test]
+    fn stays_within_budget() {
+        let sz = std::mem::size_of::<super::Item>();
+        eprintln!("Item = {sz} bytes (252 pre-census + 8 tag)");
+        assert!(sz <= 264, "Item grew past budget: {sz}");
+    }
 }
