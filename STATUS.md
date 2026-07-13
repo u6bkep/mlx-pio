@@ -19,20 +19,21 @@ via JMP); 1..2 hit 52B items at 6% settled, 2..2 extrapolated ~10h.
 is too slow** — the engine must get faster instead; a long run's
 mining value is in its first minutes; session cache expires at 1h.
 
-## Ticket 008 in progress — stage 1 of 4 landed (12ec1cb)
+## Ticket 008 — stages 1+2 landed; stage 2 = junk-window collapse, 4.4x
 
-Lazy JMP target demand (consult-time fork, like delay): L=3 0..1
-−1.4%, 1..1 −1.6% items; L=2 +2% (bounded vacuous-walk cost); scales
-with L. **Probe-log measurement reshaped the ticket**: target-only
-conflicts are 0.33% of the deep-memo wall; the wall is **JMP
-delay-bit conflicts (44% — same word, different delay spelling) and
-cross-opcode pairs (41%)**; cond-bit conflicts 2.5%, side ~0 (the
-fork-time side pre-filter kills them). Remaining stages: (2)
-outcome-grouped forking (value-set items, u32-bitmask sets per
-≤5-bit field, lazy refinement at re-consult), (3) predicate-valued
-memo records on stage-2 partitions, (4) ISR_CNT provenance. Stage
-2/3 design must center timing/outcome sharing, not cond grouping.
-After all stages: one-shot Codex review (gpt-5.6-sol) of the engine.
+Stage 1 (12ec1cb): lazy JMP target demand (consult-time, like delay).
+Stage 2 (89f97c9): **time-shift-invariant refutation lookahead** at
+the delay post-fork — one representative walk refutes the whole
+delay-spelling family when the window to refutation has no latch
+value changes, no external reads, no fork edges (mined: 96% of
+delay-conflict pairs co-refute, 100% latch-quiet, 0 diverged; records
+lose their undecided-delay conds). **L=3 0..1: 3.43B→785M items
+(4.4x, 29s); 1..1: 3.14B→717M; L=2 1..1: 104.6M→40.2M.** OOB breaks
+horizon-bounded per shift point (hole caught by the L=1 exact
+census). Next: fresh mining pass on the stage-2 binary (the wall
+census changed under the collapse), then stage 3 (cross-opcode
+outcome records — was 41% of the old wall) + stage 4 (ISR_CNT
+provenance). After all stages: one-shot Codex review (gpt-5.6-sol).
 
 ## Emulator fidelity fixed (e4a4860, a810ec5) — holds
 

@@ -4,6 +4,34 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-13 (small hours) — 008 stage 2: junk-window collapse, 4.4x at L=3
+
+**Mining loop under the new 50-min policy** (three iterations of
+instrumented 10-15min 2..2 runs, delay-pair lock-step races): of
+28,672 sampled delay-conflict probe pairs, 95.8% CO-REFUTE (identical
+captures, same refutation cycle, avg 60.5cy), 100% of those with
+latch-quiet windows, 99.95% external-free, ZERO diverged. First
+classifier iteration was an artifact (states start equal — absorption
+must require the delta to be EXPRESSED first); second starved on
+unbound probers (~99.5% of delay-conflict probers are unbound — noted).
+
+**Theorem operationalized** (89f97c9): in a window with no pin-latch
+value changes, no external-schedule reads (WAIT, JMP PIN, IN/MOV
+PINS, IRQ), and no fork edges, every spelling of every undecided
+delay executes the same instruction sequence time-shifted, holds the
+same static capture, and hits the same expected-trace mismatch cycle.
+`junk_walk` at the delay post-fork refutes the whole 8^k family in
+one representative walk; records carry no undecided-delay conds.
+OOB fetches are execution-position-based, NOT shift-invariant near
+the horizon — bounded per shift point; the L=1 exact census caught
+that hole on the first build (word 0xa680), proving the census gates'
+worth again. **L=3 0..1: 3.43B→785M items (4.4x); 1..1: 3.14B→717M;
+L=2 1..1: 104.6M→40.2M (2.6x).** Verdicts unchanged, 12/12 gates.
+
+Policy note: a bracket-measurement launch rolled into 2..2 un-gated
+and blew the 50-min cap (user caught it) — every launch, including
+"quick measurements", goes through the gated-unit incantation now.
+
 ## 2026-07-12 (late night) — OOB refutation, 008 stage 1, OOM incident, gated relaunch
 
 **OOB refutation landed** (6b08a0b, user ruling): executing any slot
