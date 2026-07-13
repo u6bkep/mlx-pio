@@ -70,6 +70,26 @@ STATUS "predicate-valued patterns".
    identified empirically: where to fire (population kill-rate) and
    when to give up (per-branch depth). Revisit only if a walk-shaped
    lever returns.
+3d. **SIZED 2026-07-13 (probe 456f829, 15-min 2..2 run): once-per-
+   family walk-certified record generalization.** Family census
+   (194M cond-misses): **95.2% single-conflict; distinct (core,
+   conflict-slot+mask) families ≈ only ~2K** (30 sampled at 1/64),
+   sizes wildly heavy-tailed (sampled mean 4K members, max 54.6K;
+   true mean ~96K/family — mega-families dominate the miss-mass).
+   Family walk (conflict mask UN-DECIDED, budget 8K, depth 128):
+   **65.4% of miss-mass killable at 6.4K steps/kill, ~119 leaves**;
+   failures = 50% budget-capped + 50% binding edges, ZERO surviving
+   branches, ZERO depth-cap. Economics: fired ONCE per family
+   (verdict cache), attempting every family costs ~15M steps ≈ 0.2s
+   total — noise — while converting ~65% of 184M single-conflict
+   misses/15min to memo hits (≈ item halving again, this time
+   without 3b's per-pop re-proof cost). Build notes: restore the
+   walk's consulted accounting (a1477f3 had it) so the kill inserts
+   the GENERALIZED record (walk-forked conflict bits carry no conds);
+   family verdict cache is per-worker, DFS-deterministic; raise
+   budget (16-32K) — budget failures are likely mega-families, the
+   most valuable; binding-edge families (17% of fired walks)
+   recoverable later by also walking the mirror twin.
 4. ISR_CNT provenance (prov becomes a small field-SET: MOV→ISR
    resets, OUT→ISR sets from a field, IN accumulates a field).
    **NOW THE ACTIVE STAGE**, then the one-shot Codex engine review.
