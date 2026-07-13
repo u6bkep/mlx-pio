@@ -1459,3 +1459,235 @@ fn champion_family_mine() {
     }
     eprintln!("champ-mine: dump at /data/pio_optimization/runs/champ_mine.jsonl");
 }
+
+/// PAIR-enumeration fingerprint census — the arity-2 analog of the
+/// ticket 009 word quotient, feeding the static canonicalization
+/// program (journal 2026-07-13 evening). Measurement only, no engine
+/// changes: reduce each slot's alphabet to the `word_canon` class
+/// representatives (in-space per `in_l1_space`, slots=2), enumerate
+/// (slot0, slot1) programs under the one-pin wrap 0..1 config, and
+/// fingerprint each pair STRICTLY (trace + oob + FINAL STATE per input
+/// context — interchange lemmas must be state-inclusive). Families
+/// whose members have DIFFERENT unordered word multisets are real
+/// cross-spelling pair equivalences (the mining target); same-multiset
+/// families only witness order symmetry. Top-200 families dumped to
+/// /data/pio_optimization/runs/pair_census.jsonl for schema mining.
+/// If R^2 exceeds the pair cap, slot1's alphabet is deterministically
+/// subsampled (every k-th representative) and the output says so.
+/// `cargo test --release --test narrow_engine -- --ignored pair_fingerprint_census --nocapture`
+#[test]
+#[ignore]
+fn pair_fingerprint_census() {
+    use pio_superopt::narrow::engine::word_canon;
+    use rustc_hash::FxHashMap;
+    use std::hash::{Hash, Hasher};
+    use std::io::Write;
+    use std::time::Instant;
+
+    let config = Config {
+        pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 1, ..PinMap::default() },
+        ..Config::default()
+    };
+    let side = SideCfg::NONE;
+    let cfg = cfg_for(config, 0, 1);
+
+    // Slot alphabet: word_canon class representatives of the in-space
+    // words (JMP targets < 2 for slots=2). Class members behave
+    // identically as fetched instructions in every state (lemma-proven,
+    // battery-gated), so the R^2 census covers all in-space pairs.
+    let mut reps: Vec<u16> = (0..=0xFFFFu16)
+        .filter(|&w| in_l1_space(w, 2))
+        .map(|w| word_canon(w, &cfg))
+        .collect();
+    reps.sort_unstable();
+    reps.dedup();
+    let r_len = reps.len();
+    eprintln!("pair-census: R = {r_len} word_canon representatives (in-space, slots=2)");
+
+    let base_code = words_of(&[], &side);
+    let input_battery: Vec<Vec<u32>> = vec![
+        vec![],
+        vec![0xA5A5_5A5A, 0x0F0F_F0F0, 0xDEAD_BEEF, 0x1234_5678],
+        vec![0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF],
+        vec![0x0000_0001, 0x8000_0000, 0x5555_5555, 0xCAFE_F00D],
+    ];
+    let mk_specs = |cycles: u32| -> Vec<EngineSpec> {
+        input_battery
+            .iter()
+            .map(|inputs| EngineSpec {
+                cfg: cfg.clone(),
+                slots: 2,
+                cycles,
+                inputs: inputs.clone(),
+                output_pins: vec![0],
+                capture_pins: vec![0],
+                stim: Stim::default(),
+                irq_sets: vec![],
+                expected: vec![],
+                seed: vec![],
+                memo_cap: 0,
+            })
+            .collect()
+    };
+    // One strict fingerprint per pair: (trace, oob, final state) per
+    // context, all four contexts folded into one hash. DefaultHasher
+    // is keyless SipHash — deterministic across runs.
+    let fingerprint = |specs: &[EngineSpec], w0: u16, w1: u16| -> u64 {
+        let mut code = base_code;
+        code[0] = w0;
+        code[1] = w1;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for spec in specs {
+            let (t, o, fin) = run_spec_state(spec, code);
+            t.hash(&mut h);
+            o.hash(&mut h);
+            fin.hash(&mut h);
+        }
+        h.finish()
+    };
+
+    // Wall-clock sizing: measure a 1000-pair sample, extrapolate, and
+    // shrink cycles and/or subsample slot1 to fit the census loop in
+    // well under 15 minutes single-threaded.
+    const LOOP_BUDGET_SECS: f64 = 780.0;
+    const PAIR_CAP: u64 = 50_000_000;
+    let mut cycles = 48u32;
+    let mut specs = mk_specs(cycles);
+    let mut rate;
+    loop {
+        let n = 1000usize;
+        let t = Instant::now();
+        let mut acc = 0u64;
+        for i in 0..n {
+            let a = reps[(i * 7919) % r_len];
+            let b = reps[(i * 104_729 + 13) % r_len];
+            acc ^= fingerprint(&specs, a, b);
+        }
+        std::hint::black_box(acc);
+        rate = n as f64 / t.elapsed().as_secs_f64();
+        eprintln!(
+            "pair-census: sample 1000 pairs @ cycles={cycles}: {:.0} pairs/s => {:.0}s for R^2={}",
+            rate,
+            r_len as f64 * r_len as f64 / rate,
+            r_len as u64 * r_len as u64,
+        );
+        // If even a heavily subsampled census would be starved for
+        // pairs at this cycle count, trade horizon for coverage.
+        if (rate * LOOP_BUDGET_SECS) as u64 >= 5_000_000 || cycles <= 24 {
+            break;
+        }
+        cycles /= 2;
+        specs = mk_specs(cycles);
+        eprintln!("pair-census: too slow, shrinking cycles to {cycles}");
+    }
+    let max_pairs = PAIR_CAP.min((rate * LOOP_BUDGET_SECS) as u64);
+    let mut k = 1usize;
+    while r_len as u64 * ((r_len + k - 1) / k) as u64 > max_pairs {
+        k += 1;
+    }
+    let slot1: Vec<u16> = reps.iter().copied().step_by(k).collect();
+    if k > 1 {
+        eprintln!(
+            "pair-census: SUBSAMPLED — R^2 = {} exceeds cap {max_pairs}; slot1 keeps every {k}-th representative ({} words), slot0 keeps all {r_len}",
+            r_len as u64 * r_len as u64,
+            slot1.len(),
+        );
+    }
+    let total = r_len as u64 * slot1.len() as u64;
+    eprintln!("pair-census: running {total} pairs at cycles={cycles} x {} contexts", specs.len());
+
+    // The census loop. Per family: size, cross-spelling flag (some
+    // member has a different unordered word multiset than the first),
+    // and up to 32 members for the dump.
+    struct Fam {
+        count: u32,
+        ms: u32,
+        cross: bool,
+        members: Vec<u32>,
+    }
+    let mut fams: FxHashMap<u64, Fam> = FxHashMap::default();
+    let t0 = Instant::now();
+    let mut last = Instant::now();
+    let mut done = 0u64;
+    for &w0 in &reps {
+        for &w1 in &slot1 {
+            let f = fingerprint(&specs, w0, w1);
+            let ms = ((w0.min(w1) as u32) << 16) | w0.max(w1) as u32;
+            let e = fams.entry(f).or_insert_with(|| Fam {
+                count: 0,
+                ms,
+                cross: false,
+                members: Vec::new(),
+            });
+            e.count += 1;
+            if e.ms != ms {
+                e.cross = true;
+            }
+            if e.members.len() < 32 {
+                e.members.push(((w0 as u32) << 16) | w1 as u32);
+            }
+        }
+        done += slot1.len() as u64;
+        if last.elapsed().as_secs_f64() >= 30.0 {
+            last = Instant::now();
+            let r = done as f64 / t0.elapsed().as_secs_f64();
+            eprintln!(
+                "pair-census: {done}/{total} pairs ({:.1}%), {:.0}/s, {} families, ETA {:.0}s",
+                100.0 * done as f64 / total as f64,
+                r,
+                fams.len(),
+                (total - done) as f64 / r,
+            );
+        }
+    }
+    let loop_secs = t0.elapsed().as_secs_f64();
+
+    // Census report: sizes, histogram, and the cross-spelling cut.
+    let mut by_size: Vec<(u32, u64)> = fams.iter().map(|(&f, fam)| (fam.count, f)).collect();
+    by_size.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut hist = [0u64; 33];
+    for &(c, _) in &by_size {
+        hist[(32 - (c.leading_zeros() as usize)).saturating_sub(1)] += 1;
+    }
+    let cross_fams = fams.values().filter(|f| f.cross).count();
+    let cross_mass: u64 = fams.values().filter(|f| f.cross).map(|f| f.count as u64).sum();
+    eprintln!(
+        "pair-census: {done} pairs in {loop_secs:.0}s, {} distinct strict fingerprints",
+        fams.len()
+    );
+    eprintln!("pair-census: family-size histogram (log2 buckets):");
+    for (b, &n) in hist.iter().enumerate() {
+        if n > 0 {
+            eprintln!("  size {:>10}..{:<10} : {n} families", 1u64 << b, (1u64 << (b + 1)) - 1);
+        }
+    }
+    let top: Vec<u32> = by_size.iter().take(10).map(|&(c, _)| c).collect();
+    eprintln!("pair-census: 10 largest families: {top:?}");
+    eprintln!(
+        "pair-census: cross-spelling families (different unordered word multisets): {cross_fams} of {} ({:.2}%), mass {cross_mass} of {done} pairs ({:.2}%)",
+        fams.len(),
+        100.0 * cross_fams as f64 / fams.len() as f64,
+        100.0 * cross_mass as f64 / done as f64,
+    );
+
+    // Dump the top-200 families (up to 32 members each) for offline
+    // schema mining.
+    let path = "/data/pio_optimization/runs/pair_census.jsonl";
+    let mut dump = std::io::BufWriter::new(std::fs::File::create(path).expect("dump file"));
+    for &(c, f) in by_size.iter().take(200) {
+        let fam = &fams[&f];
+        let members: Vec<String> = fam
+            .members
+            .iter()
+            .map(|&p| format!("[\"{:04x}\",\"{:04x}\"]", p >> 16, p & 0xFFFF))
+            .collect();
+        writeln!(
+            dump,
+            "{{\"fam\":\"{f:016x}\",\"size\":{c},\"cross\":{},\"members\":[{}]}}",
+            fam.cross,
+            members.join(","),
+        )
+        .expect("dump write");
+    }
+    eprintln!("pair-census: top-200 family dump at {path}");
+}
