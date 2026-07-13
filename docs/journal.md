@@ -4,7 +4,25 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
-## 2026-07-13 (day) — 008 stage 3b: generalized subtree walk, 2x on stage 2
+## 2026-07-13 (midday) — stage 3b REVERTED: item halving hid a 2.8x wall-clock loss
+
+The entry below celebrated 3b off a CONTENDED baseline (127s for
+0..1). Idle-box re-measurement on the pre-3b commit: 0..1 = 784.0M
+items in **27s**, 1..1 = 716.3M in **24s** — so 3b's 388.1M/76s and
+353.1M/68s are a **2.8x wall-clock regression**, confirmed at scale
+by 2..2 (10.3% vs 27% settled at the 50-min gate). Reverted
+(a1477f3's revert); probes kept; byte-identical baseline reproduction
+verified post-revert. Mechanism (understood, unlike hoisting): the
+walk re-proves subtrees with NO memo hits, no quotient sibling
+dedup, no canon prunes — ~563 steps/kill where ~100 breaks even
+(walk step ~13ns vs item ~1.3µs) — and dense sibling cond-miss pops
+re-walk overlapping futures, the exact redundancy the memo removes.
+The 84.5% transferability stands; exploit it record-side, not by
+re-proof. New ops rule: magnitude gates pair item counts with
+idle-box wall-clock. Ticket 008 §3b has the full post-mortem.
+Next: stage 4 (ISR_CNT provenance), then the Codex review.
+
+## 2026-07-13 (day) — 008 stage 3b: generalized subtree walk, 2x on stage 2 [SUPERSEDED — see above]
 
 **Morning: race-sized the cross-opcode class honestly** (the delay
 chapter's measurement lesson applied). PairRace probe = DelayPair

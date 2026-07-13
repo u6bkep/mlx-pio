@@ -37,9 +37,42 @@ STATUS "predicate-valued patterns".
    cycle-local side pre-filter) made it WORSE (1.09B) — hypothesis
    wrong, mechanism not understood. Lesson: don't reorder fork
    decisions past the cycle-local prunes without cost attribution.
-   Next lever must start from a perf + item-class profile of the
-   stage-2 engine on 2..2; then predicate-valued records
-   (cross-opcode outcome classes, 45% of residual wall).
+3b. **TRIED AND REVERTED (2026-07-13): generalized subtree walk.**
+   Race-sized first (PairRace probe, 96f0372 flat + 8e69ac8 recursive
+   joint-fork races, both KEPT): cross-opcode conflicts ≈ the whole
+   post-stage-2 wall; **84.5% of cond-miss subtrees fully co-refute**
+   (770K deep races, 100% latch-quiet, true divergence 37/770K,
+   budget-bind 29 at 16K steps, ~200 single-machine steps/kill-tree).
+   Lever (a1477f3, reverted by its revert commit): bounded concrete
+   DFS of the item's future at a COND-MISS pop, full value
+   enumeration (strict superset of engine children ⇒ refutation
+   transfers with no theorem), budget 768, per-branch depth cap 128.
+   Kill rate 89%, **items halved (L=3 0..1 784.0M→388.1M, 1..1
+   716.3M→353.1M), but WALL-CLOCK 2.8x WORSE (27s→76s, 24s→68s;
+   2..2 27%→10.3% settled at 50min)**. Mechanism understood: the
+   walk re-explores subtrees WITHOUT the memo/quotient/canon sharing
+   the engine gets (~563 steps/kill vs ~100 needed to break even at
+   ~13ns/step vs ~1.3µs/item), and sibling cond-miss pops re-walk
+   overlapping futures — the exact redundancy the memo exists to
+   remove. Firing-policy sub-lessons (all measured): ungated
+   fork-site firing = 18% kills/416 avg steps (walks out-cost the
+   main loop); remaining-trace gates never fire (search refutes
+   early, never nears the horizon); item-count magnitude gates MUST
+   be paired with idle-box wall-clock (the first "win" was against a
+   contended 127s baseline; true baseline 27s). The 84.5%
+   transferability is REAL — the exploitable form is record-side
+   (weaken/condition conds so probers hit without re-proving), not
+   walk-side re-proof. Candidate: linear lock-step race transfer at
+   cond-miss (no forking, ~44cy, kills the 7.4% flat-co_refute slice
+   cheaply) — size its wall-clock before building.
+3c. **Adaptive walk budget (user, 2026-07-13) — MOOT while 3b is
+   reverted**, but the two control knobs it would tune were
+   identified empirically: where to fire (population kill-rate) and
+   when to give up (per-branch depth). Revisit only if a walk-shaped
+   lever returns.
+4. ISR_CNT provenance (prov becomes a small field-SET: MOV→ISR
+   resets, OUT→ISR sets from a field, IN accumulates a field).
+   **NOW THE ACTIVE STAGE**, then the one-shot Codex engine review.
 4. ISR_CNT provenance (prov becomes a small field-SET: MOV→ISR
    resets, OUT→ISR sets from a field, IN accumulates a field).
 
