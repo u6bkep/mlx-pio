@@ -28,7 +28,18 @@ STATUS "predicate-valued patterns".
    accounting for the memo. Fallback to normal forking on any unclean
    window. The original value-set/outcome-class design attacks the
    2.5% cond slice — demoted behind stage 3.
-3. Predicate-valued memo records on stage-2's interned partitions.
+3. **TRIED AND REVERTED (2026-07-13): demand hoisting.** On a clean
+   walk prefix ending at a fork edge, fork the demanded FUTURE field
+   at the parked point, delay left pending (attack on the
+   post-collapse #1 class: SET-pair delay conds, 50% of the residual
+   2..2 wall). FAILED the magnitude gate: L=3 0..1 785M→982M items
+   (+25%); excluding side-field edges (hypothesis: hoists bypass the
+   cycle-local side pre-filter) made it WORSE (1.09B) — hypothesis
+   wrong, mechanism not understood. Lesson: don't reorder fork
+   decisions past the cycle-local prunes without cost attribution.
+   Next lever must start from a perf + item-class profile of the
+   stage-2 engine on 2..2; then predicate-valued records
+   (cross-opcode outcome classes, 45% of residual wall).
 4. ISR_CNT provenance (prov becomes a small field-SET: MOV→ISR
    resets, OUT→ISR sets from a field, IN accumulates a field).
 
