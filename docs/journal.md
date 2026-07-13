@@ -65,7 +65,6 @@ merged (47.2M canon-rep pairs → 684K strict fingerprints, ~69:1;
 champion/L=4-side). 009 gap check, serializer specs, stage 4 ISR_CNT
 in flight.
 
-||||||| 2acc442
 ## 2026-07-13 (night) — 008 stage 4: ISR shift-counter provenance
 
 Built the ISR_CNT provenance chain in the narrow engine (worktree
