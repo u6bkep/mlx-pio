@@ -1182,45 +1182,62 @@ fn tx_a_l2_01_split() {
 /// collapse the same way). Also checks idempotence on all 65,536
 /// words. This is the "battery verifies, lemmas prove" contract: a
 /// lemma bug shows up here as a behavioral diff.
+/// The diverse state battery shared by `word_canon_battery_sound` and
+/// `word_quotient_gap_census`.
+fn state_battery(cfg: &NCfg) -> Vec<pio_superopt::narrow::NState> {
+    use pio_superopt::narrow::NState;
+    let xs = [0u32, 1, 2, 5, 31, 32, 0x8000_0000, 0xFFFF_FFFF, 0xA5A5_5A5A];
+    let mut states = Vec::new();
+    // 48 states, not 24: the strides below are modular, and joint cases
+    // (e.g. isr_count == 32 AND a full RX FIFO, i ≡ 6 mod 7 ∧ i ≡ 2
+    // mod 5 → i = 27) only appear past two dozen states.
+    for i in 0..48usize {
+        let mut st = NState::new(cfg);
+        st.x = xs[i % xs.len()];
+        st.y = xs[(i * 7 + 3) % xs.len()];
+        // Stride 4 is coprime with 9: the old (i*3+1)%9 only ever hit
+        // indices {1,4,7} = {1, 31, 0xFFFF_FFFF} — every probed ISR had
+        // bit0 set, so ISR-vs-constant folds could slip the battery.
+        st.isr = xs[(i * 4 + 1) % xs.len()];
+        st.osr = xs[(i * 5 + 2) % xs.len()];
+        st.isr_count = [0u8, 1, 4, 7, 8, 31, 32][i % 7];
+        st.osr_count = [32u8, 0, 1, 7, 8, 31, 16][i % 7];
+        st.irq_flags = [0u8, 1, 0x80, 0xFF, 2, 0x55][i % 6];
+        st.out_latch = xs[(i * 11 + 4) % xs.len()];
+        st.dir_latch = [0u32, u32::MAX, 0x0000_FFFF][i % 3];
+        st.pc = (i % 4) as u8;
+        for k in 0..(i % 5) {
+            st.tx.push(0x1111_1111u32.wrapping_mul(k as u32 + 1));
+        }
+        // i%5, not i%4: the battery must include FULL RX FIFOs (4/4) —
+        // PUSH's block bit is only consulted when RX is full.
+        for k in 0..((i + 2) % 5) {
+            st.rx.push(0x2222_2222u32.wrapping_mul(k as u32 + 1));
+        }
+        states.push(st);
+    }
+    states
+}
+
+/// Run word `w` for one cycle from `st0` and return the final state.
+fn step_word(
+    cfg: &NCfg,
+    st0: &pio_superopt::narrow::NState,
+    w: u16,
+    gpio: u32,
+) -> pio_superopt::narrow::NState {
+    let mut c = cfg.clone();
+    c.code = [w; 32];
+    let mut st = *st0;
+    pio_superopt::narrow::step(&mut st, &c, gpio);
+    st
+}
+
 #[test]
 fn word_canon_battery_sound() {
     use pio_superopt::narrow::engine::word_canon;
-    use pio_superopt::narrow::{step, NState};
 
-    fn battery(cfg: &NCfg) -> Vec<NState> {
-        let xs = [0u32, 1, 2, 5, 31, 32, 0x8000_0000, 0xFFFF_FFFF, 0xA5A5_5A5A];
-        let mut states = Vec::new();
-        for i in 0..24usize {
-            let mut st = NState::new(cfg);
-            st.x = xs[i % xs.len()];
-            st.y = xs[(i * 7 + 3) % xs.len()];
-            st.isr = xs[(i * 3 + 1) % xs.len()];
-            st.osr = xs[(i * 5 + 2) % xs.len()];
-            st.isr_count = [0u8, 1, 4, 7, 8, 31, 32][i % 7];
-            st.osr_count = [32u8, 0, 1, 7, 8, 31, 16][i % 7];
-            st.irq_flags = [0u8, 1, 0x80, 0xFF, 2, 0x55][i % 6];
-            st.out_latch = xs[(i * 11 + 4) % xs.len()];
-            st.dir_latch = [0u32, u32::MAX, 0x0000_FFFF][i % 3];
-            st.pc = (i % 4) as u8;
-            for k in 0..(i % 5) {
-                st.tx.push(0x1111_1111u32.wrapping_mul(k as u32 + 1));
-            }
-            for k in 0..(i % 4) {
-                st.rx.push(0x2222_2222u32.wrapping_mul(k as u32 + 1));
-            }
-            states.push(st);
-        }
-        states
-    }
-
-    fn step_word(cfg: &NCfg, st0: &NState, w: u16, gpio: u32) -> NState {
-        let mut c = cfg.clone();
-        c.code = [w; 32];
-        let mut st = *st0;
-        step(&mut st, &c, gpio);
-        st
-    }
-
+    let battery = state_battery;
     let tx_a = tx_a_spec(460).0.cfg;
     let one_pin = cfg_for(
         Config {
@@ -1267,6 +1284,151 @@ fn word_canon_battery_sound() {
         }
         eprintln!("word_canon[{name}]: {merged} of 65536 words respelled, battery-verified");
     }
+}
+
+/// Ticket 009 completeness census: fingerprint EVERY word's one-cycle
+/// behavior (final full state over the shared state battery x 4 gpio
+/// words) under the champion_family_mine config (1-pin SET and OUT
+/// windows, coincident), group words by fingerprint, and report groups
+/// spanning >1 `word_canon` class — words the battery says are
+/// interchangeable in every probed state but the quotient keeps apart.
+/// Battery equality is necessary, not sufficient, so the counts are an
+/// UPPER bound on the true gap; multi-class groups are re-verified
+/// exactly (full state-vector comparison, not hash) before counting.
+/// `cargo test --release --test narrow_engine -- --ignored word_quotient_gap_census --nocapture`
+#[test]
+#[ignore]
+fn word_quotient_gap_census() {
+    use pio_superopt::narrow::engine::word_canon;
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+
+    let one_pin = cfg_for(
+        Config {
+            pins: PinMap {
+                set_base: 0,
+                set_count: 1,
+                out_base: 0,
+                out_count: 1,
+                in_base: 0,
+                ..PinMap::default()
+            },
+            ..Config::default()
+        },
+        0,
+        31,
+    );
+    let states = state_battery(&one_pin);
+    let gpios = [0u32, u32::MAX, 0x0000_0101, 1 << 8];
+    let fingerprint = |w: u16| -> Vec<pio_superopt::narrow::NState> {
+        let mut v = Vec::with_capacity(states.len() * gpios.len());
+        for st in &states {
+            for g in gpios {
+                v.push(step_word(&one_pin, st, w, g));
+            }
+        }
+        v
+    };
+
+    // Is `w` constructible by the fork loop? Mirrors `values_into`:
+    // the search never emits reserved encodings (WAIT src 3, IN src
+    // 4/5, MOV op 3 / src 4, SET dst 3/5..7, IRQ dead bits), and
+    // PUSH/PULL operand bits 0..4 are never decided (left 0).
+    fn enumerable(w: u16) -> bool {
+        let lo = w & 0xFF;
+        match (w >> 13) & 0x7 {
+            1 => (lo >> 5) & 0x3 != 3,
+            2 => !matches!((lo >> 5) & 0x7, 4 | 5),
+            4 => lo & 0x1F == 0,
+            5 => (lo >> 3) & 0x3 != 3 && lo & 0x7 != 4,
+            6 => lo & 0x88 == 0,
+            7 => matches!((lo >> 5) & 0x7, 0 | 1 | 2 | 4),
+            _ => true,
+        }
+    }
+
+    let mut groups: HashMap<u64, Vec<u16>> = HashMap::new();
+    for w in 0..=0xFFFFu16 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        fingerprint(w).hash(&mut h);
+        groups.entry(h.finish()).or_default().push(w);
+    }
+    let classes: std::collections::HashSet<u16> =
+        (0..=0xFFFFu16).map(|w| word_canon(w, &one_pin)).collect();
+
+    let (mut gap_groups, mut gap_classes, mut gap_words, mut hash_collisions) = (0u32, 0u32, 0u32, 0u32);
+    let (mut egap_groups, mut egap_classes, mut egap_words) = (0u32, 0u32, 0u32);
+    let mut samples: Vec<String> = Vec::new();
+    for members in groups.values() {
+        let mut by_class: HashMap<u16, Vec<u16>> = HashMap::new();
+        for &w in members {
+            by_class.entry(word_canon(w, &one_pin)).or_default().push(w);
+        }
+        if by_class.len() < 2 {
+            continue;
+        }
+        // Exact re-verification against the group's first member.
+        let rep = fingerprint(members[0]);
+        if members.iter().any(|&w| fingerprint(w) != rep) {
+            hash_collisions += 1;
+            continue;
+        }
+        gap_groups += 1;
+        gap_classes += by_class.len() as u32 - 1;
+        gap_words += members.len() as u32;
+        // Restricted to words the search can actually construct.
+        let mut eby_class: HashMap<u16, Vec<u16>> = HashMap::new();
+        for &w in members {
+            if enumerable(w) {
+                eby_class.entry(word_canon(w, &one_pin)).or_default().push(w);
+            }
+        }
+        if eby_class.len() < 2 {
+            continue;
+        }
+        egap_groups += 1;
+        egap_classes += eby_class.len() as u32 - 1;
+        egap_words += eby_class.values().map(|v| v.len() as u32).sum::<u32>();
+        if samples.len() < 40 {
+            let mut reps: Vec<u16> = eby_class.keys().copied().collect();
+            reps.sort_unstable();
+            let mm: Vec<Vec<String>> = reps
+                .iter()
+                .map(|r| eby_class[r].iter().map(|w| format!("{w:04x}")).collect())
+                .collect();
+            samples.push(format!("classes {reps:04x?} members {mm:x?}"));
+        }
+    }
+    eprintln!(
+        "gap census[one_pin]: words=65536 canon_classes={} behavior_groups={} | \
+         multi-class groups={} excess_classes={} words_involved={} hash_collisions={}",
+        classes.len(),
+        groups.len(),
+        gap_groups,
+        gap_classes,
+        gap_words,
+        hash_collisions
+    );
+    eprintln!(
+        "gap census[one_pin] ENUMERABLE only: groups={} excess_classes={} words_involved={}",
+        egap_groups, egap_classes, egap_words
+    );
+    for s in &samples {
+        eprintln!("  gap: {s}");
+    }
+
+    // The census pair: set pins,1 (0xE001) vs mov pins,!null (0xA00B)
+    // — behaviorally identical here (SET and OUT windows coincide).
+    // mov pins,!x (0xA009) is state-DEPENDENT (writes ~x) and must NOT
+    // share a fingerprint with either.
+    assert_eq!(fingerprint(0xE001), fingerprint(0xA00B), "E001/A00B diverge on the battery");
+    assert_ne!(fingerprint(0xE001), fingerprint(0xA009), "A009 wrongly matches E001 on the battery");
+    eprintln!(
+        "pair check: canon(E001)={:04x} canon(A00B)={:04x} canon(A009)={:04x}",
+        word_canon(0xE001, &one_pin),
+        word_canon(0xA00B, &one_pin),
+        word_canon(0xA009, &one_pin)
+    );
 }
 
 /// Champion-family mining for the static canonicalization program
