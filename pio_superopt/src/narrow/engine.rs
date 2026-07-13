@@ -144,6 +144,12 @@ pub struct Stats {
     /// cost (walks ending Unclean are calls − look_refuted).
     pub walk_calls: u64,
     pub walk_cycles: u64,
+    /// Children pushed per fork edge, attributed by demanded field
+    /// kind (indexes = FieldKind declaration order; 17 = delay
+    /// post-fork, 18 = deferred JMP target). Sizing for the
+    /// data-plane-superposition question: which field kinds carry the
+    /// fork mass.
+    pub fork_kinds: [u64; 19],
     /// Items refuted by a consulted-set memo hit (subtree skipped).
     pub memo_hits: u64,
     /// Probes whose key CORE matched at least one record (hit or not) —
@@ -245,6 +251,35 @@ enum FieldKind {
     SetDst,
     SetData,
 }
+
+/// Stable index for fork attribution (Stats::fork_kinds).
+fn kind_idx(k: FieldKind) -> usize {
+    match k {
+        FieldKind::Side => 0,
+        FieldKind::Opcode => 1,
+        FieldKind::JmpCond => 2,
+        FieldKind::WaitPol => 3,
+        FieldKind::WaitSrc => 4,
+        FieldKind::WaitIdx => 5,
+        FieldKind::InSrc => 6,
+        FieldKind::BitCount => 7,
+        FieldKind::OutDst => 8,
+        FieldKind::PushPullBits => 9,
+        FieldKind::MovDst => 10,
+        FieldKind::MovOp => 11,
+        FieldKind::MovSrc => 12,
+        FieldKind::IrqBits => 13,
+        FieldKind::IrqIdx => 14,
+        FieldKind::SetDst => 15,
+        FieldKind::SetData => 16,
+    }
+}
+
+pub const FORK_KIND_NAMES: [&str; 19] = [
+    "Side", "Opcode", "JmpCond", "WaitPol", "WaitSrc", "WaitIdx", "InSrc", "BitCount", "OutDst",
+    "PushPullBits", "MovDst", "MovOp", "MovSrc", "IrqBits", "IrqIdx", "SetDst", "SetData",
+    "Delay", "JmpTarget",
+];
 
 /// Which scratch registers a candidate field value names (for P1-lite).
 fn names_regs(kind: FieldKind, v: u16) -> (bool, bool) {
@@ -1746,6 +1781,20 @@ struct FamilyProbe {
     fail_depth: u64,
     fail_surv: u64,
     fail_bind: u64,
+    /// Local-equivalence classifier (`PIO_NARROW_LOCAL_EQ=<stride>`):
+    /// every stride-th single-conflict miss, lock-step the two
+    /// programs from the prober's state until BOTH complete the
+    /// conflict slot once — equal captures throughout and equal states
+    /// at that point means a state-CONDITIONED word-interchange lemma
+    /// would have folded this miss (upper bound on the static/
+    /// conditioned lemma path's wall coverage).
+    le_stride: u64,
+    le_checked: u64,
+    le_equiv: u64,
+    le_state_div: u64,
+    le_capture_div: u64,
+    le_unreached: u64,
+    le_capped: u64,
 }
 
 impl FamilyProbe {
@@ -1766,6 +1815,16 @@ impl FamilyProbe {
             fail_depth: 0,
             fail_surv: 0,
             fail_bind: 0,
+            le_stride: std::env::var("PIO_NARROW_LOCAL_EQ")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            le_checked: 0,
+            le_equiv: 0,
+            le_state_div: 0,
+            le_capture_div: 0,
+            le_unreached: 0,
+            le_capped: 0,
         }
     }
 
@@ -1791,6 +1850,18 @@ impl FamilyProbe {
             max,
             &hist[1..12],
         );
+        if self.le_stride > 0 {
+            eprintln!(
+                "local-eq {tag}: checked={} equiv={} ({:.1}%) state_div={} capture_div={} unreached={} capped={}",
+                self.le_checked,
+                self.le_equiv,
+                self.le_equiv as f64 * 100.0 / self.le_checked.max(1) as f64,
+                self.le_state_div,
+                self.le_capture_div,
+                self.le_unreached,
+                self.le_capped,
+            );
+        }
         if self.walk_stride > 0 {
             eprintln!(
                 "family-walk {tag}: calls={} kills={} ({:.1}%) steps_kill_avg={:.0} steps_fail_avg={:.0} leaves_kill_avg={:.1} fail{{budget={} depth={} surv={} bind={}}}",
@@ -1822,7 +1893,7 @@ impl FamilyProbe {
         proj: &mut Vec<u32>,
     ) {
         self.misses += 1;
-        let Some((slot, cmask, _cval)) = find_single_conflict(
+        let Some((slot, cmask, cval)) = find_single_conflict(
             spec, entry, it, delay_mask, true, mirror_blocked, proj, &mut self.patch_skip,
         ) else {
             return;
@@ -1836,6 +1907,73 @@ impl FamilyProbe {
         let key = h.finish();
         if key & self.sample_mask == 0 {
             *self.families.entry(key).or_insert(0) += 1;
+        }
+        if self.le_stride > 0 && self.single % self.le_stride == 0 {
+            self.le_checked += 1;
+            // Lock-step the prober's program A against the record
+            // spelling B from the prober's state until BOTH complete
+            // the conflict slot once, at the same absolute cycle
+            // (interchange must preserve timing). Equal captures
+            // throughout and equal full states there = a
+            // state-conditioned word-interchange lemma covers this
+            // miss.
+            let mut cfg_a = cfg.clone();
+            cfg_a.code = it.value;
+            let mut cfg_b = cfg_a.clone();
+            cfg_b.code[slot] = (cfg_b.code[slot] & !cmask) | cval;
+            let (mut sa, mut sb) = (it.st, it.st);
+            let (mut na, mut nb) = (it.next_input, it.next_input);
+            let preload = spec.inputs.len() <= 4;
+            let (mut done_a, mut done_b) = (false, false);
+            let mut cyc = it.cycle;
+            let verdict = loop {
+                if cyc >= spec.cycles || cyc - it.cycle >= 64 {
+                    break if cyc >= spec.cycles || !(done_a || done_b) { "unreached" } else { "capped" };
+                }
+                if let Some(&m) = irq_at.get(&cyc) {
+                    sa.irq_flags |= m;
+                    sb.irq_flags |= m;
+                }
+                if !preload {
+                    while (na as usize) < spec.inputs.len() && !sa.tx.is_full() {
+                        sa.tx.push(spec.inputs[na as usize]);
+                        na += 1;
+                    }
+                    while (nb as usize) < spec.inputs.len() && !sb.tx.is_full() {
+                        sb.tx.push(spec.inputs[nb as usize]);
+                        nb += 1;
+                    }
+                }
+                let ext = stim_at(&spec.stim, cyc);
+                let ga = compose(&sa, spec.stim.mask, ext);
+                let gb = compose(&sb, spec.stim.mask, ext);
+                let fa = peek_tick(&sa, &cfg_a) && will_fetch(&sa, &cfg_a, ga) && sa.pc as usize == slot;
+                let fb = peek_tick(&sb, &cfg_b) && will_fetch(&sb, &cfg_b, gb) && sb.pc as usize == slot;
+                if clock_tick(&mut sa, &cfg_a) {
+                    super::step(&mut sa, &cfg_a, ga);
+                }
+                if clock_tick(&mut sb, &cfg_b) {
+                    super::step(&mut sb, &cfg_b, gb);
+                }
+                done_a |= fa && sa.stall == Stall::None;
+                done_b |= fb && sb.stall == Stall::None;
+                let ca = capture_word(&sa, &spec.capture_pins, spec.stim.mask, ext);
+                let cb = capture_word(&sb, &spec.capture_pins, spec.stim.mask, ext);
+                if ca != cb {
+                    break "capture_div";
+                }
+                cyc += 1;
+                if done_a && done_b {
+                    break if sa == sb && na == nb { "equiv" } else { "state_div" };
+                }
+            };
+            match verdict {
+                "equiv" => self.le_equiv += 1,
+                "state_div" => self.le_state_div += 1,
+                "capture_div" => self.le_capture_div += 1,
+                "unreached" => self.le_unreached += 1,
+                _ => self.le_capped += 1,
+            }
         }
         if self.walk_stride > 0 && self.single % self.walk_stride == 0 {
             self.walk_calls += 1;
@@ -2927,6 +3065,13 @@ fn search_impl(
             }
         }
         if instrument && last_beat.elapsed().as_secs() >= 10 {
+            let named: Vec<String> = FORK_KIND_NAMES
+                .iter()
+                .zip(stats.fork_kinds.iter())
+                .filter(|(_, &c)| c > 0)
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect();
+            eprintln!("narrow-search: fork attribution: {}", named.join(" "));
             eprintln!(
                 "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} walks={} wcyc={} cyc={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
                 stats.items,
@@ -3226,6 +3371,7 @@ fn search_impl(
                         child.named |= nx | ny;
                         stack.push(child);
                         stats.forks += 1;
+                        stats.fork_kinds[kind_idx(field.kind)] += 1;
                         pushed += 1;
                     }
                     if memo_on {
@@ -3287,6 +3433,7 @@ fn search_impl(
                             child.value[fetch_pc] |= t;
                             stack.push(child);
                             stats.forks += 1;
+                            stats.fork_kinds[18] += 1;
                             pushed += 1;
                         }
                         if memo_on {
@@ -3478,6 +3625,7 @@ fn search_impl(
                         child.prev_nop_submax = true;
                         stack.push(child);
                         stats.forks += 1;
+                        stats.fork_kinds[17] += 1;
                         stats.canon_pruned += max as u64;
                         pushed = 1;
                     } else {
@@ -3489,6 +3637,7 @@ fn search_impl(
                             child.prev_nop_submax = nop_run && v < max;
                             stack.push(child);
                             stats.forks += 1;
+                            stats.fork_kinds[17] += 1;
                         }
                         pushed = max as u32 + 1;
                     }
@@ -3542,6 +3691,15 @@ fn search_impl(
     if let Some(f) = family.as_ref() {
         f.print("final");
     }
+    if instrument {
+        let named: Vec<String> = FORK_KIND_NAMES
+            .iter()
+            .zip(stats.fork_kinds.iter())
+            .filter(|(_, &c)| c > 0)
+            .map(|(n, c)| format!("{n}={c}"))
+            .collect();
+        eprintln!("narrow-search: fork attribution: {}", named.join(" "));
+    }
     if let Some(d) = dump.as_mut() {
         d.finish(&stats);
     }
@@ -3570,6 +3728,9 @@ fn merge_stats(into: &mut Stats, s: &Stats) {
     into.look_refuted += s.look_refuted;
     into.walk_calls += s.walk_calls;
     into.walk_cycles += s.walk_cycles;
+    for i in 0..19 {
+        into.fork_kinds[i] += s.fork_kinds[i];
+    }
     into.memo_hits += s.memo_hits;
     into.memo_core_matches += s.memo_core_matches;
     into.memo_state_misses += s.memo_state_misses;
