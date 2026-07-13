@@ -4,6 +4,48 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-13 — dead-demand census (ticket 011 first measurement): shift plumbing is LIVE, MOV copies are the dead mass
+
+Env-gated instrument (`PIO_NARROW_DEAD_DEMAND=1`, agent worktree): at
+every data-plane fetch-demand fork, tag the children with the fed
+register's SC mask (pending until the instruction completes, so its
+own operand reads don't count); the fork resolves live (a
+`word_state_reads` consult / walk read / memo-hit rmask intersected
+the mask before the subtree ended) or dead (refuted or closed with the
+tag unread). One tag slot per item (concurrent qualifying forks are
+`nested_untracked`; same-instruction field chains merge); per-fork =
+first-outcome-seen via a DFS watermark. Item 252 → 260 bytes; flag-off
+= one always-false test per hook; 13 fast gates green with the flag
+off AND on.
+
+150s sequential 2..2 mine (90.1M items, 76.5M refuted, 0 champions):
+
+| kind | tracked | live | dead | dead-frac |
+|---|---|---|---|---|
+| SetData | 41 | 0 | 41 | **1.00** (thin sample; +864K memo-unresolved) |
+| BitCount/IN | 9,176 | 9,175 | 1 | **0.0001** |
+| BitCount/OUT | 9,058 | 9,057 | 1 | **0.0001** |
+| MovSrc | 36,820 | 9,204 | 27,616 | **0.75** |
+| MovOp | 36,820 | 9,204 | 27,616 | **0.75** |
+| InSrc | 9,204 | 9,175 | 1 | 0.0001 |
+| OutDst | 10,229 | 9,057 | 1 | 0.0001 |
+
+**Verdict shape:** the BitCount 28.6%-of-fork-mass prize is ~0% dead
+on this wall — in a wrap loop the shift chain re-executes within
+cycles and OUT/IN unconditionally read SC_OSR/SC_OSR_CNT/SC_ISR, so
+the written state is read (one-hop) almost immediately; stage (c)'s
+Fn1 cannot absorb chained shifts, so those live reads are collapses,
+not deletions. The collapsible mass concentrates in **MOV→reg copies:
+75% dead × (MovSrc 13.1% + MovOp 2.3% of fork mass) ≈ 11.5%**, plus
+SetData's ~100% (negligible mass here, 6K forks). Caveats: one-hop
+read liveness (a read by a downstream instruction whose own effect is
+dead still counts live — dead fraction is a lower bound, but the
+BitCount ~0% specifically reflects self-chain reads); first-outcome
+approximation; 150s shallow bias; tracked is a minority sample (~5%
+of data-plane fork events — one tag slot, nested dominate); SetData
+n=41. Full log: `pio_superopt/runs/dd_census_2v2_150s.log` (untracked;
+beat 14 = final).
+
 ## 2026-07-13 (late night) — wave 1 complete: 4/4 agent workstreams merged
 
 First parallel-worktree wave (user's new working mode), all merged
