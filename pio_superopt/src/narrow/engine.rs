@@ -3074,17 +3074,25 @@ fn junk_walk(
                 CntEffect::Accum | CntEffect::None => {}
             }
         }
-        // A completed delay — DECIDED or not — contributes NO cond:
-        // the time-shift theorem makes the verdict independent of its
-        // value either way, so walk records are delay-AGNOSTIC (a
-        // reconvergent spelling with a different decided delay
-        // memo-hits instead of re-walking; measured pre-change: walks
-        // were 51% of engine cycles and decided-delay values were 50%
-        // of residual cond conflicts). Every crossing IS a shift point
-        // for the OOB horizon bound, since a prober's value may exceed
-        // the walked one by up to max_delay.
+        // A completed UNDECIDED delay contributes no cond and counts a
+        // shift point: the walk reads it as 0 — the MINIMUM spelling —
+        // so every other family member shifts later instructions
+        // LATER, never into the clean window, and refutes at the same
+        // absolute cycle (OOB horizon-bounded per shift point). A
+        // DECIDED delay's cond MUST be recorded (Codex review S4,
+        // 2026-07-13): a prober matching the record with a SMALLER
+        // decided value would shift a downstream latch writer EARLIER,
+        // into the walked window, voiding the cleanliness premise —
+        // the fully-delay-agnostic record (2a4c5fa) was unsound on
+        // exactly that path (and measured ~flat anyway).
         if fetching && it.st.stall == Stall::None && delay_mask != 0 {
-            shift_points += 1;
+            if it.decided[fetch_pc] & delay_mask == delay_mask {
+                if memo_on {
+                    w_mask[fetch_pc] |= delay_mask;
+                }
+            } else {
+                shift_points += 1;
+            }
         }
     };
     if refuted && memo_on {
