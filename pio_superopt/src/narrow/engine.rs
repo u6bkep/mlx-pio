@@ -81,11 +81,17 @@ pub struct EngineSpec {
     pub expected: Vec<u32>,
     /// Pre-decided fields of the root item: `(slot, decided_mask,
     /// value)` — constrained resynthesis (pin known scaffolding, search
-    /// the rest). A seed that names a register disables the P1
-    /// first-naming prune (the caller chose the spelling); NOTE that
-    /// champions may still be register-MIRRORS of the seed when a
-    /// binding fork executes — post-filter if the seed spelling is
-    /// load-bearing.
+    /// the rest). Masks MUST be whole-semantic-field aligned (validated
+    /// at search entry, panics otherwise — see `validate_seed`): the
+    /// binding fork's mirror twin and the fork loops' `value |= v`
+    /// writes are only sound for whole-field decided masks. A seed that
+    /// names a register disables the P1 first-naming prune (the caller
+    /// chose the spelling), and any seeded bits on a slot disable the
+    /// P2/P4 canonicity prunes for that slot (the canonical
+    /// representative is a same-slot sibling the seed may exclude);
+    /// NOTE that champions may still be register-MIRRORS of the seed
+    /// when a binding fork executes — post-filter if the seed spelling
+    /// is load-bearing.
     pub seed: Vec<(u8, u16, u16)>,
     /// Consulted-set memo capacity in entries (0 disables). Records are
     /// FAILURE-ONLY (an exhausted, champion-free subtree keyed by its
@@ -716,6 +722,105 @@ pub fn mirror_word(w: u16) -> u16 {
             (w & !((0x7 << 5) | 0x7)) | (dst << 5) | src
         }
         _ => w,
+    }
+}
+
+/// S6 guard: seeded-search entry validation. `EngineSpec::seed` masks
+/// must be WHOLE-SEMANTIC-FIELD aligned, for two reasons:
+///
+/// 1. The binding fork represents an item's register-mirror twin by
+///    mirroring `value` under the SAME `decided` mask, and
+///    `mirror_word` permutes 3-bit field VALUES — a permutation
+///    commutes with a decided mask only when the mask covers whole
+///    fields (a partial mask constrains a value SET that maps to a
+///    non-mask-expressible set after mirroring). `mirror_word` also
+///    decodes a zero-filled undecided opcode as JMP, so operand bits
+///    seeded without a full opcode would be mis-permuted.
+/// 2. The fork loops write `child.value |= v` over whole-field
+///    candidate values; a partially seeded field is still "undecided"
+///    to `demand`, so it would be re-forked over ALL field values,
+///    ORing garbage over the seeded bits.
+///
+/// The engine's own forks always decide whole fields — fetch-demand
+/// fork: `field.mask` from the `demand` tables; deferred JMP-target
+/// fork: `0x001F`; delay post-fork: `delay_mask`; fixed slots: the
+/// whole word `0xFFFF`; the binding fork decides nothing — so a root
+/// seed is the ONLY entry point for a partial-field mask, and
+/// engine-generated seeds (the split driver's frontier units) always
+/// pass this check.
+fn validate_seed(spec: &EngineSpec) {
+    let delay_bits = 5 - spec.cfg.side_count.min(5);
+    let delay_mask: u16 = if delay_bits == 0 { 0 } else { ((1u16 << delay_bits) - 1) << 8 };
+    let side_mask: u16 = if spec.cfg.side_count > 0 {
+        (((1u16 << spec.cfg.side_count) - 1) << (5 - spec.cfg.side_count)) << 8
+    } else {
+        0
+    };
+    // Combined per-slot masks/values (a slot may appear in several
+    // entries); overlapping entries must agree.
+    let mut dm = [0u16; 32];
+    let mut vm = [0u16; 32];
+    for &(s, d, v) in &spec.seed {
+        assert!(
+            s < spec.slots,
+            "EngineSpec::seed slot {s} is outside the searched footprint (slots = {}): \
+             slots >= `slots` are fixed NOPs and cannot be seeded",
+            spec.slots
+        );
+        let s = s as usize;
+        let overlap = dm[s] & d;
+        assert!(
+            (vm[s] ^ v) & overlap == 0,
+            "EngineSpec::seed slot {s}: conflicting values on overlapping seeded bits \
+             {overlap:#06x}"
+        );
+        dm[s] |= d;
+        vm[s] |= v & d;
+    }
+    for s in 0..spec.slots as usize {
+        let d = dm[s];
+        if d == 0 {
+            continue;
+        }
+        let whole = |m: u16, name: &str| {
+            assert!(
+                d & m == 0 || d & m == m,
+                "EngineSpec::seed slot {s}: decided mask {d:#06x} splits the {name} \
+                 semantic field {m:#06x} — seeds must be whole-field aligned (S6: the \
+                 binding fork's mirror twin and the fork loops are only sound for \
+                 whole-field decided masks)"
+            );
+        };
+        whole(side_mask, "side-set");
+        whole(delay_mask, "delay");
+        whole(0xE000, "opcode");
+        if d & 0x00FF == 0 {
+            continue;
+        }
+        assert!(
+            d & 0xE000 == 0xE000,
+            "EngineSpec::seed slot {s}: operand bits {:#06x} seeded without a fully \
+             seeded opcode — field boundaries are opcode-dependent, and `mirror_word` \
+             decodes a zero-filled opcode as JMP (S6)",
+            d & 0x00FF
+        );
+        // Per-opcode semantic fields (mirrors the `demand` tables plus
+        // the deferred JMP-target fork). Dead bits (PUSH/PULL 0..4,
+        // IRQ bit 7) are never forked or mirrored, so seeding them is
+        // harmless and allowed.
+        let fields: &[(u16, &str)] = match (vm[s] >> 13) & 0x7 {
+            0 => &[(0x00E0, "JMP cond"), (0x001F, "JMP target")],
+            1 => &[(0x0080, "WAIT polarity"), (0x0060, "WAIT src"), (0x001F, "WAIT index")],
+            2 => &[(0x00E0, "IN src"), (0x001F, "IN count")],
+            3 => &[(0x00E0, "OUT dst"), (0x001F, "OUT count")],
+            4 => &[(0x00E0, "PUSH/PULL bits")],
+            5 => &[(0x00E0, "MOV dst"), (0x0018, "MOV op"), (0x0007, "MOV src")],
+            6 => &[(0x0060, "IRQ bits"), (0x001F, "IRQ index")],
+            _ => &[(0x00E0, "SET dst"), (0x001F, "SET data")],
+        };
+        for &(m, name) in fields {
+            whole(m, name);
+        }
     }
 }
 
@@ -3150,6 +3255,9 @@ fn search_impl(
     progress: Option<&std::sync::atomic::AtomicU64>,
     quotient: Option<&mut WordQuotient>,
 ) -> SearchResult {
+    // S6 guard: partial-field seed masks make the binding fork's mirror
+    // twin (and the fork loops' `|= v` writes) unsound — reject at entry.
+    validate_seed(spec);
     let nop = crate::ir::Insn::nop_for(&crate::ir::SideCfg {
         count: spec.cfg.side_count,
         en: spec.cfg.side_en,
@@ -3181,6 +3289,18 @@ fn search_impl(
         // (disabling the P1 prune is always sound, only less pruned).
         if d & 0xE000 != 0xE000 || word_touches_regs(v) {
             root.named = true;
+        }
+    }
+    // S5 guard: the P2/P4 canonicity prunes argue "the canonical
+    // representative of this spelling exists as a sibling fork of the
+    // SAME slot" — a seed on that slot can exclude the representative
+    // (e.g. dst pinned to Y excludes `mov x,x`; opcode pinned to JMP
+    // excludes the MOV nop), turning a satisfiable seeded search into
+    // a false impossibility. Both prunes disarm on seeded slots.
+    let mut seeded_slots = 0u32;
+    for &(s, d, _) in &spec.seed {
+        if d != 0 {
+            seeded_slots |= 1u32 << s;
         }
     }
     for &p in &spec.output_pins {
@@ -3527,7 +3647,10 @@ fn search_impl(
                         // `mov x,x` (NOP_CANON), so only y,y is pruned.
                         // ISR/OSR self-moves reset the target's shift
                         // counter (datasheet 11.4.10) — real ops, kept.
-                        if field.kind == FieldKind::MovSrc {
+                        // Disarmed on seeded slots (S5): the `mov x,x`
+                        // sibling lives in this slot's MovDst fork,
+                        // which a seed may have pinned away.
+                        if field.kind == FieldKind::MovSrc && seeded_slots >> fetch_pc & 1 == 0 {
                             let dst = (it.value[fetch_pc] >> 5) & 0x7;
                             let mov_op = (it.value[fetch_pc] >> 3) & 0x3;
                             if mov_op == 0 && raw == dst && dst == 2 {
@@ -3645,7 +3768,14 @@ fn search_impl(
                             // with a non-writing condition is a no-op
                             // respelling; the canonical spelling lives
                             // in the MOV sibling of the opcode fork.
-                            if cond != 2 && cond != 4 && t == ft as u16 {
+                            // Disarmed on seeded slots (S5): a seed
+                            // pinning this slot's opcode to JMP
+                            // excludes that MOV sibling.
+                            if cond != 2
+                                && cond != 4
+                                && t == ft as u16
+                                && seeded_slots >> fetch_pc & 1 == 0
+                            {
                                 stats.canon_pruned += 1;
                                 continue;
                             }
@@ -3700,6 +3830,11 @@ fn search_impl(
             // diverge the moment an asymmetric event executes — PULL's
             // implicit physical-X read with x != y, or a pending_exec
             // word (data is not mirror-renamed) touching any register.
+            // Mirroring `value` under an UNCHANGED `decided` mask is
+            // sound only because every decided mask here is a union of
+            // whole semantic fields: engine forks decide whole fields
+            // by construction and `validate_seed` enforces it for root
+            // seeds (S6).
             // Fork: one child keeps the words as spelled; the other
             // BECOMES the twin as an ordinary concrete item — decided
             // searched slots mirrored, x/y swapped (the twin's true

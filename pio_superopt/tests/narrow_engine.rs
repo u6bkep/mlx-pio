@@ -742,6 +742,189 @@ fn pull_empty_binding_fork() {
     );
 }
 
+/// S5 soundness gate, P2 arm (external review, 2026-07-13): P2 prunes
+/// `mov y,y` because its canonical representative `mov x,x` exists as a
+/// sibling of the MovDst fork — but a seed that PINS dst = Y excludes
+/// that sibling from the space. Topology: slot 0 loads y = 3, slot 1 is
+/// seeded to `mov y, <src free>` (dst/op pinned, src searched), slot 2
+/// emits y to the pins, slot 3 parks. The trace requires y == 2 at the
+/// emit — distinguishable from the all-ones idle latch (3) AND from
+/// every other enumerable src (x/null/status/isr/osr read 0, pins reads
+/// the idle 3) — so `mov y,y` is the ONLY satisfying spelling of
+/// slot 1. An unguarded P2 prunes it (its representative `mov x,x` is
+/// out-of-seed) and a satisfiable seeded search returns impossible.
+#[test]
+fn s5_p2_seeded_mov_dst_not_pruned() {
+    let config = Config {
+        pins: PinMap { out_base: 0, out_count: 2, in_base: 0, ..PinMap::default() },
+        ..Config::default()
+    };
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config, 0, 3),
+        slots: 4,
+        cycles: 6,
+        inputs: vec![],
+        output_pins: vec![0, 1],
+        capture_pins: vec![0, 1],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![
+            (0, 0xFFFF, 0xE042), // set y, 2
+            (1, 0xE0F8, 0xA040), // mov y, <src undecided>; op none, delay free
+            (2, 0xFFFF, 0xA002), // mov pins, y
+            (3, 0xFFFF, 0x0003), // jmp 3 (park)
+        ],
+        memo_cap: 0,
+    };
+    let mut w = words_of(&[], &SideCfg::NONE);
+    w[0] = 0xE042;
+    w[1] = 0xA042; // mov y, y — the seeded space's only satisfying src
+    w[2] = 0xA002;
+    w[3] = 0x0003;
+    spec.expected = run_spec(&spec, w);
+    let result = search(&spec, 1000);
+    assert_champions_sound(&spec, &result.champions);
+    assert!(
+        result.stats.champions_found > 0 && covered(&result.champions, &w),
+        "S5/P2: seeded `mov y,y` pruned in favor of an out-of-seed representative \
+         (champions={})",
+        result.stats.champions_found
+    );
+    eprintln!(
+        "s5_p2 gate: items={} canon_pruned={} champions={}",
+        result.stats.items, result.stats.canon_pruned, result.stats.champions_found
+    );
+}
+
+/// S5 soundness gate, P4 arm: P4 prunes a non-writing JMP to its own
+/// fallthrough because the canonical no-op spelling lives in the MOV
+/// sibling of the OPCODE fork — but a seed that pins the opcode to JMP
+/// (cond = always, target searched) excludes that sibling. Topology:
+/// slot 0 is the seeded JMP, slot 1 (seeded `set pins,0`) must execute
+/// from cycle 1 on — the pin idles HIGH (all-ones latch), so target = 1
+/// (the fallthrough) is the ONLY satisfying target: target = 0
+/// self-loops and leaves the pin high. An unguarded P4 prunes
+/// t == fallthrough and returns impossible.
+#[test]
+fn s5_p4_seeded_jmp_fallthrough_not_pruned() {
+    let config = Config {
+        pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 1, ..PinMap::default() },
+        ..Config::default()
+    };
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config, 0, 1),
+        slots: 2,
+        cycles: 6,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![
+            (0, 0xE0E0, 0x0000), // jmp always, <target undecided>, delay free
+            (1, 0xFFFF, 0xE000), // set pins, 0
+        ],
+        memo_cap: 0,
+    };
+    let mut w = words_of(&[], &SideCfg::NONE);
+    w[0] = 0x0001; // jmp 1 — the fallthrough, the only satisfying target
+    w[1] = 0xE000;
+    spec.expected = run_spec(&spec, w);
+    let result = search(&spec, 1000);
+    assert_champions_sound(&spec, &result.champions);
+    assert!(
+        result.stats.champions_found > 0 && covered(&result.champions, &w),
+        "S5/P4: seeded jmp-to-fallthrough pruned in favor of an out-of-seed MOV nop \
+         (champions={})",
+        result.stats.champions_found
+    );
+    eprintln!(
+        "s5_p4 gate: items={} canon_pruned={} champions={}",
+        result.stats.items, result.stats.canon_pruned, result.stats.champions_found
+    );
+}
+
+/// S6 soundness gate: the binding fork mirrors `value` (mirror_word)
+/// while keeping `decided` — X/Y mirroring permutes 3-bit field VALUES,
+/// which does not commute with a partial bit-mask over the field. Seed
+/// slot 2 to `mov pins, <src>` with only BIT 0 of the src selector
+/// decided (=1, i.e. src in {x,null,status,osr}) and force a binding
+/// fork (set y,3 / pull noblock on empty TX with x != y). The twin's
+/// mirrored value turns the seeded "bit0 = 1" into "src = 2" under the
+/// SAME 1-bit decided mask, and the subsequent MovSrc fork ORs whole-
+/// field values over it — enumerating src set {y,null,isr,osr} where
+/// the true mirror space is {y,null,status,osr}: ISR is in NEITHER the
+/// seed nor its register-mirror, so a champion carrying it violates the
+/// seeded-search contract. The guard rejects such seeds at entry:
+/// EngineSpec::seed masks must be whole-semantic-field aligned.
+#[test]
+fn s6_partial_field_seed_rejected() {
+    let config = Config {
+        pins: PinMap { out_base: 0, out_count: 1, ..PinMap::default() },
+        ..Config::default()
+    };
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config, 0, 2),
+        slots: 3,
+        cycles: 6,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![
+            (0, 0xFFFF, 0xE043), // set y, 3
+            (1, 0xFFFF, 0x8080), // pull noblock (TX empty -> reads X, x != y)
+            (2, 0xE0F9, 0xA001), // mov pins, <src>; PARTIAL src mask: bit0 = 1
+        ],
+        memo_cap: 0,
+    };
+    let mut w = words_of(&[], &SideCfg::NONE);
+    w[0] = 0xE043;
+    w[1] = 0x8080;
+    w[2] = 0xA003; // mov pins, null — in the seeded src set
+    spec.expected = run_spec(&spec, w);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| search(&spec, 1000)));
+    match result {
+        Err(payload) => {
+            // Guard in place: the partial-field seed must be rejected
+            // with a message that names the misaligned slot/field.
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(
+                msg.contains("whole-field") || msg.contains("semantic field"),
+                "seed rejected but with an unclear message: {msg}"
+            );
+            eprintln!("s6 gate: partial-field seed rejected as designed: {msg}");
+        }
+        Ok(result) => {
+            // No guard (master behavior): demonstrate the violation —
+            // the twin branch produces a champion whose src is in
+            // neither the seeded set {1,3,5,7} (x,null,status,osr) nor
+            // its true register-mirror {2,3,5,7} (y,null,status,osr).
+            assert_champions_sound(&spec, &result.champions);
+            let bad: Vec<u16> = result
+                .champions
+                .iter()
+                .map(|ch| ch.value[2] & 0x7)
+                .filter(|src| !matches!(src, 1 | 2 | 3 | 5 | 7))
+                .collect();
+            assert!(
+                bad.is_empty(),
+                "S6: binding-fork mirror of a partial-field seed enumerated the wrong \
+                 space — champion src values outside seed-or-mirror: {bad:?}"
+            );
+            eprintln!("s6 gate: champions={} (no violation?)", result.champions.len());
+        }
+    }
+}
+
 /// The shipped tx_a (rs485-eth dme_pio.rs): IRQ→DI toggler with the
 /// jmp-PIN parity absorber, `.side_set 1 opt` on DI, wrap 0..1.
 fn tx_a_words(side: &SideCfg) -> [u16; 32] {
