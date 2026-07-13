@@ -4,6 +4,35 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-13 (night) — 008 stage 4: ISR shift-counter provenance
+
+Built the ISR_CNT provenance chain in the narrow engine (worktree
+agent-acdbc27243f2e17d1). `CntProv` = segment-local field-SET
+provenance mirroring `x_prov`/`y_prov`: a base-pop flag (pop-time
+counter still feeds the value) plus up to 4 deduped `(slot, mask)`
+BitCount entries (overflow flushes into `seg_mask` — over-approximate,
+sound). Transitions at completion, mirrored exactly in `junk_walk`:
+MOV→ISR and PUSH reset to accounted (IFFULL's guard READ consults
+first, covering both guard arms), OUT→ISR sets to its BitCount field,
+IN accumulates its BitCount; pending-exec words are core → nothing
+tracked. A READ of the counter consults exactly the tracked sources
+and then normalizes to accounted. The enabling read-table change:
+`word_state_reads` now returns SC_ISR_CNT for IN only under autopush —
+without autopush the old count feeds nothing but the new count, and
+that dependency rides the provenance. (The BitCount field entries are
+currently redundant with `fetch_footprint`'s 0x00FF for IN/OUT — kept
+anyway so the provenance stays sound if the footprint is ever trimmed
+like SET's immediate.)
+
+Gates: 12/12 narrow_engine tests green (censuses, memo on/off,
+split-vs-sequential). Like-for-like 150s tx_a_l3_22_mine on the idle
+dev box, sequential: items 88.2M→100.9M (+14% throughput), memo_hit
+1.84M→1.98M (+8%), memo entries 656K→484K (−26% — records generalize
+over isr_count, the census's 35% state-miss class), recs_avg 22.6→26.1.
+Truncated-run caveat: items here measures throughput, not
+items-to-complete; the record-count collapse and absolute-hit gain are
+the direct effect signals.
+
 ## 2026-07-13 (late evening) — two-tier census: input data & state both accounted
 
 User challenge: was 250K:1 an empty-FIFO artifact? Re-fingerprinted
