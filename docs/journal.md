@@ -4,6 +4,42 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-13 (night) — realness tests: the monsters' wall belongs to superposition
+
+User course-correction: "are you deciding where to spend effort, or
+whether an optimization is real?" — two realness tests against the
+2..2 wall (probes 2acc442, 15-min run):
+
+**Test 1 — conditioned-lemma coverage (local-eq):** of 18.6M
+single-conflict cond-misses, prober-vs-record lock-stepped until both
+complete the conflict slot at the same cycle: **equiv 13.3%**
+(state-conditioned word-interchange lemmas cover ≤13.3% of the wall),
+**state_div 86.0%** — captures equal but STATES diverge — capture_div
+~0 (52!). Combined with the earlier 84.5% subtree co-refutation: the
+wall is output-equal, state-divergent, doom-insensitive pairs. The
+operative equivalence is "the diverged state is DEAD (refutation
+precedes any read)" — a liveness argument no interchange lemma can
+express. Static/conditioned lemma path on the REFUTATION wall: thin
+(13.3% ceiling); its real target stays champion-side / L=4.
+
+**Test 2 — fork attribution:** Delay 43% (post-stage-2 residue),
+**BitCount 28% (155.6M), MovSrc 15% (82.8M)**, JmpTarget 3.7%, MovOp
+2.6%, everything else small. Data-plane fields (BitCount + MovSrc/
+MovOp/InSrc share + OutDst-partial) ≈ 35-45% of fork mass.
+
+**Both tests point at the same lever: data-plane superposition**
+(provenance-tag symbols for x/y/ISR/OSR/counters). Mechanism check:
+under lazy data fields, the state_div class becomes symbol-equal
+items whose field bits are never read → memo hits — it converts
+exactly the 86% class. Prize on the monsters ≈ the data-plane fork
+share compounded by the memo convergence it unlocks.
+
+**Parallel-wave results (worktree agents, first wave):** pair census
+merged (47.2M canon-rep pairs → 684K strict fingerprints, ~69:1;
+99.68% of mass in cross-spelling families — arity-2 quotient large,
+champion/L=4-side). 009 gap check, serializer specs, stage 4 ISR_CNT
+in flight.
+
 ## 2026-07-13 (late evening) — two-tier census: input data & state both accounted
 
 User challenge: was 250K:1 an empty-FIFO artifact? Re-fingerprinted
