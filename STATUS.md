@@ -30,10 +30,14 @@ delay-conflict pairs co-refute, 100% latch-quiet, 0 diverged; records
 lose their undecided-delay conds). **L=3 0..1: 3.43B→785M items
 (4.4x, 29s); 1..1: 3.14B→717M; L=2 1..1: 104.6M→40.2M.** OOB breaks
 horizon-bounded per shift point (hole caught by the L=1 exact
-census). Next: fresh mining pass on the stage-2 binary (the wall
-census changed under the collapse), then stage 3 (cross-opcode
-outcome records — was 41% of the old wall) + stage 4 (ISR_CNT
-provenance). After all stages: one-shot Codex review (gpt-5.6-sol).
+census). Post-collapse census: residual
+wall = SET-pair delay conds 50% + cross-opcode 41%; JMP-delay class
+GONE (47M→7K). **Demand hoisting tried and REVERTED** (+25% at L=3,
+mechanism not understood — see ticket 008 stage 3). Perf: no
+machinery tax (search_impl 73.8% flat). Next: cost-instrument the
+walk/frontier split, then cross-opcode outcome records; stage 4
+ISR_CNT provenance; then one-shot Codex engine review (gpt-5.6-sol).
+Gated 50-min 2..2 attempt running (txa_l3_22try.log).
 
 ## Emulator fidelity fixed (e4a4860, a810ec5) — holds
 

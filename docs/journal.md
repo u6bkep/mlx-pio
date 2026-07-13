@@ -4,6 +4,25 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-13 (small hours, later) — hoisting tried & reverted; wall re-censused
+
+Post-collapse mining (fresh 15-min instrumented 2..2 run): the old
+44% JMP-delay conflict class is GONE (47M→6,954 sampled); residual
+wall = SET-pair delay conds 50% (delay families whose walk hits a
+fork edge — 93.6% of residual walks are demand_edge) + cross-opcode
+41%. Collapse does 50% of all refutations (look=251.8M of 504.9M).
+
+**Demand hoisting FAILED the magnitude gate and was reverted**: fork
+the walk-edge's future field at the parked point, delay pending —
+L=3 0..1 785M→982M (+25%); the side-filter-bypass hypothesis
+(exclude side edges) made it worse (1.09B), so the mechanism is NOT
+understood. Reverted byte-identically (785,290,370 items reproduce).
+Negative result + lesson in ticket 008: don't reorder fork decisions
+past the cycle-local prunes; next lever starts from cost attribution
+(perf: search_impl 73.8% flat, step 13.8% — no machinery tax; the
+cost is genuine frontier churn). Gated 50-min 2..2 attempt launched
+on the stage-2 engine as benchmark/coup-de-grace (txa_l3_22try.log).
+
 ## 2026-07-13 (small hours) — 008 stage 2: junk-window collapse, 4.4x at L=3
 
 **Mining loop under the new 50-min policy** (three iterations of
