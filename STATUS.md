@@ -24,8 +24,13 @@ re-verify pre-S2/S3: 0..1 764.9M/29s, 1..1 698.4M/26s, verdicts hold.
 **Verdict campaign result: ALL THREE proven brackets RE-REFUTE on the
 repaired memo — 0..0 560.2M items/94s (was 5.33B/26min pre-stage-2:
 9.5x items, 17x wall from the day's compounded levers), 0..1
-781.9M/57s, 1..1 704.8M/38s. CAVEAT LIFTED for the proven brackets;
-2..2 settle-rate re-baseline in the same log.**
+781.9M/57s, 1..1 704.8M/38s. CAVEAT LIFTED for the proven brackets.**
+
+**OVERNIGHT RUN (2026-07-13→14): unit pio-overnight, detached, 10h
+cap, runs/overnight_monsters.log — all five rest brackets in order
+(0..1, 1..1, then MONSTERS 2..2, 1..2, 0..2) on the repaired engine.
+If all refute: footprint <=3 impossible, L=4 ladder unlocks. Check
+this log first next session.**
 
 ## Superposition (ticket 011) — v1 scope NEEDS RE-CUT after census
 
