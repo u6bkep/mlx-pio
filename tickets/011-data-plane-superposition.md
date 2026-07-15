@@ -1,10 +1,36 @@
 # 011 — Data-plane superposition (provenance-tag symbols)
 
-**Status:** design (this doc; no implementation yet) · **Source:**
-realness tests on the 2..2 wall + champion census (journal 2026-07-13
-evening/late-evening/night); user design thread "late evening".
-Subsumes ticket 008's ORIGINAL outcome-grouped-forking design; enables
-multi-case specs (ticket 010 prereq, RX flagship adjacency).
+**Status:** RE-CUT 2026-07-14 — this ticket now ENDS at stage (b);
+see "Re-cut" below · **Source:** realness tests on the 2..2 wall +
+champion census (journal 2026-07-13 evening/late-evening/night); user
+design thread "late evening". Subsumes ticket 008's ORIGINAL
+outcome-grouped-forking design; enables multi-case specs (ticket 010
+prereq, RX flagship adjacency).
+
+## Re-cut (2026-07-14): this ticket stops at stage (b)
+
+The dead-demand census (merged ff6a4b3) refuted stage (c) as BARE
+laziness: **BitCount forks are ~0% dead** — in a wrap loop the shift
+chain re-reads the shifted register within a few cycles (IN reads
+SC_ISR, OUT reads SC_OSR unconditionally, `word_state_reads`), so
+"don't fork until read" gains nothing there; the collapsible-by-pure-
+laziness class is only **MOV/SetData ≈ 11.5%** of fork mass. Deferral
+without a predicate/sub-value read rule cannot touch the 28.6%
+BitCount mass.
+
+Consequences (per ticket 012 §5 — 011 and 012 are ONE lattice: tags =
+where a value comes from, value-set constraints = what is known about
+the defining field; the predicate read is the rule connecting them):
+
+- **Stage (c) is DELETED from this ticket.** Its `Fn1` machinery moves
+  to **012 stage 4**, where the transform is paired with the OUT
+  pin-visible predicate classes that make it pay.
+- **Stages (a) and (b) land here as planned** (they own the 11.5%
+  MOV/SetData slice and force the Item/memo-projection/binding/
+  junk_walk decisions that 012 builds on).
+- **Stage (d) (`Input(k)`, multi-case specs) is unchanged** and
+  follows later — after 012's ladder — under this ticket's design.
+- Ticket 008 closes into 011(a,b) + 012, as recorded in 012 §5.
 
 ## Measured motivation
 
@@ -391,21 +417,17 @@ of the 35-45% — SetData is not in the top-3 fork kinds — its job is
 to land the machinery under the cheapest semantics. Fallback: revert
 (the demand() arm restore is mechanical).
 
-**(c) ISR/OSR data tags + one transform level (`Fn1`).** OUT x/y/isr
-with concrete OSR and undecided BitCount writes
-`Fn1(shift, osr_snapshot, bc)`; IN with dead chain likewise; MOV
-`!`/`::` folds into Field tags. This is the stage aimed at **BitCount
-28.6%** — but only its DEAD-PATH share collapses (a live shift still
-demands at the read; see First Measurement). Gates: stage-b suite +
-serializer-battery census (data-driven specs from bd6f0ac: champion
-sets and verdicts must be IDENTICAL — registers are live there, tags
-must be near-inert, wall-clock within noise) + output-only 2..2 gate
-where the effect should concentrate. Expected: the item-count dent on
-the monsters ≈ dead fraction of BitCount+MovSrc mass compounded by
-memo convergence (86% class). Fallback: revert to (b) — Fn1 is a tag
-variant + replay table, no structural coupling.
+**(c) — DELETED (re-cut 2026-07-14).** Was: ISR/OSR data tags + one
+transform level (`Fn1`) aimed at BitCount 28.6%. REFUTED as bare
+laziness by the dead-demand census (BitCount forks ~0% dead — the
+wrap-loop shift chain re-reads the register within cycles), so
+deferral alone collapses nothing there. The Fn1 machinery moves to
+**ticket 012 stage 4**, paired with the OUT pin-visible predicate
+classes that make the transform pay. See 012 §5 (composition) and the
+Re-cut section above.
 
-**(d) `Input(k)` symbols + multi-case specs.** TX-FIFO tag bitmap;
+**(d) `Input(k)` symbols + multi-case specs** (unchanged by the
+re-cut; follows AFTER ticket 012's ladder). TX-FIFO tag bitmap;
 pull/autopull moves `Input(k)` into OSR as a tag copy; a demand on an
 Input symbol forks the CASE axis (per-case children), which is
 outcome-grouped forking over cases; spec gains a case battery
@@ -423,9 +445,9 @@ stages a-c don't reference Input.
 
 Stage order rationale: (a) is measurement-grade cheap and de-risks
 the junk_walk mirroring; (b) lands representation+memo+binding rules
-on the simplest tag; (c) is the effect-size stage; (d) is the
-flagship-enabling stage and touches the spec surface, so it goes
-last.
+on the simplest tag; the effect-size stage is now 012 stage 4 (where
+(c)'s Fn1 lives); (d) is the flagship-enabling stage and touches the
+spec surface, so it goes last, after 012.
 
 ## 7. Risks
 
@@ -502,31 +524,25 @@ Does NOT address:
   fully concrete forever; superposition buys nothing on pin-dense
   spaces where most instructions are latch writers.
 
-## v1 scope decision (recommendation)
+## v1 scope decision (superseded by the re-cut — kept for provenance)
 
 Build **stages (a) + (b) only**, as two commits: (a) OSR-count
 CntProv (pure stage-4 mirror, bracket-neutral expected), then (b)
 x/y `Field` tags with die-on-transform, skip-set memo rule,
-collapse-at-binding, two-lane step. No Fn1, no predicates, no Input
-symbols, no counter VALUE tags beyond the existing CntProv pattern.
-Rationale: (b) is the smallest stage that forces every hard design
-decision (Item layout, two-lane hot path, memo projection encoding,
-binding collapse, junk_walk mirroring, census extensions) while its
-semantics stay simple enough to audit against exec_op line-by-line;
-its expected effect size is modest and that is acceptable — the
-gates it must pass are exactly the gates (c) will need, and (c) is
-where the 28.6% BitCount / 86% conflict-class prize lives.
+collapse-at-binding. No Fn1, no predicates, no Input symbols, no
+counter VALUE tags beyond the existing CntProv pattern. Rationale:
+(b) is the smallest stage that forces every hard design decision
+(Item layout, memo projection encoding, binding collapse, junk_walk
+mirroring, census extensions) while its semantics stay simple enough
+to audit against exec_op line-by-line; its expected effect size is
+modest and that is acceptable — the gates it must pass are exactly
+the gates 012's ladder needs, and 012 stage 4 is where the 28.6%
+BitCount / 86% conflict-class prize lives.
 
-**First measurement to run BEFORE coding** (instrumentation-only
-probe, PairRace-style, env-gated): a **dead-demand census** on the
-15-min 2..2 mine — at every data-plane fork (SetData, BitCount,
-MovSrc/MovOp, InSrc, OutDst-to-reg), record whether the forked
-field's written register is READ (word_state_reads consult, jmp_taken
-peek, binding event, or latch-feeding chain) before the item's
-subtree refutes. The read-before-refute fraction per field kind is
-the direct upper bound on what stages (b)/(c) can kill — it converts
-"fork attribution 35-45%" into "collapsible fork mass X%", and
-decides whether (c)'s Fn1 complexity is warranted or (b)+predicates
-should come first. (The champion-side answer is known — 250K:1 dead
-on output-only — but the wall lives on REFUTED paths, where the
-84.5% co-refutation number is suggestive, not field-resolved.)
+The dead-demand census this section asked for WAS RUN (merged
+ff6a4b3, journal 2026-07-13) and is what forced the re-cut: it
+converted "fork attribution 35-45%" into "collapsible-by-laziness
+mass ≈ 11.5% (MOV/SetData)", refuted (c) as bare laziness (BitCount
+~0% dead), and routed the Fn1 machinery into 012 stage 4 where it
+pairs with predicate classes. See the Re-cut section at the top and
+012 §5.
