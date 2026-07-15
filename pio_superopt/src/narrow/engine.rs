@@ -1258,7 +1258,13 @@ fn word_state_reads(w: u16, cfg: &NCfg) -> u16 {
             // (008 stage 4).
             src | SC_ISR | if cfg.autopush { SC_ISR_CNT | SC_RX } else { 0 }
         }
-        3 => SC_OSR | SC_OSR_CNT | if cfg.autopull { SC_TX } else { 0 },
+        // OUT always reads the OSR data. The shift counter is a real
+        // READ (threshold compare) only with autopull on; without it
+        // the old count feeds nothing but the new count — that
+        // dependency rides the OSR `CntProv` twin and is consulted
+        // only if the counter is actually read later (011 stage a,
+        // mirroring IN's autopush conditioning above).
+        3 => SC_OSR | if cfg.autopull { SC_OSR_CNT | SC_TX } else { 0 },
         4 => {
             let if_flag = if (w >> 6) & 1 != 0 { u16::MAX } else { 0 };
             if (w >> 7) & 1 != 0 {
@@ -1310,17 +1316,20 @@ enum Prov {
 
 const CNT_PROV_CAP: usize = 4;
 
-/// Segment-local provenance of the ISR shift counter (008 stage 4) —
-/// its value is usually PROGRAM-determined: a completed PUSH or
-/// MOV→ISR resets it, OUT→ISR sets it to the OUT's BitCount, and IN
-/// saturating-adds its BitCount (probe census 2026-07-12: isr_count-
-/// only diffs were 35% of state misses). Like X/Y `Prov`, tracked from
-/// pop within one fork-free segment: a READ of the counter consults
-/// exactly the tracked sources — the SC_ISR_CNT state pattern iff the
-/// pop-time value still feeds it, plus the decided BitCount fields
-/// accumulated since — instead of unconditionally adding the state
-/// component. Unlike X/Y, an accumulation chain (several INs) needs a
-/// field SET, not one field.
+/// Segment-local provenance of a shift counter (008 stage 4 built it
+/// for the ISR counter; 011 stage (a) instantiates a twin for the OSR
+/// counter) — its value is usually PROGRAM-determined. ISR: a
+/// completed PUSH or MOV→ISR resets it, OUT→ISR sets it to the OUT's
+/// BitCount, IN saturating-adds its BitCount (probe census
+/// 2026-07-12: isr_count-only diffs were 35% of state misses). OSR:
+/// a completed PULL or MOV→OSR resets it, OUT saturating-adds its
+/// BitCount. Like X/Y `Prov`, tracked from pop within one fork-free
+/// segment: a READ of the counter consults exactly the tracked
+/// sources — the counter's SC_* state pattern iff the pop-time value
+/// still feeds it, plus the decided BitCount fields accumulated since
+/// — instead of unconditionally adding the state component. Unlike
+/// X/Y, an accumulation chain (several INs/OUTs) needs a field SET,
+/// not one field. The instance's SC bit is passed at `consume`.
 #[derive(Clone, Copy)]
 struct CntProv {
     /// The pop-time counter still feeds the current value: no reset,
@@ -1347,10 +1356,11 @@ impl CntProv {
     }
 
     /// A read of the counter: consult the tracked sources into the
-    /// segment, after which the value is accounted.
-    fn consume(&mut self, seg_reads: &mut u16, seg_mask: &mut [u16; 32]) {
+    /// segment, after which the value is accounted. `bit` is this
+    /// instance's state component (SC_ISR_CNT or SC_OSR_CNT).
+    fn consume(&mut self, bit: u16, seg_reads: &mut u16, seg_mask: &mut [u16; 32]) {
         if self.base_pop {
-            *seg_reads |= SC_ISR_CNT;
+            *seg_reads |= bit;
         }
         self.flush(seg_mask);
         self.base_pop = false;
@@ -1421,17 +1431,38 @@ fn word_cnt_writes(w: u16) -> CntEffect {
     }
 }
 
+/// How a COMPLETED execution writes the OSR shift counter (011 stage
+/// a, the `word_cnt_writes` twin): OUT saturating-adds its BitCount
+/// regardless of destination (a possible autopull zeroing first is a
+/// function of the threshold compare, which consulted the counter);
+/// PULL resets it to 0 on every completing path (pop, or the empty
+/// nonblocking X read — an IFEMPTY guard-skip leaves the counter, but
+/// the guard's read consulted it first, so both arms end fully
+/// accounted; a blocked PULL stalls and never completes); MOV→OSR
+/// resets it to 0. There is no OSR analog of OUT→ISR's `Set`.
+fn word_osr_cnt_writes(w: u16) -> CntEffect {
+    match (w >> 13) & 0x7 {
+        3 => CntEffect::Accum,
+        4 if (w >> 7) & 1 == 1 => CntEffect::Reset,
+        5 if (w >> 5) & 0x7 == 7 => CntEffect::Reset,
+        _ => CntEffect::None,
+    }
+}
+
 /// Consume a word's state reads into the segment, routing X/Y through
-/// their provenance and the ISR shift counter through `CntProv`.
+/// their provenance and the two shift counters through their
+/// `CntProv` instances.
+#[allow(clippy::too_many_arguments)]
 fn consume_reads(
     r: u16,
     x_prov: Prov,
     y_prov: Prov,
     cnt_prov: &mut CntProv,
+    osr_cnt_prov: &mut CntProv,
     seg_reads: &mut u16,
     seg_mask: &mut [u16; 32],
 ) {
-    *seg_reads |= r & !(SC_X | SC_Y | SC_ISR_CNT);
+    *seg_reads |= r & !(SC_X | SC_Y | SC_ISR_CNT | SC_OSR_CNT);
     for (bit, prov) in [(SC_X, x_prov), (SC_Y, y_prov)] {
         if r & bit != 0 {
             match prov {
@@ -1442,7 +1473,10 @@ fn consume_reads(
         }
     }
     if r & SC_ISR_CNT != 0 {
-        cnt_prov.consume(seg_reads, seg_mask);
+        cnt_prov.consume(SC_ISR_CNT, seg_reads, seg_mask);
+    }
+    if r & SC_OSR_CNT != 0 {
+        osr_cnt_prov.consume(SC_OSR_CNT, seg_reads, seg_mask);
     }
 }
 
@@ -1461,13 +1495,20 @@ fn consume_reads(
 /// imm-consults-only-when-read win within a segment while making every
 /// cross-segment dependency explicit. Over-consulting (the register may
 /// never be read again) only adds record conditions, never unsoundness.
-fn flush_prov(x_prov: Prov, y_prov: Prov, cnt_prov: &mut CntProv, seg_mask: &mut [u16; 32]) {
+fn flush_prov(
+    x_prov: Prov,
+    y_prov: Prov,
+    cnt_prov: &mut CntProv,
+    osr_cnt_prov: &mut CntProv,
+    seg_mask: &mut [u16; 32],
+) {
     for p in [x_prov, y_prov] {
         if let Prov::Field(s, m) = p {
             seg_mask[s as usize] |= m;
         }
     }
     cnt_prov.flush(seg_mask);
+    osr_cnt_prov.flush(seg_mask);
 }
 
 /// Which scratch registers a COMPLETED execution of this word definitely
@@ -3352,6 +3393,7 @@ fn junk_walk(
     mut x_prov: Prov,
     mut y_prov: Prov,
     mut cnt_prov: CntProv,
+    mut osr_cnt_prov: CntProv,
     wcyc: &mut u64,
     // Dead-demand census out-param: set when the walk's executing
     // words read the start item's armed tag registers. Only meaningful
@@ -3429,7 +3471,7 @@ fn junk_walk(
             }
             if memo_on {
                 let r = word_state_reads(exec_word, cfg);
-                consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut w_reads, &mut w_mask);
+                consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut w_reads, &mut w_mask);
             }
             // Dead-demand census (walk starts at a completion, so a
             // present tag is always armed here).
@@ -3490,6 +3532,13 @@ fn junk_walk(
                 CntEffect::Set | CntEffect::Reset => cnt_prov.reset(),
                 CntEffect::Accum | CntEffect::None => {}
             }
+            match word_osr_cnt_writes(exec_word) {
+                CntEffect::Accum if !exec_pending => {
+                    osr_cnt_prov.accum_field(fetch_pc as u8, 0x001F, &mut w_mask)
+                }
+                CntEffect::Reset => osr_cnt_prov.reset(),
+                _ => {} // pending Accum folds in a core-known count
+            }
         }
         // A completed UNDECIDED delay contributes no cond and counts a
         // shift point: the walk reads it as 0 — the MINIMUM spelling —
@@ -3515,7 +3564,7 @@ fn junk_walk(
     if refuted && memo_on {
         // The walk is a segment tail ending here: flush its live field
         // provenance like every other segment end (review S1).
-        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut w_mask);
+        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut w_mask);
         *seg_reads |= w_reads;
         for s in 0..32 {
             seg_mask[s] |= w_mask[s];
@@ -3880,6 +3929,7 @@ fn search_impl(
         let mut x_prov = Prov::Fork;
         let mut y_prov = Prov::Fork;
         let mut cnt_prov = CntProv::fork();
+        let mut osr_cnt_prov = CntProv::fork();
 
         while it.cycle < spec.cycles {
             // Deterministic per-cycle environment (idempotent, so a fork
@@ -3921,7 +3971,7 @@ fn search_impl(
                     dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::DeadRefute);
                 }
                 if memo_on {
-                    flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+                    flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                     merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                     close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                 }
@@ -4059,7 +4109,7 @@ fn search_impl(
                             // conditions even for values never pushed.
                             if memo_on {
                                 let r = word_state_reads(child_value, &cfg);
-                                consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut seg_reads, &mut seg_mask);
+                                consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_reads, &mut seg_mask);
                             }
                             // Dead-demand census: the lookahead READS
                             // the candidate word's sources even when
@@ -4112,7 +4162,7 @@ fn search_impl(
                         dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::DeadRefute);
                     }
                     if memo_on {
-                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                         merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                         if pushed > 0 {
                             frames.push(Frame {
@@ -4188,7 +4238,7 @@ fn search_impl(
                             dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::DeadRefute);
                         }
                         if memo_on {
-                            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+                            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                             if pushed > 0 {
                                 frames.push(Frame {
@@ -4224,7 +4274,7 @@ fn search_impl(
             let exec_pending = it.st.pending_exec.is_some();
             if memo_on && it.st.delay_count == 0 && peek_tick(&it.st, &cfg) {
                 let r = word_state_reads(exec_word, &cfg);
-                consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut seg_reads, &mut seg_mask);
+                consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_reads, &mut seg_mask);
             }
             // Dead-demand census: this cycle's executing word reads an
             // ARMED tag's register — the fork is live. Pending tags
@@ -4301,7 +4351,7 @@ fn search_impl(
                         pushed = 2;
                     }
                     if memo_on {
-                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                         merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                         frames.push(Frame {
                             key: (it.cycle, it.next_input, it.st),
@@ -4357,7 +4407,7 @@ fn search_impl(
                     dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::DeadRefute);
                 }
                 if memo_on {
-                    flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+                    flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                     merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                     close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                 }
@@ -4399,6 +4449,13 @@ fn search_impl(
                     CntEffect::Set | CntEffect::Reset => cnt_prov.reset(),
                     CntEffect::Accum | CntEffect::None => {}
                 }
+                match word_osr_cnt_writes(exec_word) {
+                    CntEffect::Accum if !exec_pending => {
+                        osr_cnt_prov.accum_field(fetch_pc as u8, 0x001F, &mut seg_mask)
+                    }
+                    CntEffect::Reset => osr_cnt_prov.reset(),
+                    _ => {} // pending Accum folds in a core-known count
+                }
             }
             // A FETCHED canonical nop (P3 only applies without side-set,
             // whose assertion would make delay splits observable).
@@ -4424,7 +4481,7 @@ fn search_impl(
                     let mut dd_walk_read = false;
                     if junk_walk(
                         spec, &cfg, &irq_at, &it, delay_mask, memo_on,
-                        &mut seg_mask, &mut seg_reads, x_prov, y_prov, cnt_prov,
+                        &mut seg_mask, &mut seg_reads, x_prov, y_prov, cnt_prov, osr_cnt_prov,
                         &mut stats.walk_cycles, &mut dd_walk_read,
                     ) {
                         stats.refuted += 1;
@@ -4439,7 +4496,7 @@ fn search_impl(
                             dd_note(&mut dd, it.dd, it.dd_id, out);
                         }
                         if memo_on {
-                            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+                            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                             close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                         }
@@ -4477,7 +4534,7 @@ fn search_impl(
                         pushed = max as u32 + 1;
                     }
                     if memo_on {
-                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                         merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                         frames.push(Frame {
                             key: (it.cycle, it.next_input, it.st),
@@ -4523,7 +4580,7 @@ fn search_impl(
             champion_cap_hit = true;
         }
         if memo_on {
-            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
             close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, true, spec.slots);
         }
