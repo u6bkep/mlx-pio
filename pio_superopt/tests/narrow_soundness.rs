@@ -159,6 +159,404 @@ fn s3_bound_record_must_not_refute_unbound_prober() {
     );
 }
 
+// --- Ticket 011 stage (b): x/y Field tags, die-on-transform ---------
+//
+// Adversarial micro-specs written BEFORE the feature (red-green
+// convention). The riskiest interactions identified in design:
+//
+//  (T1) TAG-AWARE STATE PROJECTION — a record whose subtree read a
+//       register while it was TAGGED must pattern the tag IDENTITY,
+//       never the placeholder u32 left in NState: a garbage-blind
+//       projection lets pattern components recorded at tag-carrying
+//       frames match value-equal CONCRETE probers (and vice versa)
+//       whose futures differ by the undecided field. Red check:
+//       weaken `project_state` to project the placeholder — the
+//       memo on/off batteries below must catch a divergence.
+//  (T2) JUNK-WALK TAG READS — the walk cannot collapse a tag; a walk
+//       that treats a tagged register's placeholder as its value can
+//       falsely co-refute a whole delay family (memo-INDEPENDENT
+//       unsoundness). Red check: weaken the walk's value-read bail —
+//       the widening/coverage tests below must catch lost champions.
+
+const JMP_NOT_X_2: u16 = 0x0022; // jmp !x, 2
+const MOV_PINS_X: u16 = 0xA001; // mov pins, x
+const MOV_Y_X: u16 = 0xA041; // mov y, x (op none: tag copy)
+const MOV_PINS_Y: u16 = 0xA002; // mov pins, y
+const SET_PINS_0: u16 = 0xE000;
+const SET_PINS_1: u16 = 0xE001;
+
+/// Widening gate (ticket 011 (b) census): a provably-DEAD
+/// `set x, imm` must close champions with the immediate UNDECIDED
+/// (the don't-care prize), and a LIVE one must decide it. Champions
+/// are additionally materialized at NONZERO don't-care assignments
+/// (all-ones-under-mask + a seeded-random one) — the canonical-zero
+/// materialization would miss a widening bug on exactly the newly
+/// widened bits.
+#[test]
+fn tag_widening_dead_set_imm_stays_undecided() {
+    let config = Config {
+        pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 2, ..PinMap::default() },
+        ..Config::default()
+    };
+    // DEAD: slot0 `set x, <imm free>` (seeded dst, free data), slot1
+    // `set pins, 1` (seeded) — x is never read; every imm reproduces
+    // the trace, so the search must close ONE champion subspace with
+    // the imm undecided instead of 32 decided ones.
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config.clone(), 0, 1),
+        slots: 2,
+        cycles: 8,
+        inputs: vec![],
+        output_pins: vec![0, 1],
+        capture_pins: vec![0, 1],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![(0, 0xFFE0, 0xE020), (1, 0xFFFF, SET_PINS_1)],
+        memo_cap: 1 << 20,
+    };
+    let mut w = [NOP_WORD; 32];
+    w[0] = 0xE022; // set x, 2 — any imm works
+    w[1] = SET_PINS_1;
+    spec.expected = run_spec(&spec, w);
+    let r = search(&spec, 10_000);
+    assert!(!r.champion_cap_hit);
+    assert!(r.stats.champions_found > 0, "dead-set rig found nothing");
+    assert!(
+        r.champions.iter().all(|c| c.decided[0] & 0x001F == 0),
+        "dead `set x, imm` decided its immediate — laziness lost: {:?}",
+        r.champions.iter().map(|c| c.decided[0]).collect::<Vec<_>>()
+    );
+    assert_champions_sound_widened(&spec, &r.champions);
+
+    // LIVE: slot1 becomes `mov pins, x` — the imm is pin-visible, so
+    // champions must DECIDE it and only imm & 3 == 2 survives.
+    let mut spec_live = spec.clone();
+    spec_live.seed = vec![(0, 0xFFE0, 0xE020), (1, 0xFFFF, MOV_PINS_X)];
+    let mut wl = [NOP_WORD; 32];
+    wl[0] = 0xE022;
+    wl[1] = MOV_PINS_X;
+    spec_live.expected = run_spec(&spec_live, wl);
+    let rl = search(&spec_live, 10_000);
+    assert!(rl.stats.champions_found > 0, "live-set rig found nothing");
+    assert!(
+        rl.champions.iter().all(|c| c.decided[0] & 0x001F == 0x001F),
+        "live `set x, imm` left its immediate undecided — unsound widening"
+    );
+    assert!(
+        rl.champions.iter().all(|c| c.value[0] & 0x3 == 0x2),
+        "live rig admitted a wrong immediate"
+    );
+    assert_champions_sound_widened(&spec_live, &rl.champions);
+    eprintln!(
+        "tag_widening: dead champs={} (imm undecided), live champs={} (imm decided)",
+        r.champions.len(),
+        rl.champions.len()
+    );
+}
+
+/// Memo on/off battery over tag-exercising rigs (T1): SET-x + zero
+/// test, SET-x + pin read (collapse), MOV tag-copy chain + read of
+/// the copy, and a wrap-loop re-executing the tag-creating SET.
+/// Champion LISTS must be identical with the memo on and off, and the
+/// witness program covered. Any projection/cond hole in the tag memo
+/// interplay shows up here as a divergence.
+#[test]
+fn tag_collapse_memo_on_off_battery() {
+    let config = Config {
+        pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 2, ..PinMap::default() },
+        ..Config::default()
+    };
+    // (rig, seeds, witness_slots): slot words for the witness run.
+    let rigs: Vec<(&str, Vec<(u8, u16, u16)>, Vec<u16>, u8, u8)> = vec![
+        // slot0 set x,<free>; slot1 jmp !x,2; slot2 set pins,0;
+        // slot3 set pins,1; wrap 0..3. Zero test: taken iff imm == 0.
+        (
+            "zero-test",
+            vec![
+                (0, 0xFFE0, 0xE020),
+                (1, 0xFFFF, JMP_NOT_X_2),
+                (2, 0xFFFF, SET_PINS_0),
+                (3, 0xFFFF, SET_PINS_1),
+            ],
+            vec![0xE022, JMP_NOT_X_2, SET_PINS_0, SET_PINS_1],
+            0,
+            3,
+        ),
+        // slot0 set x,<free>; slot1 mov pins,x — direct value read.
+        (
+            "pin-read",
+            vec![(0, 0xFFE0, 0xE020), (1, 0xFFFF, MOV_PINS_X)],
+            vec![0xE022, MOV_PINS_X],
+            0,
+            1,
+        ),
+        // slot0 set x,<free>; slot1 mov y,x (tag COPY); slot2
+        // mov pins,y — the copy's tag is read one register removed.
+        (
+            "copy-read",
+            vec![(0, 0xFFE0, 0xE020), (1, 0xFFFF, MOV_Y_X), (2, 0xFFFF, MOV_PINS_Y)],
+            vec![0xE022, MOV_Y_X, MOV_PINS_Y],
+            0,
+            2,
+        ),
+        // Wrap loop re-executing the SET: slot0 set x,<free>; slot1
+        // jmp !x,0 spins while x==0... witness imm=2: falls through
+        // to slot2 set pins,0 then wraps. Exercises tag re-creation.
+        (
+            "loop-recreate",
+            vec![
+                (0, 0xFFE0, 0xE020),
+                (1, 0xFFFF, 0x0020), // jmp !x, 0
+                (2, 0xFFFF, SET_PINS_0),
+            ],
+            vec![0xE022, 0x0020, SET_PINS_0],
+            0,
+            2,
+        ),
+    ];
+    for (name, seed, wit, wb, wt) in rigs {
+        let mut spec = EngineSpec {
+            cfg: cfg_for(config.clone(), wb, wt),
+            slots: wit.len() as u8,
+            cycles: 12,
+            inputs: vec![],
+            output_pins: vec![0, 1],
+            capture_pins: vec![0, 1],
+            stim: Stim::default(),
+            irq_sets: vec![],
+            expected: vec![],
+            seed,
+            memo_cap: 0,
+        };
+        let mut w = [NOP_WORD; 32];
+        for (i, &ww) in wit.iter().enumerate() {
+            w[i] = ww;
+        }
+        spec.expected = run_spec(&spec, w);
+        let off = search(&spec, 100_000);
+        assert!(!off.champion_cap_hit);
+        assert!(
+            covered(&off.champions, &w),
+            "[{name}] witness not covered with memo off — rig broken"
+        );
+        assert_champions_sound_widened(&spec, &off.champions);
+        spec.memo_cap = 1 << 20;
+        let on = search(&spec, 100_000);
+        assert_eq!(
+            off.champions, on.champions,
+            "[{name}] champion lists diverge between memo off/on (T1)"
+        );
+        eprintln!(
+            "tag battery [{name}]: off items={} on items={} hits={} champs={}",
+            off.stats.items,
+            on.stats.items,
+            on.stats.memo_hits,
+            on.stats.champions_found
+        );
+    }
+}
+
+/// T2: the junk_walk must BAIL on a value read of a live tag instead
+/// of walking the placeholder. Rig: slot0 `set x, <imm free>` with
+/// FREE DELAY (the delay post-fork arms the walk right after the tag
+/// is created), slot1 `jmp !x, 2`, slot2/3 emit different pins; wrap
+/// parks at slot3. A placeholder-walking bug reads x == 0, takes the
+/// branch for every family member, and co-refutes delay families that
+/// contain the imm != 0 witnesses — losing champions that exist with
+/// the walk disabled. Assert coverage of both an imm == 0 witness
+/// trace and an imm != 0 one.
+#[test]
+fn tag_junk_walk_value_read_bails() {
+    let config = Config {
+        pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 2, ..PinMap::default() },
+        ..Config::default()
+    };
+    let base = |expected: Vec<u32>| EngineSpec {
+        cfg: cfg_for(config.clone(), 0, 3),
+        slots: 4,
+        cycles: 10,
+        inputs: vec![],
+        output_pins: vec![0, 1],
+        capture_pins: vec![0, 1],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected,
+        seed: vec![
+            (0, 0xE0E0, 0xE020), // set x, <imm free>, DELAY FREE
+            (1, 0xFFFF, JMP_NOT_X_2),
+            (2, 0xFFFF, SET_PINS_0),
+            (3, 0xFFFF, 0xE001 | 0x0700), // set pins,1 [7] — park-ish
+        ],
+        memo_cap: 1 << 20,
+    };
+    // Witness A: imm = 5 (branch NOT taken; falls into slot2 then 3).
+    let mut wa = [NOP_WORD; 32];
+    wa[0] = 0xE025;
+    wa[1] = JMP_NOT_X_2;
+    wa[2] = SET_PINS_0;
+    wa[3] = 0xE001 | 0x0700;
+    let mut spec_a = base(vec![]);
+    spec_a.expected = run_spec(&spec_a, wa);
+    let ra = search(&spec_a, 100_000);
+    assert!(
+        covered(&ra.champions, &wa),
+        "imm!=0 witness lost — junk_walk walked a tag placeholder (T2)"
+    );
+    assert_champions_sound_widened(&spec_a, &ra.champions);
+
+    // Witness B: imm = 0 (branch taken; straight to slot2).
+    let mut wb = wa;
+    wb[0] = 0xE020;
+    let mut spec_b = base(vec![]);
+    spec_b.expected = run_spec(&spec_b, wb);
+    if spec_b.expected != spec_a.expected {
+        let rb = search(&spec_b, 100_000);
+        assert!(
+            covered(&rb.champions, &wb),
+            "imm==0 witness lost — tag zero-test broken (T2)"
+        );
+        assert_champions_sound_widened(&spec_b, &rb.champions);
+    }
+    eprintln!("tag_junk_walk: witness A covered ({} champs)", ra.champions.len());
+
+    // LATCH-QUIET arm — the actual walk hazard. The walk only refutes
+    // through latch-quiet windows, so a placeholder-walking bug needs
+    // a refutation that never touches a latch: OOB fall-through.
+    // slot0 `set x, <imm free>, <delay free>`; slot1 `jmp x--, 0`
+    // (seeded); idle trace; wrap top past the footprint so an untaken
+    // jmp at slot1 FALLS THROUGH out of it. Placeholder x == 0 makes the
+    // walk's `jmp x--` FALL THROUGH to an out-of-footprint fetch and
+    // falsely co-refute the whole delay family — which contains every
+    // imm >= 1 champion (the loop re-arms x each iteration and idles
+    // forever). The correct walk bails at the tag-value read.
+    let config_q = Config::default();
+    let mut spec_q = EngineSpec {
+        cfg: cfg_for(config_q, 0, 5),
+        slots: 2,
+        // Horizon must exceed the walk's OOB shift guard (max delay
+        // 31) or the walk never concludes OOB for an undecided-delay
+        // family and the hazard is unreachable.
+        cycles: 40,
+        inputs: vec![],
+        output_pins: vec![],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![(0, 0xE0E0, 0xE020), (1, 0xFFFF, 0x0040)],
+        memo_cap: 1 << 20,
+    };
+    let mut wq = [NOP_WORD; 32];
+    wq[0] = 0xE025; // set x, 5
+    wq[1] = 0x0040; // jmp x--, 0
+    spec_q.expected = run_spec(&spec_q, wq);
+    let rq = search(&spec_q, 100_000);
+    assert!(
+        covered(&rq.champions, &wq),
+        "imm>=1 loop champion lost — junk_walk co-refuted a tagged family \
+         through the placeholder (T2, latch-quiet arm)"
+    );
+    assert_champions_sound_widened(&spec_q, &rq.champions);
+    eprintln!("tag_junk_walk: latch-quiet arm covered ({} champs)", rq.champions.len());
+}
+
+/// Binding interplay: tags must collapse BEFORE a binding-relevant
+/// event (ticket 011 §4). The pull_empty_binding_fork topology with
+/// the x-loader's immediate left FREE: slot0 `set y, <imm free>`,
+/// slot1 `pull noblock` (empty TX: osr <- physical X), slot2
+/// `out pins, 1`. Both binding branches and all 32 immediates are in
+/// play; the mirror trace requires the TWIN branch with imm = 3.
+#[test]
+fn tag_binding_collapse() {
+    let config = Config {
+        pins: PinMap { out_base: 0, out_count: 1, ..PinMap::default() },
+        ..Config::default()
+    };
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config.clone(), 0, 2),
+        slots: 3,
+        cycles: 6,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        // set y, <imm free> / pull noblock / out pins,1 — only the
+        // immediate (and the binding) is searched.
+        seed: vec![(0, 0xFFE0, 0xE040), (1, 0xFFFF, PULL_NOBLOCK), (2, 0xFFFF, 0x6001)],
+        memo_cap: 1 << 20,
+    };
+    // The mirror of [set y,3 / pull / out pins,1]: set x,3 loads
+    // physical X = 3, the pull reads it into OSR, the OUT emits 1.
+    let w_expect_src = {
+        let mut w = [NOP_WORD; 32];
+        w[0] = SET_Y_3_B;
+        w[1] = PULL_NOBLOCK;
+        w[2] = 0x6001;
+        w
+    };
+    spec.expected = run_spec(&spec, mirror_program(&w_expect_src, 3));
+    let r = search(&spec, 100_000);
+    assert!(!r.champion_cap_hit);
+    assert_champions_sound_widened(&spec, &r.champions);
+    // The twin champion must exist and carry imm = 3 decided (the
+    // pull's X read is a value read through the binding).
+    let mut w_twin = w_expect_src;
+    for s in 0..3 {
+        w_twin[s] = mirror_word(w_twin[s]);
+    }
+    assert!(
+        covered(&r.champions, &w_twin),
+        "twin champion with collapsed imm lost at the binding event"
+    );
+    eprintln!("tag_binding_collapse: champs={}", r.champions.len());
+}
+
+const SET_X_3: u16 = 0xE023;
+const SET_Y_3_B: u16 = 0xE043;
+
+/// Champion soundness incl. NONZERO don't-care materializations
+/// (ticket 011 gate (ii)): canonical zeros, all-ones-under-mask, and
+/// a seeded-random assignment must all reproduce the trace in-space.
+fn assert_champions_sound_widened(
+    spec: &EngineSpec,
+    champions: &[pio_superopt::narrow::engine::Champion],
+) {
+    use pio_superopt::narrow::engine::run_spec_oob;
+    let mut rng = 0x9E3779B97F4A7C15u64;
+    for (i, ch) in champions.iter().enumerate() {
+        let mut fills: Vec<[u16; 32]> = vec![ch.words()];
+        let mut ones = ch.words();
+        let mut rnd = ch.words();
+        for s in 0..32 {
+            ones[s] |= !ch.decided[s];
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rnd[s] |= (rng >> 32) as u16 & !ch.decided[s];
+        }
+        fills.push(ones);
+        fills.push(rnd);
+        for (k, w) in fills.iter().enumerate() {
+            let (trace, oob) = run_spec_oob(spec, *w);
+            assert!(!oob, "champion {i} materialization {k} executes out of footprint");
+            assert_eq!(
+                trace, spec.expected,
+                "champion {i} materialization {k} does not reproduce the trace \
+                 (don't-care over-widening)"
+            );
+        }
+        if ch.binding_free {
+            let m = mirror_program(&ch.words(), spec.slots);
+            assert_eq!(
+                run_spec(spec, m),
+                spec.expected,
+                "champion {i} binding-free mirror diverges"
+            );
+        }
+    }
+}
+
 /// Diagnostic: memo-on run of the S3 rig for env-driven dumps
 /// (PIO_NARROW_DUMP / PIO_NARROW_PROBE_LOG). Development only.
 #[test]
