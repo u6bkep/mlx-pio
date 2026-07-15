@@ -18,6 +18,7 @@ Status values: `open` · `in-progress` · `blocked` · `done` · `wontfix`
 | 009 | Word-class digests (word_canon quotient + lemma schemas) | in-progress | high |
 | 010 | Multi-SM factorization blueprint | open (blocked on multi-case specs) | med |
 | 011 | Data-plane superposition (provenance-tag symbols) | design | high |
+| 012 | 008-B outcome-predicate reads (value-set constraints) | design | high |
 
 Provenance: 001–003 distilled from a survey of `reference/mlx86` (a friend's
 x86-assembly superoptimizer) on 2026-06-22. The split of what transfers vs. what
