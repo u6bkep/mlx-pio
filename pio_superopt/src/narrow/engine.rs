@@ -4275,6 +4275,22 @@ fn search_impl(
                     sib_ids.clear();
                     let qtab = wq.table(it.decided[fetch_pc] | field.mask);
                     let mut pushed = 0u32;
+                    // S7 (s2-relaxation-review.md §5.2/§6.4): reads made
+                    // AT THIS FORK on behalf of values that are never
+                    // pushed — the P1 prune's mirror-coverage reads and
+                    // the pin-write pre-filter lookahead's reads — are
+                    // conditions of THIS fork's subtree claim (the frame
+                    // quantifies over the killed values too), not just of
+                    // the enclosing segment. Accumulate them here; they
+                    // are merged into the segment (ancestor frames, the
+                    // pre-filter's historical path) AND seeded into the
+                    // fork's own frame below. Charging only the segment
+                    // left the fork frame's record generalizing over
+                    // components its kill verdicts read (observed live:
+                    // SC_Y-free records above P1-pruned `mov <dst>,y`
+                    // refuting y==1 binding-fork twins).
+                    let mut kill_reads: u16 = 0;
+                    let mut kill_mask = [0u16; 32];
                     for &v in &values {
                         let raw = v >> field.shift();
                         // Side-set pre-filter: an ASSERTED side-set is
@@ -4302,6 +4318,22 @@ fn search_impl(
                         // the item represents ONE concrete program, so
                         // both spellings must be enumerated.
                         if !it.named && it.unbound && ny && !nx {
+                            // S7 fix (s2-relaxation-review.md §6.4): the
+                            // prune's coverage claim is STATE-dependent —
+                            // the pruned Y-spelling is mirror-equivalent
+                            // to the explored X-spelling only because
+                            // x == y here (unnamed ⇒ never diverged). A
+                            // record formed at or above this fork must
+                            // pin the components that equivalence read,
+                            // or it generalizes over Y while its
+                            // champion-free proof covers a Y-reading
+                            // spelling proven only at the recorded y.
+                            // Charge the pruned value's reads exactly as
+                            // the pre-filter charges the values it kills.
+                            if memo_on {
+                                let r = word_state_reads(it.value[fetch_pc] | v, &cfg);
+                                consume_reads(r, x_prov, y_prov, it.tags, &mut cnt_prov, &mut osr_cnt_prov, &mut kill_reads, &mut kill_mask);
+                            }
                             continue;
                         }
                         // P2 canonical nop: the X/Y self-moves with op
@@ -4366,10 +4398,12 @@ fn search_impl(
                             }
                             // The lookahead's verdict reads whatever the
                             // candidate word reads — those are subtree
-                            // conditions even for values never pushed.
+                            // conditions even for values never pushed
+                            // (routed into the fork's kill accumulators,
+                            // S7: see above).
                             if memo_on {
                                 let r = word_state_reads(child_value, &cfg);
-                                consume_reads(r, x_prov, y_prov, it.tags, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_reads, &mut seg_mask);
+                                consume_reads(r, x_prov, y_prov, it.tags, &mut cnt_prov, &mut osr_cnt_prov, &mut kill_reads, &mut kill_mask);
                             }
                             // Dead-demand census: the lookahead READS
                             // the candidate word's sources even when
@@ -4422,6 +4456,16 @@ fn search_impl(
                         dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::DeadRefute);
                     }
                     if memo_on {
+                        // Kill-time reads flow BOTH ways: into the
+                        // segment (ancestors — the pre-filter's
+                        // historical path) and into the fork's own frame
+                        // (S7: its record quantifies over the killed
+                        // values, so their verdicts' reads are its
+                        // conditions too).
+                        seg_reads |= kill_reads;
+                        for s in 0..32 {
+                            seg_mask[s] |= kill_mask[s];
+                        }
                         flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                         merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                         if pushed > 0 {
@@ -4434,11 +4478,19 @@ fn search_impl(
                                 any_champion: false,
                                 recordable: true,
                                 bound_seen: !it.unbound,
-                                state_reads: 0,
+                                state_reads: kill_reads,
                                 items_at_open: stats.items,
                             });
+                            let f = frames.last_mut().expect("just pushed");
+                            for s in 0..32 {
+                                if kill_mask[s] != 0 {
+                                    f.merge(s, kill_mask[s], it.value[s] & kill_mask[s]);
+                                }
+                            }
                         } else {
-                            // Every value filtered: this fork is a leaf.
+                            // Every value filtered: this fork is a leaf;
+                            // the kill reads merged into the parent
+                            // frame above, which owns the claim.
                             close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                         }
                     }

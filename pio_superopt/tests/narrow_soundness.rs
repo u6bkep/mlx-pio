@@ -557,6 +557,119 @@ fn assert_champions_sound_widened(
     }
 }
 
+// --- S7: P1-pruned spellings' reads must be consulted ----------------
+//
+// Finding S7 (s2-relaxation-review.md §5.2/§6): the P1 register-mirror
+// prune discards Y-naming spellings with no accounting of the pruned
+// spelling's reads, so records formed above unnamed naming forks
+// generalize over Y while their champion-free proof silently leans on
+// P1 coverage valid only where x == y. A binding-fork twin can arrive
+// at the same core with y != 0, match the SC_Y-free pattern, and be
+// refuted by a proof that does not cover it. On the reviewed engine no
+// champion is lost — the one champion-bearing record is benefit-gated
+// out (3-item frame vs min_benefit == 4) and the reachable twin values
+// are capture-degenerate — so this test is GREEN either way; it is a
+// CANARY that flips red if the benefit gate, the MovOp/field arities,
+// or the pre-filter counting ever shift. The demonstrated
+// wrong-transfer kills (SC_Y-free records refuting the y == 1 twin's
+// items) are reproduced via the probe-log recipe in §6.3; the S7 fix
+// (charge the pruned value's reads, mirroring the pin-prefilter's
+// consume_reads) makes those probes state-miss instead.
+
+const S1: u16 = 0x1000; // side-set value 1 (side_count=1, en=false)
+const MOV_OSR_INV_NULL: u16 = 0xA0EB; // mov osr, ~null (osr=FFFF_FFFF, cnt=0)
+
+fn p1_rig() -> (EngineSpec, [u16; 32]) {
+    let config = Config {
+        side: pio_superopt::ir::SideCfg { count: 1, en: false },
+        pins: PinMap {
+            out_base: 0,
+            out_count: 2,
+            set_base: 0,
+            set_count: 2,
+            sideset_base: 2,
+            ..PinMap::default()
+        },
+        ..Config::default()
+    };
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config, 0, 5),
+        slots: 4,
+        cycles: 4,
+        inputs: vec![],
+        output_pins: vec![0, 1, 2],
+        capture_pins: vec![0, 1, 2],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![(0, 0xFFFF, MOV_OSR_INV_NULL)], // registerless: root stays unnamed
+        memo_cap: 0,
+    };
+    let mut w_target = [NOP_WORD; 32];
+    w_target[0] = MOV_OSR_INV_NULL; // side 0
+    w_target[1] = OUT_Y_1 | S1; // twin spelling; identity spells out x,1
+    w_target[2] = PULL_NOBLOCK; // side 0; empty TX -> osr <- physical X
+    w_target[3] = MOV_PINS_Y | S1; // y=1 -> pins 01, the differentiator
+    spec.expected = run_spec(&spec, w_target);
+    (spec, w_target)
+}
+
+#[test]
+fn p1_pruned_reads_must_be_consulted() {
+    let (mut spec, w_target) = p1_rig();
+    eprintln!("expected: {:08x?}", &spec.expected);
+    assert_eq!(spec.expected[3] & 0x7, 0x5, "target trace must end side=1 pins=01");
+    assert_eq!(spec.expected[2] & 0x7, 0x3, "cycle-2: pins idle high, side 0");
+
+    let off = search(&spec, 1_000_000);
+    assert!(!off.champion_cap_hit);
+    assert!(
+        covered(&off.champions, &w_target),
+        "memo-off search failed to find the twin champion at all — rig broken"
+    );
+
+    spec.memo_cap = 1 << 20;
+    let on = search(&spec, 1_000_000);
+    assert!(!on.champion_cap_hit);
+    eprintln!(
+        "p1 rig: off champs={} items={} | on champs={} items={} hits={} entries={}",
+        off.champions.len(),
+        off.stats.items,
+        on.champions.len(),
+        on.stats.items,
+        on.stats.memo_hits,
+        on.stats.memo_entries
+    );
+    for ch in &off.champions {
+        if !on.champions.contains(ch) {
+            eprintln!("  lost champion: v={:04x?} bf={}", &ch.value[..4], ch.binding_free);
+        }
+    }
+    assert!(
+        covered(&on.champions, &w_target),
+        "P1 RED: memo record with unaccounted P1-pruned reads killed a bound twin prober"
+    );
+    assert_eq!(
+        off.champions, on.champions,
+        "P1 RED: champion lists diverge between memo off/on"
+    );
+}
+
+/// Diagnostic: memo-on run of the P1 rig for env-driven dumps.
+#[test]
+#[ignore]
+fn p1_rig_dump() {
+    let (mut spec, w_target) = p1_rig();
+    spec.memo_cap = 1 << 20;
+    let on = search(&spec, 1_000_000);
+    eprintln!(
+        "diag: champs={} hits={} target_covered={}",
+        on.champions.len(),
+        on.stats.memo_hits,
+        covered(&on.champions, &w_target)
+    );
+}
+
 /// Diagnostic: memo-on run of the S3 rig for env-driven dumps
 /// (PIO_NARROW_DUMP / PIO_NARROW_PROBE_LOG). Development only.
 #[test]

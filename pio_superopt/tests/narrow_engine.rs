@@ -471,8 +471,15 @@ fn consulted_state_shares_across_unread_register() {
     assert_eq!(off.champions, on.champions, "memo changed the verdict");
     assert_eq!(off.stats.champions_found, 0, "period-3 unexpectedly satisfiable at L=2");
     assert!(on.stats.memo_hits > 0, "no memo sharing at all");
+    // Magnitude bar. Was `off / 2` before the S7 fix; charging the
+    // fork-time kill reads (P1-pruned spellings, pin-write pre-filter
+    // lookaheads) into the fork's own frame widens record patterns —
+    // records over forks whose killed values read OSR/Y now pin them,
+    // and probers with diverging values legitimately state-miss
+    // (on/off = 1.87x here, vs 0.065% items on the L=3 0..1 gate).
+    // The relaxed bar still locks substantial cross-register sharing.
     assert!(
-        on.stats.items < off.stats.items / 2,
+        on.stats.items < off.stats.items * 2 / 3,
         "consulted-state memo lost its cross-register sharing: on={} off={}",
         on.stats.items,
         off.stats.items
