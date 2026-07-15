@@ -4,6 +4,36 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-15 (evening) — 1..2 monster REFUTED (5/6); w12 trace mined: 71% repeat work
+
+**1..2 REFUTED**: 363.97B items / 318.06B refuted / 657.1M memo hits /
+champions=0 / cap_hit=false / 34,943s (9.7h) on 28 threads; all
+1,383,452 units settled, resumable machinery never needed. L=3 ladder
+now 5/6; 0..2 started immediately after (~12:20), ~49% at 17:26, ETA
+~22:30. For scale: the old engine died at 60.5%/7h on this bracket.
+
+**Unit-keying soundness check** (identical 1,383,452 unit count on
+both w12 and w02 looked suspicious): benign — phase 1 truncates the
+spec at frontier cycle 2, and with wrap_top=2 at L=3 the wrap-back
+first affects the fetch at cycle 3, so the two brackets' frontiers
+coincide; each unit re-runs the FULL spec with the true wrap. Verdict
+path sound.
+
+**w12 trace mined** (docs/analysis/narrow-split-w12-unit-mining.md):
+recursive-unit-split driver NOT justified (28.0/28 effective cores,
+max unit 1,087s = 3.1% of wall — work stealing absorbs the skew);
+tail violently bimodal (p99 168ms → p99.9 149s; top 1% of units =
+92% of CPU). HEADLINE: only 6,925 distinct stat fingerprints across
+1.38M units — **71.1% of CPU was byte-identical repeat subtrees**
+(seven exact 126-copy orbits @~122s each = 11% of the run; mirror
+twins are the innermost x2). Sound exploitation = seed-level quotient
+via equiv()/rule library (unit-granularity canonicalization), now the
+top measured lever (3.5x ceiling). Fork attribution on the monster:
+Delay 73.1% (post-junk-collapse residue lives in unclean windows),
+BitCount 11.8%, WaitIdx 4.8%. Ops finding: resume header pins RUNTIME
+HEAD+dirty, so doc commits after launch break naive resume (recovery:
+stash + checkout launch rev; fix candidate in mining doc §5).
+
 ## 2026-07-15 (night) — proof-engine Layer 1, 011(b) tags, S7, S2 relaxed, resumable runner; monsters relaunched
 
 Wave-2 day (5 worktree agents + 2 surveys, all merged and gated).

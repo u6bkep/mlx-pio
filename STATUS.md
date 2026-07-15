@@ -1,66 +1,54 @@
 # STATUS — current frontier
 
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
-> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-15 (~3am).
-> **Session handoff (read first): `docs/handoff-2026-07-15.md`** — overnight
-> run details, resume commands, queued decisions.
+> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-15 (evening).
 
-## OVERNIGHT RUN LIVE: unit `pio-l3-monsters` (detached, 24h cap, RESUMABLE)
+## L=3 ladder: 5 of 6 PROVEN — only 0..2 still running
 
-Brackets 1..2 then 0..2 via the new `narrow-split` runner subcommand.
-Log: `/data/pio_optimization/runs/l3_monsters.log`; unit-level JSONL
-traces `narrow-split-l3-w12.jsonl` / `-w02.jsonl` alongside. If it
-dies, rerun the same command (in handoff doc) — it resumes, skipping
-settled units. Do NOT rebuild the binary before resuming (trace header
-pins the engine rev).
+**1..2 REFUTED** (2026-07-15, 9.7h): 363.97B items, 657.1M memo hits,
+cap_hit=false, all 1,383,452 units settled. 0..0, 0..1, 1..1, 2..2
+already proven. **If 0..2 refutes: footprint ≤3 impossible for tx_a;
+L=4 rediscovery ladder unlocks.**
 
-## L=3 ladder: 4 of 6 proven; monsters running on a much faster engine
+## RUN LIVE: 0..2 monster (unit `pio-l3-monsters`, detached, resumable)
 
-0..0, 0..1 (700.56M/29s post-tags), 1..1 (632.8M/25s), 2..2
-(132.0B/2h55m, pre-tags engine) REFUTED. Tonight's engine gained:
-011(b) x/y Field tags (−10.3% items at L=3, wall-neutral), S2
-relaxation (memo hits 1.366%→1.938% on the 2..2 mine — the −41%
-poisoning fully recovered), S7 soundness fix. All proven-bracket
-verdicts re-held on the launch tree.
+Started ~12:20 after 1..2 finished; ~49% settled at 17:26, ETA
+~22:30–23:00. Log `/data/pio_optimization/runs/l3_monsters.log` (check
+mtime); trace `narrow-split-l3-w02.jsonl`. **RESUME CAVEAT: the header
+pins runtime HEAD (024bb2a) + dirty flag — this session's doc commits
+break a naive resume. If resume is needed:**
+`git stash && git checkout 024bb2a`, rerun the exact command (handoff
+doc §1), then return to master. Do NOT rebuild the binary.
 
-## Landed tonight (all gated, all merged to master)
+## w12 trace mined (docs/analysis/narrow-split-w12-unit-mining.md)
 
-- **011(a)+(b)**: OSR-count CntProv twin; x/y Field(slot,mask) tags,
-  die-on-transform. Ticket 011 re-cut (stops at (b); Fn1 → 012 stage 4).
-- **S7** (new soundness finding from the S2 review): P1 prune + pin
-  pre-filter didn't charge killed words' reads to the FORK frame's own
-  record (segment-only was insufficient — deviation from review doc
-  documented in commit). Red-green canary in narrow_soundness.rs
-  (NOTE: fast suite now ~5 min because of it).
-- **S2 relaxation**: binding frames record again; upward poisoning
-  narrowed to exact conflict-poison. Rec::bound/S5/S6 untouched.
-- **012 ticket** (outcome-predicate reads design) + **stage-0 census**
-  (PIO_NARROW_PRED_CENSUS=1, sequential only): first table says 2-way
-  predicate kinds = 5.4% of collapses at 16x; in-sub 51% at 1.1x;
-  ctr-thresh/out-pinvis have no surface until OSR tags (stage 4).
-- **Proof engine Layer 1**: `equiv()` driver (smt/equiv.rs) — 3-valued,
-  ∀-inputs (symbolic FIFO words+occupancy), preconditions, loose/strict
-  tiers, counterexample replay on the real emulator. 2,144 word_canon
-  pairs PROVEN universal; CL1/CL2 conditional lemmas proven; 0 mirror
-  divergences. Config coverage (not opcodes) is the binding limit.
-- **Runner `narrow-split`**: unit-level resumable bracket searches,
-  per-unit telemetry JSONL, byte-identical to the test path.
-- **Tiny-champion eyeball** (docs/analysis/): toggler+bit-copier full
-  champion dumps; candidate lemmas CL1-CL6; multi-seed + 2x horizon
-  both caught real impostors.
+- **Recursive-unit-split driver: NOT justified** — 28.0/28 effective
+  cores, max unit 3.1% of wall. At L=4 prefer deeper frontier cycle.
+- **71.1% of CPU was byte-identical repeat subtrees** (6,925 distinct
+  stat fingerprints / 1.38M units; seven 126-copy orbits @122s = 11%
+  of the run). Sound exploitation = seed-level quotient via the
+  equiv()/rule-library track — unit-granularity canonicalization is
+  now the top measured lever (3.5x ceiling on this workload).
+- Fork attribution: Delay 73.1%, BitCount 11.8%, WaitIdx 4.8%.
+- Unit-keying soundness checked: identical unit counts across w12/w02
+  are benign (wrap-back invisible on a 2-cycle prefix; units re-run
+  the full spec with true wrap).
 
-## Queued (priority order — see handoff doc for detail)
+## Queued (priority order)
 
-1. Bank overnight verdicts; per-unit tail analysis from the traces.
-2. T1 open follow-up: adversarial rig for tag-blind projection
-   (011(b) agent couldn't make it red; invariant shipped defensively).
-3. 012 stage 1 (JMP zero-test predicates on tags).
-4. Mirror config-coverage extension (68.7K battery-only pairs blocked
-   on supported_config, only 17.5K on opcodes); then rule library.
-5. 008 §3b re-measurement trigger FIRED (evaluator-adjacent cost
-   changed tonight) — re-test walk economics when convenient.
-6. Sequential instrumented 1..2 slice (pred-census + near-miss probe
-   on a monster wall); ≤4 impossibility re-proof via equiv.
+1. **Bank 0..2 verdict when it lands** (~22:30); then STATUS/journal/
+   memory + ladder close-out. Mine its trace:
+   `python3 tools/mine_narrow_split.py <trace>` (stdout only, never
+   into runs/).
+2. Seed-orbit identification: re-derive phase-1 seeds (deterministic),
+   join on unit index, name what the 126-orbits respell → feeds the
+   unit-quotient design.
+3. T1 open follow-up: adversarial rig for tag-blind projection.
+4. 012 stage 1 (JMP zero-test predicates on tags).
+5. Mirror config-coverage extension for equiv(); then rule library.
+6. 008 §3b re-measurement (trigger fired); sequential instrumented
+   1..2 slice; ≤4 impossibility re-proof via equiv; runner header
+   rev-pinning fix (build-time rev, see mining doc §5).
 
 ## Ops rules
 
@@ -68,5 +56,3 @@ Big searches serialized + gated (systemd-run --user, MemoryMax=48G,
 MemorySwapMax=0). Magnitude gates = idle-box WALL-CLOCK + items.
 `systemctl --user` unreliable from monitor shells — use log mtime.
 Runner resume: same command, same rev, same params.
-
-## Shard twin — COMPLETE (2a3a2e7); bench/paused items unchanged
