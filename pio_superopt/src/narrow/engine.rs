@@ -458,6 +458,163 @@ fn dd_outdst_mask(raw: u16) -> u16 {
     }
 }
 
+// --- 012 stage 0: predicate-read census -------------------------------
+//
+// Measurement before code (the dead-demand-census convention),
+// env-gated by `PIO_NARROW_PRED_CENSUS=1`. At every 011(b) TAG-COLLAPSE
+// fork, classify the triggering read by ticket 012 §1's taxonomy and
+// record the fork width actually paid (children pushed) against the
+// width an outcome-classed fork (012 §2) would pay — the would-be
+// class count over the collapse's allowed raw values. Measurement
+// only: no search behavior changes; flag off (or "0") every hook is
+// one `None` test.
+//
+// Structural notes against the current machinery (011(b): x/y Field
+// tags only):
+// - `ctr-thresh` (JMP !osre, PULL IFEMPTY, PUSH IFFULL, autopush/pull
+//   guards) never triggers a collapse today — shift counters are
+//   CntProv-tracked concrete state, not tags — so its row stays 0
+//   until counters can be symbolic (012 stage 3). No fork width is
+//   paid for counter reads anywhere today.
+// - `out-pinvis` (grouping allowed bc values by (latch write,
+//   threshold outcome)) never triggers either: OUT reads OSR, which
+//   011(b) never tags — the row stays 0 until OSR tags land (012
+//   stage 4 / 011(c)). Its width today is paid at the BitCount FETCH
+//   fork, outside the collapse sites this probe is commissioned for.
+// The reachable kinds are the stage-1/2 slices (zero tests, dec
+// tests, eq tests, IN sub-values) vs the full-value collapses.
+
+const PC_NKIND: usize = 10;
+const PC_KIND_NAMES: [&str; PC_NKIND] = [
+    "jmp-zero",     // JMP !x/!y on the tagged reg: Pred(v == 0)
+    "jmp-dec",      // JMP x--/y--: Pred(v == 0) + dec write on the != 0 arm
+    "jmp-eq-const", // JMP x!=y, other side concrete: Pred(v == c)
+    "jmp-eq-sym",   // JMP x!=y, both sides symbolic: collapse (012 §7)
+    "in-sub",       // IN src x/y: low-bc sub-value classes
+    "mov-full",     // MOV src read: full-value collapse
+    "pull-bind",    // PULL empty physical-X read + binding predicate
+    "pend-bind",    // binding demand for a pending word (011 §4)
+    "ctr-thresh",   // counter threshold (unreachable today, see above)
+    "out-pinvis",   // OUT pin-visible classes (unreachable today)
+];
+
+#[derive(Default)]
+struct PredCensus {
+    count: [u64; PC_NKIND],
+    width_paid: [u64; PC_NKIND],
+    width_class: [u64; PC_NKIND],
+}
+
+impl PredCensus {
+    fn open() -> Option<Box<PredCensus>> {
+        let v = std::env::var("PIO_NARROW_PRED_CENSUS").ok()?;
+        if v == "0" {
+            return None;
+        }
+        eprintln!("narrow-search: predicate-read census on (ticket 012 stage 0)");
+        Some(Box::default())
+    }
+
+    fn note(&mut self, kind: usize, paid: u64, classes: u64) {
+        self.count[kind] += 1;
+        self.width_paid[kind] += paid;
+        self.width_class[kind] += classes;
+    }
+
+    fn print(&self, tag: &str) {
+        eprintln!("pred-census[{tag}]: kind collapses width-paid width-classes reduction");
+        for k in 0..PC_NKIND {
+            if self.count[k] == 0 {
+                continue;
+            }
+            let red = self.width_paid[k] as f64 / self.width_class[k].max(1) as f64;
+            eprintln!(
+                "  {:<12} {} {} {} {:.1}x",
+                PC_KIND_NAMES[k], self.count[k], self.width_paid[k], self.width_class[k], red
+            );
+        }
+        let (c, p, cl): (u64, u64, u64) = (
+            self.count.iter().sum(),
+            self.width_paid.iter().sum(),
+            self.width_class.iter().sum(),
+        );
+        eprintln!(
+            "  {:<12} {} {} {} {:.1}x",
+            "TOTAL",
+            c,
+            p,
+            cl,
+            p as f64 / cl.max(1) as f64
+        );
+    }
+}
+
+/// Classify one tag collapse (012 §1) and compute the would-be
+/// outcome-class count over the allowed raw values. `alias_x`/`alias_y`
+/// say which registers the collapsing tag feeds; `other_tag`/
+/// `other_val` describe the non-collapsing scratch register.
+fn pred_census_classify(
+    w: u16,
+    alias_x: bool,
+    alias_y: bool,
+    other_tag: Option<(u8, u16)>,
+    other_val: u32,
+    raws: &[u32],
+) -> (usize, u64) {
+    let full = raws.len() as u64;
+    let two_way = |pred: &dyn Fn(u32) -> bool| -> u64 {
+        raws.iter().any(|&r| pred(r)) as u64 + raws.iter().any(|&r| !pred(r)) as u64
+    };
+    match (w >> 13) & 0x7 {
+        0 => {
+            let cond = (w >> 5) & 0x7;
+            let tests_this = match cond {
+                1 | 2 => alias_x,
+                3 | 4 => alias_y,
+                5 => true,
+                _ => false,
+            };
+            if !tests_this {
+                return (7, full); // collapse forced by the binding demand
+            }
+            match cond {
+                1 | 3 => (0, two_way(&|r| r == 0)),
+                2 | 4 => (1, two_way(&|r| r == 0)),
+                5 if alias_x && alias_y => (2, 1), // x == y by tag identity
+                5 if other_tag.is_some() => (3, full),
+                5 => (2, two_way(&|r| r == other_val)),
+                _ => (7, full),
+            }
+        }
+        2 => {
+            let src = (w >> 5) & 0x7;
+            if !(src == 1 && alias_x || src == 2 && alias_y) {
+                return (7, full);
+            }
+            let bc = { let b = (w & 0x1F) as u32; if b == 0 { 32 } else { b } };
+            let mask = if bc >= 32 { u32::MAX } else { (1u32 << bc) - 1 };
+            let mut seen: Vec<u32> = Vec::with_capacity(raws.len());
+            for &r in raws {
+                let s = r & mask;
+                if !seen.contains(&s) {
+                    seen.push(s);
+                }
+            }
+            (4, seen.len() as u64)
+        }
+        4 => (6, full),
+        5 => {
+            let src = (w & 0x7) as u16;
+            if src == 1 && alias_x || src == 2 && alias_y {
+                (5, full)
+            } else {
+                (7, full)
+            }
+        }
+        _ => (7, full),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DdOutcome {
     LiveRead,
@@ -3975,6 +4132,9 @@ fn search_impl(
     // Dead-demand census (ticket 011 gating measurement), env-gated
     // and instrument-only like the other diagnostic channels.
     let mut dd = if instrument { DeadDemand::open() } else { None };
+    // 012 stage 0 predicate-read census, same channel conventions
+    // (instrument-only ⇒ split workers run uninstrumented by design).
+    let mut pred_census = if instrument { PredCensus::open() } else { None };
     // Records must beat this subtree size to earn a slot; quadruples at
     // every cap purge.
     let mut min_benefit: u32 = 4;
@@ -4039,6 +4199,9 @@ fn search_impl(
             );
             if let Some(d) = dd.as_ref() {
                 d.print("beat");
+            }
+            if let Some(c) = pred_census.as_ref() {
+                c.print("beat");
             }
             last_beat = std::time::Instant::now();
         }
@@ -4592,6 +4755,22 @@ fn search_impl(
                             stats.fork_kinds[kind_idx(FieldKind::SetData)] += 1;
                         }
                         stats.tag_collapses += 1;
+                        // 012 stage 0: classify this collapse's
+                        // triggering read and the fork width an
+                        // outcome-classed fork would have paid.
+                        if let Some(c) = pred_census.as_mut() {
+                            let raws: Vec<u32> =
+                                values.iter().map(|&v| ((v & m) >> sh) as u32).collect();
+                            let (other_tag, other_val) = if alias_x {
+                                (it.tags.y, it.st.y)
+                            } else {
+                                (it.tags.x, it.st.x)
+                            };
+                            let (kind, classes) = pred_census_classify(
+                                exec_word, alias_x, alias_y, other_tag, other_val, &raws,
+                            );
+                            c.note(kind, values.len() as u64, classes);
+                        }
                         if memo_on {
                             flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
@@ -5072,6 +5251,9 @@ fn search_impl(
             .map(|(n, c)| format!("{n}={c}"))
             .collect();
         eprintln!("narrow-search: fork attribution: {}", named.join(" "));
+    }
+    if let Some(c) = pred_census.as_ref() {
+        c.print("final");
     }
     if let Some(d) = dd.as_ref() {
         d.print("final");
