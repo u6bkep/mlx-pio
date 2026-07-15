@@ -2247,3 +2247,343 @@ fn pair_fingerprint_census() {
     }
     eprintln!("pair-census: top-200 family dump at {path}");
 }
+
+/// Disassemble one champion slot into PIO asm with don't-care fields
+/// annotated `*` (an undecided field was never consulted on any
+/// surviving path — any value reproduces the trace). `decided == 0`
+/// means the slot was never fetched at all.
+fn disasm_slot(value: u16, decided: u16) -> String {
+    let field = |mask: u16| -> Option<u16> {
+        if decided & mask == mask {
+            Some((value & mask) >> mask.trailing_zeros())
+        } else {
+            None
+        }
+    };
+    if decided == 0 {
+        return "<never fetched: whole slot free>".into();
+    }
+    let fs = |v: Option<u16>, names: &[&str]| -> String {
+        match v {
+            Some(x) => names.get(x as usize).copied().unwrap_or("?").into(),
+            None => "*".into(),
+        }
+    };
+    let fn_ = |v: Option<u16>| -> String {
+        match v {
+            Some(x) => format!("{x}"),
+            None => "*".into(),
+        }
+    };
+    let delay = match field(0x1F00) {
+        Some(0) => String::new(),
+        Some(d) => format!(" [{d}]"),
+        None => " [*]".into(),
+    };
+    let body = match field(0xE000) {
+        None => "<opcode undecided>".into(),
+        Some(0) => {
+            let cond = fs(field(0x00E0), &["", "!x, ", "x--, ", "!y, ", "y--, ", "x!=y, ", "pin, ", "!osre, "]);
+            format!("jmp {cond}{}", fn_(field(0x001F)))
+        }
+        Some(1) => {
+            let pol = fn_(field(0x0080));
+            let src = fs(field(0x0060), &["gpio", "pin", "irq"]);
+            format!("wait {pol} {src} {}", fn_(field(0x001F)))
+        }
+        Some(2) => {
+            let count = field(0x001F).map(|c| if c == 0 { 32 } else { c });
+            format!(
+                "in {}, {}",
+                fs(field(0x00E0), &["pins", "x", "y", "null", "?", "?", "isr", "osr"]),
+                fn_(count)
+            )
+        }
+        Some(3) => {
+            let count = field(0x001F).map(|c| if c == 0 { 32 } else { c });
+            format!(
+                "out {}, {}",
+                fs(field(0x00E0), &["pins", "x", "y", "null", "pindirs", "pc", "isr", "exec"]),
+                fn_(count)
+            )
+        }
+        Some(4) => match field(0x00E0) {
+            None => "push/pull *".into(),
+            Some(b) => {
+                let mut s = if b & 4 != 0 { "pull".to_string() } else { "push".to_string() };
+                if b & 2 != 0 {
+                    s.push_str(if b & 4 != 0 { " ifempty" } else { " iffull" });
+                }
+                s.push_str(if b & 1 != 0 { " block" } else { " noblock" });
+                s
+            }
+        },
+        Some(5) => format!(
+            "mov {}, {}{}",
+            fs(field(0x00E0), &["pins", "x", "y", "pindirs", "exec", "pc", "isr", "osr"]),
+            fs(field(0x0018), &["", "!", "::"]),
+            fs(field(0x0007), &["pins", "x", "y", "null", "?", "status", "isr", "osr"])
+        ),
+        Some(6) => {
+            let flags = fs(field(0x0060), &["set", "wait", "clear", "clear+wait"]);
+            let idx = match field(0x001F) {
+                Some(i) if i & 0x10 != 0 => format!("{} rel", i & 0x7),
+                Some(i) => format!("{i}"),
+                None => "*".into(),
+            };
+            format!("irq {flags} {idx}")
+        }
+        _ => format!(
+            "set {}, {}",
+            fs(field(0x00E0), &["pins", "x", "y", "?", "pindirs"]),
+            fn_(field(0x001F))
+        ),
+    };
+    format!("{body}{delay}")
+}
+
+/// Tiny-spec champion mining for DIRECT human eyeballing — the point is
+/// a champion set small enough to read in full (prior dumps were far too
+/// big; mining-by-proxy loses information). Two solution-sparse specs on
+/// a 1-pin config (SET + OUT windows and the IN loopback all on pin 0):
+///
+///   - TOGGLER (output-only): pin toggles every cycle. L* = 1
+///     (`mov pins, !pins` via loopback); also mined at L = 2.
+///   - BIT-COPIER (data-driven, primary): pin level = next TX-FIFO bit,
+///     LSB first, 2 cycles/bit, autopull threshold 8 (each word's low
+///     byte is the payload). L* = 1 (`out pins, 1 [1]`, wrap 0..0);
+///     also mined at L = 2. The reference trace is asserted to DEPEND
+///     on the FIFO data (each of the first two words), and every
+///     champion is re-validated against alternative FIFO seedings —
+///     the single-seeded-FIFO census caveat (journal 2026-07-13).
+///
+/// Champions are grouped into STRICT families (pin trace + OOB flag +
+/// final state, across a 4-context FIFO battery over a 2x horizon) and
+/// printed in full, disassembled with `*` don't-care annotations.
+/// `cargo test --release --test narrow_engine -- --ignored tiny_champion_eyeball --nocapture`
+#[test]
+#[ignore]
+fn tiny_champion_eyeball() {
+    use pio_superopt::ir::{MovDst, MovOp, MovSrc};
+    use pio_superopt::narrow::NState;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    let side = SideCfg::NONE;
+    let mov_toggle = Insn::plain(Op::Mov { dst: MovDst::Pins, op: MovOp::Invert, src: MovSrc::Pins });
+    let out1_d1 = Insn { op: Op::Out { dst: OutDst::Pins, count: 1 }, delay: 1, sideset: None };
+
+    struct Entry {
+        name: &'static str,
+        reference: Vec<Insn>,
+        slots: u8,
+        wrap: (u8, u8),
+        cycles: u32,
+        inputs: Vec<u32>,
+        autopull: bool,
+        pull_threshold: u8,
+        data_driven: bool,
+    }
+    let payload = || vec![0xD3u32, 0x4A, 0xFF, 0x00];
+    let battery = vec![
+        Entry { name: "toggler_l1", reference: vec![mov_toggle.clone()], slots: 1, wrap: (0, 0), cycles: 17, inputs: vec![], autopull: false, pull_threshold: 32, data_driven: false },
+        Entry { name: "toggler_l2", reference: vec![mov_toggle.clone()], slots: 2, wrap: (0, 1), cycles: 17, inputs: vec![], autopull: false, pull_threshold: 32, data_driven: false },
+        Entry { name: "bitcopy_l1", reference: vec![out1_d1.clone()], slots: 1, wrap: (0, 0), cycles: 44, inputs: payload(), autopull: true, pull_threshold: 8, data_driven: true },
+        Entry { name: "bitcopy_l2", reference: vec![out1_d1.clone()], slots: 2, wrap: (0, 1), cycles: 44, inputs: payload(), autopull: true, pull_threshold: 8, data_driven: true },
+    ];
+
+    // Fingerprint context battery: FIFO seedings the champion families
+    // must agree under (empty, the search payload, and two contrasting
+    // seedings — with pull_threshold 8 only each word's low byte is
+    // consumed: 0x55, 0x00, 0xFF, 0xB1 / 0x01, 0x00, 0x55, 0x0D).
+    let fp_ctxs: Vec<Vec<u32>> = vec![
+        vec![],
+        payload(),
+        vec![0xAAAA_5555, 0x0000_0000, 0xFFFF_FFFF, 0x1234_56B1],
+        vec![0x0000_0001, 0x8000_0000, 0x5555_5555, 0xCAFE_F00D],
+    ];
+    // Cross-context validity seedings for the data-driven spec: the
+    // champion's canonical program must reproduce the REFERENCE trace
+    // under each (same spec, different data).
+    let validity_ctxs: Vec<Vec<u32>> = vec![
+        vec![0xAAAA_5555, 0x0000_0000, 0xFFFF_FFFF, 0x1234_56B1],
+        vec![0x0000_0001, 0x8000_0000, 0x5555_5555, 0xCAFE_F00D],
+        vec![0, 0, 0, 0],
+        vec![0xFFFF_FFFF; 4],
+    ];
+
+    for e in &battery {
+        let config = Config {
+            pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 1, in_base: 0, ..PinMap::default() },
+            shift: ShiftCfg { autopull: e.autopull, pull_threshold: e.pull_threshold, ..ShiftCfg::default() },
+            ..Config::default()
+        };
+        // Expected trace from the reference under its own (L*) wrap.
+        let mut ref_spec = EngineSpec {
+            cfg: cfg_for(config.clone(), 0, e.reference.len() as u8 - 1),
+            slots: e.reference.len() as u8,
+            cycles: e.cycles,
+            inputs: e.inputs.clone(),
+            output_pins: vec![0],
+            capture_pins: vec![0],
+            stim: Stim::default(),
+            irq_sets: vec![],
+            expected: vec![],
+            seed: vec![],
+            memo_cap: 0,
+        };
+        let reference = words_of(&e.reference, &side);
+        ref_spec.expected = run_spec(&ref_spec, reference);
+
+        if e.data_driven {
+            // Flipping the consumed byte of either of the first two FIFO
+            // words must change the trace: the waveform is a function of
+            // the data and at least two words shift out in the horizon.
+            for w in 0..2 {
+                let mut alt = ref_spec.clone();
+                alt.inputs[w] ^= 0xFF;
+                assert_ne!(
+                    run_spec(&alt, reference),
+                    ref_spec.expected,
+                    "[{}] trace does not depend on FIFO word {w} — not a data-driven spec",
+                    e.name
+                );
+            }
+        } else {
+            assert!(
+                ref_spec.expected.windows(2).all(|w| (w[0] ^ w[1]) & 1 != 0),
+                "[{}] oracle is not an every-cycle toggle",
+                e.name
+            );
+        }
+        let wave: String =
+            ref_spec.expected.iter().map(|w| if w & 1 != 0 { '1' } else { '0' }).collect();
+        eprintln!("\n=== {} : slots={} wrap={:?} cycles={} inputs={:08x?}", e.name, e.slots, e.wrap, e.cycles, e.inputs);
+        eprintln!("    expected pin0 waveform: {wave}");
+
+        let s = EngineSpec {
+            cfg: cfg_for(config.clone(), e.wrap.0, e.wrap.1),
+            slots: e.slots,
+            cycles: e.cycles,
+            inputs: e.inputs.clone(),
+            output_pins: vec![0],
+            capture_pins: vec![0],
+            stim: Stim::default(),
+            irq_sets: vec![],
+            expected: ref_spec.expected.clone(),
+            seed: vec![],
+            memo_cap: 1 << 21,
+        };
+        let t = Instant::now();
+        let r = search(&s, 1 << 20);
+        assert_champions_sound(&s, &r.champions);
+        // The reference itself is only a member of the searched space at
+        // its own length (at L*+1 the NOP-padded reference does not
+        // reproduce the trace — the padding executes).
+        if e.slots as usize == e.reference.len() {
+            assert!(covered(&r.champions, &reference), "[{}] reference not covered", e.name);
+        }
+        assert!(r.stats.champions_found > 0, "[{}] no champions", e.name);
+        eprintln!(
+            "    search: items={} refuted={} champions={} cap_hit={} in {:.1}s",
+            r.stats.items,
+            r.stats.refuted,
+            r.champions.len(),
+            r.champion_cap_hit,
+            t.elapsed().as_secs_f64()
+        );
+
+        // Cross-context validity (data-driven only): the canonical
+        // program of each champion must reproduce the reference's trace
+        // under every alternative seeding. A failure is a data
+        // coincidence of the search context — report, don't assert.
+        let mut ctx_valid = vec![true; r.champions.len()];
+        if e.data_driven {
+            for ctx in &validity_ctxs {
+                let mut alt = ref_spec.clone();
+                alt.inputs = ctx.clone();
+                let want = run_spec(&alt, reference);
+                let mut chk = s.clone();
+                chk.inputs = ctx.clone();
+                let mut ok = 0usize;
+                for (i, ch) in r.champions.iter().enumerate() {
+                    let (tr, oob) = run_spec_oob(&chk, ch.words());
+                    if !oob && tr == want {
+                        ok += 1;
+                    } else {
+                        ctx_valid[i] = false;
+                    }
+                }
+                eprintln!(
+                    "    ctx-validity {:08x?}: {ok}/{} champions reproduce the reference",
+                    ctx,
+                    r.champions.len()
+                );
+            }
+        }
+
+        // STRICT fingerprint: (trace, oob, final state) per context over
+        // a 2x horizon. LOOSE drops the final state (externally
+        // observable behavior only).
+        let mut ext = s.clone();
+        ext.cycles = e.cycles * 2;
+        let mut strict: HashMap<Vec<(Vec<u32>, bool, NState)>, Vec<usize>> = HashMap::new();
+        let mut loose: HashMap<Vec<(Vec<u32>, bool)>, Vec<usize>> = HashMap::new();
+        for (i, ch) in r.champions.iter().enumerate() {
+            let mut fp = Vec::with_capacity(fp_ctxs.len());
+            for ctx in &fp_ctxs {
+                let mut c = ext.clone();
+                c.inputs = ctx.clone();
+                let (tr, oob, fin) = run_spec_state(&c, ch.words());
+                fp.push((tr, oob, fin));
+            }
+            loose
+                .entry(fp.iter().map(|(t, o, _)| (t.clone(), *o)).collect())
+                .or_default()
+                .push(i);
+            strict.entry(fp).or_default().push(i);
+        }
+        // Stable loose-family ids for the printout.
+        let mut loose_fams: Vec<&Vec<usize>> = loose.values().collect();
+        loose_fams.sort_unstable_by_key(|m| (usize::MAX - m.len(), m[0]));
+        let loose_id: HashMap<usize, usize> = loose_fams
+            .iter()
+            .enumerate()
+            .flat_map(|(id, m)| m.iter().map(move |&i| (i, id)))
+            .collect();
+
+        let mut fams: Vec<&Vec<usize>> = strict.values().collect();
+        fams.sort_unstable_by_key(|m| (usize::MAX - m.len(), m[0]));
+        eprintln!(
+            "    strict families: {} ({} multi) | loose families: {} ({} multi)",
+            fams.len(),
+            fams.iter().filter(|m| m.len() > 1).count(),
+            loose.len(),
+            loose.values().filter(|m| m.len() > 1).count()
+        );
+        let full = r.champions.len() <= 1000;
+        if !full {
+            eprintln!("    >1000 champions: printing one representative per strict family");
+        }
+        for (fid, members) in fams.iter().enumerate() {
+            eprintln!("    S{fid:02} ({} members, loose L{:02}):", members.len(), loose_id[&members[0]]);
+            let shown: &[usize] = if full { members } else { &members[..1] };
+            for &i in shown {
+                let ch = &r.champions[i];
+                let raw: Vec<String> = (0..e.slots as usize)
+                    .map(|s| format!("{:04x}/{:04x}", ch.value[s], ch.decided[s]))
+                    .collect();
+                let asm: Vec<String> = (0..e.slots as usize)
+                    .map(|s| disasm_slot(ch.value[s], ch.decided[s]))
+                    .collect();
+                eprintln!(
+                    "      [{}]  {}  bf={}{}",
+                    raw.join(" "),
+                    asm.join("  ;  "),
+                    ch.binding_free,
+                    if ctx_valid[i] { "" } else { "  CTX-DEPENDENT" }
+                );
+            }
+        }
+    }
+}
