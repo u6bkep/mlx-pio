@@ -43,10 +43,13 @@
 //! PIO cycle), all pin groups base 0 / count 1 (one observed pin), autopush
 //! off, autopull free, both shift directions.
 //!
-//! The TX FIFO is modeled as an index into the concrete input word list —
+//! The TX FIFO is modeled as an index into an input word list ([`SymFifo`]) —
 //! valid for both the harness fast path (inputs pre-loaded) and streaming
 //! (refill before every step): pops happen in order and "empty" ⇔ the list is
-//! exhausted (`run::tests::stream_matches_fast` pins their equivalence).
+//! exhausted (`run::tests::stream_matches_fast` pins their equivalence). The
+//! word list and its occupancy may be concrete (the historical `&[u32]`
+//! behavior) or free bitvector variables — the equivalence driver
+//! ([`equiv`]) quantifies over both.
 
 // `_eq` is deprecated in favor of an inherent `eq`, but `eq` collides with
 // `PartialEq::eq` in reading position; the explicit name is clearer here.
@@ -58,6 +61,7 @@ use crate::ir::SideCfg;
 use crate::program::{Config, Program, ShiftDir};
 
 pub mod cegis;
+pub mod equiv;
 
 // ---- small constructors --------------------------------------------------
 
@@ -151,6 +155,14 @@ impl SymProgram {
     /// `(0, len-1)`. Callers must assert [`legal_word`] on each free word.
     pub fn free(len: usize, side: &SideCfg) -> SymProgram {
         Self::with_holes(&vec![None; len], side)
+    }
+
+    /// Concrete raw instruction words (slot `i` = `words[i]`), NOP padding,
+    /// wrap = `(0, len-1)` — the [`equiv`](crate::smt::equiv) entry point.
+    /// Callers must check each word against [`legal_word`] themselves.
+    pub fn from_words(words: &[u16], side: &SideCfg) -> SymProgram {
+        let template: Vec<Option<u16>> = words.iter().map(|&w| Some(w)).collect();
+        Self::with_holes(&template, side)
     }
 
     /// Like [`SymProgram::free`], but with a template: `Some(word)` slots are
@@ -249,11 +261,44 @@ pub fn legal_word(word: &BV, len: u8) -> Bool {
     jmp_ok | out_ok | pull_ok | mov_ok | set_ok
 }
 
-/// One PIO cycle: `execute_cycle` in bitvectors. `inputs` is the concrete TX
-/// word stream ([`SymState::fifo_next`] indexes it). Returns the next state;
+/// The TX input stream of a symbolic run: `words[i]` is the i-th word popped
+/// ([`SymState::fifo_next`] indexes it), `len` is how many of them are
+/// actually queued — the FIFO reads empty once `fifo_next >= len`. Both the
+/// contents and the occupancy may be Z3 constants ([`SymFifo::concrete`],
+/// the historical `&[u32]` behavior) or free variables ([`SymFifo::free`],
+/// the ∀-input side of equivalence queries).
+pub struct SymFifo {
+    pub words: Vec<BV>, // 32 bits each
+    pub len: BV,        // 8 bits; callers keep len <= words.len()
+}
+
+impl SymFifo {
+    /// Constant contents, constant occupancy = the whole list.
+    pub fn concrete(inputs: &[u32]) -> SymFifo {
+        assert!(inputs.len() < 256, "fifo_next is 8 bits");
+        SymFifo {
+            words: inputs.iter().map(|&w| bvu(w as u64, 32)).collect(),
+            len: bvu(inputs.len() as u64, 8),
+        }
+    }
+
+    /// `n` free words (`<tag>_w<i>`) plus a free occupancy `<tag>_len`.
+    /// Returns the FIFO and the side condition `len <= n`, which the caller
+    /// MUST assert — an unconstrained `len` would index past `words`.
+    pub fn free(n: usize, tag: &str) -> (SymFifo, Bool) {
+        assert!(n < 256, "fifo_next is 8 bits");
+        let words = (0..n).map(|i| BV::new_const(format!("{tag}_w{i}"), 32)).collect();
+        let len = BV::new_const(format!("{tag}_len"), 8);
+        let side = len.bvule(&bvu(n as u64, 8));
+        (SymFifo { words, len }, side)
+    }
+}
+
+/// One PIO cycle: `execute_cycle` in bitvectors. `fifo` is the TX word
+/// stream ([`SymState::fifo_next`] indexes it). Returns the next state;
 /// the captured sample for this cycle is `next.level()` / `next.oe` (the
 /// harness samples the merged pads *after* stepping).
-pub fn step(st: &SymState, prog: &SymProgram, cfg: &Config, inputs: &[u32]) -> SymState {
+pub fn step(st: &SymState, prog: &SymProgram, cfg: &Config, fifo: &SymFifo) -> SymState {
     debug_assert!(supported_config(cfg).is_ok());
     let thresh = cfg.shift.pull_threshold as u64; // 1..=32 (encode-time 0=32 already resolved)
     let autopull = cfg.shift.autopull;
@@ -266,7 +311,7 @@ pub fn step(st: &SymState, prog: &SymProgram, cfg: &Config, inputs: &[u32]) -> S
 
     // -- phase select (execute_cycle's early returns) -----------------------
     let in_delay = st.delay.bvugt(&bvu(0, 5));
-    let fifo_empty = st.fifo_next.bvuge(&bvu(inputs.len() as u64, 8));
+    let fifo_empty = st.fifo_next.bvuge(&fifo.len);
     // Only StallKind::Pull is reachable: still stalled iff the FIFO is empty.
     let blocked = !(&in_delay) & &st.stalled & &fifo_empty;
     let attempt = !(&in_delay) & !(&blocked);
@@ -308,9 +353,10 @@ pub fn step(st: &SymState, prog: &SymProgram, cfg: &Config, inputs: &[u32]) -> S
     let is_mov = opcode._eq(&bvu(5, 3));
     let is_set = opcode._eq(&bvu(7, 3));
 
-    // -- FIFO pop value (concrete stream, symbolic index) --------------------
-    let popped = inputs.iter().enumerate().rev().fold(bvu(0, 32), |acc, (i, &w)| {
-        st.fifo_next._eq(&bvu(i as u64, 8)).ite(&bvu(w as u64, 32), &acc)
+    // -- FIFO pop value (symbolic index into the word list; a read past
+    // `fifo.len` is unreachable — every pop is guarded by !fifo_empty) ------
+    let popped = fifo.words.iter().enumerate().rev().fold(bvu(0, 32), |acc, (i, w)| {
+        st.fifo_next._eq(&bvu(i as u64, 8)).ite(w, &acc)
     });
 
     // -- JMP ------------------------------------------------------------------
@@ -527,13 +573,13 @@ pub struct SymTrace {
 /// [`unroll_interned`] instead.
 pub fn unroll(prog: &SymProgram, cfg: &Config, inputs: &[u32], cycles: usize) -> SymTrace {
     supported_config(cfg).expect("unsupported config for the smt model");
-    assert!(inputs.len() < 256, "fifo_next is 8 bits");
+    let fifo = SymFifo::concrete(inputs);
     let mut states = Vec::with_capacity(cycles + 1);
     let mut levels = Vec::with_capacity(cycles);
     let mut oes = Vec::with_capacity(cycles);
     states.push(SymState::initial());
     for t in 0..cycles {
-        let next = step(&states[t], prog, cfg, inputs);
+        let next = step(&states[t], prog, cfg, &fifo);
         levels.push(next.level());
         oes.push(next.oe.clone());
         states.push(next);
@@ -554,14 +600,38 @@ pub fn unroll_interned(
     cycles: usize,
     tag: usize,
 ) -> SymTrace {
+    unroll_interned_from(
+        solver,
+        prog,
+        cfg,
+        &SymState::initial(),
+        &SymFifo::concrete(inputs),
+        cycles,
+        tag,
+    )
+}
+
+/// [`unroll_interned`] generalized to an arbitrary (possibly symbolic)
+/// initial state and a [`SymFifo`] input stream — the equivalence driver's
+/// unrolling: two programs share `init` and `fifo` in one solver, each with
+/// its own `tag`. The caller owns any constraints on the symbolic parts
+/// (e.g. `SymFifo::free`'s side condition, `osr_cnt <= 32`).
+pub fn unroll_interned_from(
+    solver: &z3::Solver,
+    prog: &SymProgram,
+    cfg: &Config,
+    init: &SymState,
+    fifo: &SymFifo,
+    cycles: usize,
+    tag: usize,
+) -> SymTrace {
     supported_config(cfg).expect("unsupported config for the smt model");
-    assert!(inputs.len() < 256, "fifo_next is 8 bits");
     let mut states = Vec::with_capacity(cycles + 1);
     let mut levels = Vec::with_capacity(cycles);
     let mut oes = Vec::with_capacity(cycles);
-    states.push(SymState::initial());
+    states.push(init.clone());
     for t in 0..cycles {
-        let next = step(&states[t], prog, cfg, inputs);
+        let next = step(&states[t], prog, cfg, fifo);
         let ibv = |name: &str, e: &BV| -> BV {
             let v = BV::new_const(format!("u{tag}_{t}_{name}"), e.get_size());
             solver.assert(&v._eq(e));
