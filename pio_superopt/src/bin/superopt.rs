@@ -8,6 +8,7 @@
 //!     superopt enumerate --len N    # exhaustive loop-body sweep (sharded, resumable)
 //!     superopt serve --len N        # shard-lease coordinator for a worker fleet
 //!     superopt work --server URL    # pull shards from a coordinator until drained
+//!     superopt narrow-split [opts]  # narrowing-engine bracket search, unit-resumable
 //!     superopt diagnose --trace PATH
 //!     superopt smt-synth --len N    # CEGIS synthesis via z3 (--features smt)
 //!
@@ -44,6 +45,9 @@ fn usage() -> ! {
        superopt enumerate --len N [--shard-mod M --shard-rem R] [--threads T] [--out DIR]\n\
        superopt serve --len N [--out DIR] [--listen ADDR:PORT] [--lease-secs S]\n\
        superopt work --server URL [--threads T]\n\
+       superopt narrow-split --spec tx-a --len L --wrap-lo A --wrap-hi B [--cycles 460]\n\
+                          [--threads T] [--target N] [--champion-cap 5] [--memo-cap N]\n\
+                          [--trace PATH] [--fresh]   (unit-level resume; see fn docs)\n\
        superopt diagnose --trace PATH\n\
        superopt smt-synth --len N [--side none|1|2en] [--side-pindir] [--no-autopull]\n\
                           [--max-iters N] [--trace PATH]   (needs --features smt)\n\
@@ -121,6 +125,7 @@ fn main() {
         Some("enumerate") => enumerate_cmd(&args[1..]),
         Some("serve") => serve_cmd(&args[1..]),
         Some("work") => work_cmd(&args[1..]),
+        Some("narrow-split") => narrow_split_cmd(&args[1..]),
         Some("diagnose") => diagnose(&args[1..]),
         #[cfg(feature = "smt")]
         Some("smt-synth") => smt_synth_cmd(&args[1..]),
@@ -885,6 +890,587 @@ fn work_cmd(args: &[String]) {
         done_count.load(std::sync::atomic::Ordering::SeqCst),
         t0.elapsed().as_secs_f64()
     );
+}
+
+// ---------------------------------------------------------------------
+// narrow-split: the narrowing engine's bracket searches (tx_a wrap
+// brackets), migrated from the #[ignore] test path with UNIT-LEVEL
+// resume. Same computation as `narrow::engine::search_split` — phase 1
+// (`split_units`) deterministically enumerates truncated-spec frontier
+// units, phase 2 runs each unit as an independent seeded search
+// (`search_unit`) — but the runner writes one JSONL line per settled
+// unit and, on restart with the same arguments, re-enumerates the
+// frontier and skips every unit already in the trace. The final
+// aggregate (item total, champion set, verdict) is byte-identical to
+// an uninterrupted run because unit verdicts are scheduling-independent
+// and the merge is in unit-id order.
+//
+// Trace records (one JSON object per line):
+//   line 1   {"narrow_split":{spec identity + engine git rev}}  — the
+//            resume contract; a mismatched header REFUSES to resume.
+//   unit     {"unit":i,"ms":..,"items":..,"champions":[..],"stats":{..}}
+//   telem    {"telem":{..}} every ~60s: settled-aggregate item/fork/memo
+//            counters for tail analysis (distinct type; resume skips it).
+//   done     {"done":{..}} final aggregate.
+// Lines are written whole under a mutex and flushed line-atomically;
+// fsync every ~5s and at signal exit. SIGINT/SIGTERM: settled units are
+// already durable, in-flight units are abandoned (they simply re-run on
+// resume — partial unit lines are never written), the trace is synced,
+// exit 130. A torn final line (SIGKILL mid-write) is truncated away on
+// the next resume scan.
+
+/// FNV-1a 64 over the spec's Debug rendering: a stable, dependency-free
+/// spec fingerprint for the resume header (belt and braces on top of
+/// the explicit len/wrap/cycles fields — catches fixture drift).
+fn fnv1a64(s: &str) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn git_rev_dirty() -> (String, bool) {
+    let rev = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let dirty = std::process::Command::new("git")
+        .args(["status", "--porcelain", "-uno"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+    (rev, dirty)
+}
+
+/// One settled unit as recovered from the trace.
+struct NarrowUnitRec {
+    champions: Vec<pio_superopt::narrow::engine::Champion>,
+    stats: pio_superopt::narrow::engine::Stats,
+    cap_hit: bool,
+}
+
+/// Scan a narrow-split trace: returns (header, settled units, byte
+/// length of the last complete line). A torn FINAL line is tolerated
+/// (reported via the returned length, truncated by the caller before
+/// appending); torn interior lines or duplicate unit ids are errors.
+fn scan_narrow_trace(
+    path: &std::path::Path,
+) -> Result<(serde_json::Value, std::collections::BTreeMap<usize, NarrowUnitRec>, u64), String> {
+    let data = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut header: Option<serde_json::Value> = None;
+    let mut units = std::collections::BTreeMap::new();
+    let mut good_len = 0u64;
+    let mut offset = 0usize;
+    for line in data.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let complete = line.ends_with('\n');
+        let body = line.trim_end();
+        if body.is_empty() {
+            if complete {
+                good_len = offset as u64;
+            }
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(e) => {
+                if offset == data.len() {
+                    // Torn tail (killed mid-write) — resume just before it.
+                    eprintln!(
+                        "note: {} has a torn final line ({} bytes) — dropping it (its unit re-runs)",
+                        path.display(),
+                        line.len()
+                    );
+                    break;
+                }
+                return Err(format!("{}: bad line at byte {start}: {e}", path.display()));
+            }
+        };
+        if !complete && offset == data.len() {
+            // Parsed but unterminated: treat as torn (an append could
+            // otherwise glue the next record onto it).
+            eprintln!("note: {} final line unterminated — dropping it", path.display());
+            break;
+        }
+        good_len = offset as u64;
+        if header.is_none() {
+            if v.get("narrow_split").is_none() {
+                return Err(format!("{}: not a narrow-split trace (bad header)", path.display()));
+            }
+            header = Some(v);
+            continue;
+        }
+        if let Some(u) = v.get("unit").and_then(|u| u.as_u64()) {
+            let champions = serde_json::from_value(v["champions"].clone())
+                .map_err(|e| format!("unit {u}: bad champions: {e}"))?;
+            let stats = serde_json::from_value(v["stats"].clone())
+                .map_err(|e| format!("unit {u}: bad stats: {e}"))?;
+            let cap_hit = v["cap_hit"].as_bool().unwrap_or(false);
+            if units
+                .insert(u as usize, NarrowUnitRec { champions, stats, cap_hit })
+                .is_some()
+            {
+                return Err(format!(
+                    "{}: unit {u} appears twice — was this trace written by two processes at once?",
+                    path.display()
+                ));
+            }
+        }
+        // telem / done records: observability only, nothing to recover.
+    }
+    let header = header.ok_or_else(|| format!("{}: empty trace (pass --fresh)", path.display()))?;
+    Ok((header, units, good_len))
+}
+
+/// The trace sink: whole-line writes under one lock, flushed per line
+/// (a line present in the file is complete), fsynced at most every ~5s
+/// plus at exit — a SIGKILL can tear only the final line, which the
+/// resume scan drops.
+struct NarrowSink {
+    w: std::io::BufWriter<std::fs::File>,
+    last_sync: std::time::Instant,
+}
+
+impl NarrowSink {
+    fn line(&mut self, s: &str) {
+        writeln!(self.w, "{s}").expect("write trace line");
+        self.w.flush().expect("flush trace");
+        if self.last_sync.elapsed().as_secs() >= 5 {
+            let _ = self.w.get_ref().sync_data();
+            self.last_sync = std::time::Instant::now();
+        }
+    }
+    fn sync(&mut self) {
+        let _ = self.w.flush();
+        let _ = self.w.get_ref().sync_data();
+    }
+}
+
+/// `superopt narrow-split --spec tx-a --len 3 --wrap-lo 1 --wrap-hi 2
+/// [--cycles 460] [--threads T] [--target N] [--champion-cap 5]
+/// [--memo-cap 2097152] [--trace PATH] [--fresh]`
+///
+/// Reproduces the #[ignore]-test bracket searches (`tx_a_l3_*` in
+/// tests/narrow_engine.rs) through the resumable runner. The header
+/// pins spec identity (spec/len/wrap/cycles/caps/target/spec-hash) AND
+/// the engine git rev — resuming across a mismatched header is refused
+/// (unit verdicts from different engine revisions must never be mixed;
+/// pass --fresh or another --trace). `--threads` is deliberately NOT
+/// part of the identity: unit verdicts are scheduling-independent, so a
+/// resume may use a different thread count — but the unit DECOMPOSITION
+/// depends on `--target` (default max(128*threads, 512), the frontier
+/// unit target), so resuming with different threads requires pinning
+/// --target to the original run's value (recorded in the header).
+/// Env-gated engine probes (PIO_NARROW_*) behave exactly as under the
+/// test path's `search_split`: active in instrumented sequential
+/// searches only — split workers run uninstrumented by design.
+fn narrow_split_cmd(args: &[String]) {
+    use pio_superopt::fixtures::{tx_a_narrow_spec, tx_a_narrow_words};
+    use pio_superopt::narrow::engine::{
+        merge_stats, run_spec, search_unit, split_units, SplitPlan, Stats, WordQuotient,
+    };
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    let mut spec_name = "tx-a".to_string();
+    let (mut len, mut wrap_lo, mut wrap_hi): (Option<u8>, Option<u8>, Option<u8>) = (None, None, None);
+    let mut cycles: u32 = 460;
+    let mut threads: usize = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let mut target: usize = 0; // 0 = auto
+    let mut champion_cap: usize = 5;
+    let mut memo_cap: usize = 1 << 21;
+    let mut trace: Option<String> = None;
+    let mut fresh = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().unwrap_or_else(|| usage()).clone();
+        match a.as_str() {
+            "--spec" => spec_name = val(),
+            "--len" => len = Some(val().parse().unwrap_or_else(|_| usage())),
+            "--wrap-lo" => wrap_lo = Some(val().parse().unwrap_or_else(|_| usage())),
+            "--wrap-hi" => wrap_hi = Some(val().parse().unwrap_or_else(|_| usage())),
+            "--cycles" => cycles = val().parse().unwrap_or_else(|_| usage()),
+            "--threads" => threads = val().parse().unwrap_or_else(|_| usage()),
+            "--target" => target = val().parse().unwrap_or_else(|_| usage()),
+            "--champion-cap" => champion_cap = val().parse().unwrap_or_else(|_| usage()),
+            "--memo-cap" => memo_cap = val().parse().unwrap_or_else(|_| usage()),
+            "--trace" => trace = Some(val()),
+            "--fresh" => fresh = true,
+            _ => usage(),
+        }
+    }
+    let (len, wrap_lo, wrap_hi) = match (len, wrap_lo, wrap_hi) {
+        (Some(l), Some(a), Some(b)) => (l, a, b),
+        _ => usage(),
+    };
+    assert!(wrap_lo <= wrap_hi && wrap_hi < len, "need wrap-lo <= wrap-hi < len");
+    let threads = threads.max(1);
+    // Same formula as search_split — byte-identical decomposition.
+    let target = if target == 0 { (threads * 128).max(512) } else { target };
+
+    // Spec construction, mirroring the test path exactly: expected
+    // trace from the reference program at its own shape (L=4 wrap
+    // 0..1), then the bracket spec at --len/--wrap over that trace.
+    let spec = match spec_name.as_str() {
+        "tx-a" => {
+            let (mut spec4, side) = tx_a_narrow_spec(cycles);
+            spec4.expected = run_spec(&spec4, tx_a_narrow_words(&side));
+            let (mut s, _) = tx_a_narrow_spec(cycles);
+            s.slots = len;
+            s.cfg.wrap_bottom = wrap_lo;
+            s.cfg.wrap_top = wrap_hi;
+            s.expected = spec4.expected;
+            s.memo_cap = memo_cap;
+            s
+        }
+        other => {
+            eprintln!("unknown --spec {other:?} (available: tx-a)");
+            std::process::exit(2);
+        }
+    };
+
+    let (git_rev, dirty) = git_rev_dirty();
+    let header = serde_json::json!({ "narrow_split": {
+        "spec": spec_name,
+        "len": len,
+        "wrap": [wrap_lo, wrap_hi],
+        "cycles": cycles,
+        "champion_cap": champion_cap,
+        "memo_cap": memo_cap,
+        "target": target,
+        "spec_hash": format!("fnv1a:{:016x}", fnv1a64(&format!("{spec:?}"))),
+        "git_rev": git_rev,
+        "dirty": dirty,
+    }});
+
+    let path = std::path::PathBuf::from(trace.unwrap_or_else(|| {
+        format!("runs/narrow-split-{spec_name}-l{len}-w{wrap_lo}-{wrap_hi}.jsonl")
+    }));
+    std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new("."))).expect("create trace dir");
+
+    // Resolve fresh-vs-resume BEFORE opening for append.
+    let mut settled = std::collections::BTreeMap::new();
+    let mut resume = false;
+    if path.exists() && !fresh && std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false) {
+        let (old_header, units, good_len) = scan_narrow_trace(&path).unwrap_or_else(|e| {
+            eprintln!("cannot resume from {}: {e}\n(pass --fresh to discard it)", path.display());
+            std::process::exit(1);
+        });
+        if old_header != header {
+            eprintln!(
+                "{} belongs to a different run (header mismatch — unit verdicts must not be \
+                 mixed across specs or engine revisions):\n  file: {old_header}\n  args: {header}\n\
+                 rerun with the original parameters/binary, another --trace, or --fresh.",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+        if header["narrow_split"]["dirty"].as_bool() == Some(true) {
+            eprintln!(
+                "warning: resuming with a DIRTY working tree — the header's git rev cannot \
+                 prove the engine is unchanged; verdict validity is on you."
+            );
+        }
+        // Drop a torn tail so appended lines start clean.
+        if good_len < std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) {
+            let f = std::fs::OpenOptions::new().write(true).open(&path).expect("open for truncate");
+            f.set_len(good_len).expect("truncate torn tail");
+        }
+        settled = units;
+        resume = true;
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(resume)
+        .truncate(!resume)
+        .write(true)
+        .open(&path)
+        .expect("open trace file");
+    let sink = std::sync::Arc::new(std::sync::Mutex::new(NarrowSink {
+        w: std::io::BufWriter::new(file),
+        last_sync: std::time::Instant::now(),
+    }));
+    if !resume {
+        let mut s = sink.lock().unwrap();
+        s.line(&header.to_string());
+        s.sync();
+    }
+
+    // SIGINT/SIGTERM: settled units are already durable (per-line
+    // flush); sync the trace and exit — in-flight units are abandoned
+    // and re-run on resume. A second signal exits without the sync.
+    static STOP: AtomicBool = AtomicBool::new(false);
+    {
+        let sink = sink.clone();
+        let shown = path.display().to_string();
+        ctrlc::set_handler(move || {
+            if STOP.swap(true, Ordering::SeqCst) {
+                std::process::exit(130);
+            }
+            eprintln!(
+                "\nsignal — abandoning in-flight units (their trace lines were never written); \
+                 settled units are durable in {shown}. Rerun the same command to resume."
+            );
+            if let Ok(mut s) = sink.lock() {
+                s.sync();
+            }
+            std::process::exit(130);
+        })
+        .expect("install signal handler");
+    }
+
+    eprintln!(
+        "=== narrow-split === {spec_name} L={len} wrap {wrap_lo}..{wrap_hi} cycles={cycles} \
+         | champion_cap={champion_cap} memo_cap={memo_cap} | target {target} on {threads} threads"
+    );
+    eprintln!("trace -> {}", path.display());
+
+    let t0 = std::time::Instant::now();
+    eprintln!("phase 1: enumerating the frontier (deterministic; re-derived on every resume)...");
+    let su = match split_units(&spec, target) {
+        SplitPlan::Sequential => {
+            // Frontier never widened to target: one unit IS the whole
+            // search (an empty seed = the full seeded space).
+            eprintln!("phase 1: frontier never reached target — running as a single unit");
+            pio_superopt::narrow::engine::SplitUnits {
+                seeds: vec![vec![]],
+                phase1: Stats::default(),
+                frontier_cycle: 0,
+                pre_mirror: 0,
+            }
+        }
+        SplitPlan::Refuted(r) => {
+            eprintln!(
+                "phase 1: REFUTED on a trace prefix — the full space is empty \
+                 (items={} in {:.1}s)",
+                r.stats.items,
+                t0.elapsed().as_secs_f64()
+            );
+            narrow_split_finish(
+                &path, &sink, &header, &spec, spec_name.as_str(), len, wrap_lo, wrap_hi, threads,
+                champion_cap, Vec::new(), r.stats, false, t0,
+            );
+            return;
+        }
+        SplitPlan::Units(su) => su,
+    };
+    let n_units = su.seeds.len();
+    if let Some((&bad, _)) = settled.iter().find(|(&i, _)| i >= n_units) {
+        eprintln!(
+            "{}: trace has unit {bad} but the re-enumerated frontier has only {n_units} units \
+             — same header yet different frontier (engine drift?); refusing. Pass --fresh.",
+            path.display()
+        );
+        std::process::exit(1);
+    }
+    let todo: Vec<usize> = (0..n_units).filter(|i| !settled.contains_key(i)).collect();
+    eprintln!(
+        "phase 1: {n_units} units (frontier cycle {}, {} pre-mirror) in {:.1}s | {} settled in trace, {} to run",
+        su.frontier_cycle,
+        su.pre_mirror,
+        t0.elapsed().as_secs_f64(),
+        settled.len(),
+        todo.len()
+    );
+
+    // Running aggregate over everything settled (phase 1 + resumed +
+    // this run), for telemetry lines; the FINAL aggregate is re-merged
+    // in unit order below for determinism.
+    let mut agg0 = su.phase1.clone();
+    for r in settled.values() {
+        merge_stats(&mut agg0, &r.stats);
+    }
+    let agg = std::sync::Mutex::new(agg0);
+    let results: std::sync::Mutex<Vec<(usize, pio_superopt::narrow::engine::SearchResult)>> =
+        std::sync::Mutex::new(Vec::with_capacity(todo.len()));
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(settled.len());
+    let live = AtomicU64::new(0);
+    let t1 = std::time::Instant::now();
+    let start_settled = settled.len();
+    let spec_ref = &spec;
+    let seeds = &su.seeds;
+    let todo_ref = &todo;
+
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| {
+                // Config-only scratch: build once per worker, lend to
+                // every unit (see search_split).
+                let mut wq = WordQuotient::build(&spec_ref.cfg);
+                loop {
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&i) = todo_ref.get(k) else { break };
+                    let tu = std::time::Instant::now();
+                    let r = search_unit(spec_ref, &seeds[i], champion_cap, Some(&live), &mut wq);
+                    let line = serde_json::json!({
+                        "unit": i,
+                        "ms": tu.elapsed().as_millis() as u64,
+                        "items": r.stats.items,
+                        "refuted": r.stats.refuted,
+                        "champions_found": r.stats.champions_found,
+                        "memo_hits": r.stats.memo_hits,
+                        "memo_entries": r.stats.memo_entries,
+                        "cap_hit": r.champion_cap_hit,
+                        "champions": r.champions,
+                        "stats": r.stats,
+                    });
+                    // One whole line per settled unit, atomically; a
+                    // unit is either fully in the trace or absent.
+                    sink.lock().unwrap().line(&line.to_string());
+                    merge_stats(&mut agg.lock().unwrap(), &r.stats);
+                    results.lock().unwrap().push((i, r));
+                    done.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+        // Coordinator: stderr heartbeat (~10s) + trace telemetry (~60s).
+        let mut last_hb = std::time::Instant::now();
+        let mut last_tel = std::time::Instant::now();
+        while done.load(Ordering::Relaxed) < n_units {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let d = done.load(Ordering::Relaxed);
+            if last_hb.elapsed().as_secs() >= 10 {
+                let el = t1.elapsed().as_secs_f64();
+                let this_run = d - start_settled;
+                let rate = this_run as f64 / el; // units/s
+                let eta = if rate > 0.0 {
+                    let s = (n_units - d) as f64 / rate;
+                    if s > 5400.0 { format!("~{:.1}h", s / 3600.0) } else { format!("~{:.0}m", s / 60.0) }
+                } else {
+                    "?".into()
+                };
+                eprintln!(
+                    "narrow-split: {d}/{n_units} units settled, ~{} worker items (live) | {:.1} u/min, ETA {eta}, elapsed {:.0}s",
+                    live.load(Ordering::Relaxed),
+                    rate * 60.0,
+                    el
+                );
+                last_hb = std::time::Instant::now();
+            }
+            if last_tel.elapsed().as_secs() >= 60 {
+                let a = agg.lock().unwrap().clone();
+                let tel = serde_json::json!({ "telem": {
+                    "t_s": t1.elapsed().as_secs_f64(),
+                    "settled": d,
+                    "total": n_units,
+                    "live_items": live.load(Ordering::Relaxed),
+                    "items": a.items,
+                    "refuted": a.refuted,
+                    "champions_found": a.champions_found,
+                    "fork_kinds": a.fork_kinds,
+                    "memo_hits": a.memo_hits,
+                    "memo_core_matches": a.memo_core_matches,
+                    "memo_entries": a.memo_entries,
+                    "memo_purges": a.memo_purges,
+                }});
+                sink.lock().unwrap().line(&tel.to_string());
+                last_tel = std::time::Instant::now();
+            }
+        }
+    });
+
+    // Deterministic merge in unit-id order: resumed units from the
+    // trace + this run's results are indistinguishable from an
+    // uninterrupted run's per-unit results.
+    for (i, r) in results.into_inner().unwrap() {
+        settled.insert(
+            i,
+            NarrowUnitRec { champions: r.champions, stats: r.stats, cap_hit: r.champion_cap_hit },
+        );
+    }
+    assert_eq!(settled.len(), n_units, "settled unit count mismatch after merge");
+    let mut champions = Vec::new();
+    let mut stats = su.phase1;
+    let mut cap_hit = false;
+    for rec in settled.values() {
+        champions.extend(rec.champions.iter().copied());
+        merge_stats(&mut stats, &rec.stats);
+        cap_hit |= rec.cap_hit;
+    }
+    if champions.len() > champion_cap {
+        champions.truncate(champion_cap);
+        cap_hit = true;
+    }
+    narrow_split_finish(
+        &path, &sink, &header, &spec, spec_name.as_str(), len, wrap_lo, wrap_hi, threads,
+        champion_cap, champions, stats, cap_hit, t0,
+    );
+}
+
+/// Shared tail: append the `done` record, print the verdict in the
+/// test-path format (directly comparable to the #[ignore] runs), and
+/// write `<trace>.result.json`.
+#[allow(clippy::too_many_arguments)]
+fn narrow_split_finish(
+    path: &std::path::Path,
+    sink: &std::sync::Arc<std::sync::Mutex<NarrowSink>>,
+    header: &serde_json::Value,
+    spec: &pio_superopt::narrow::engine::EngineSpec,
+    spec_name: &str,
+    len: u8,
+    wrap_lo: u8,
+    wrap_hi: u8,
+    threads: usize,
+    champion_cap: usize,
+    champions: Vec<pio_superopt::narrow::engine::Champion>,
+    stats: pio_superopt::narrow::engine::Stats,
+    cap_hit: bool,
+    t0: std::time::Instant,
+) {
+    let secs = t0.elapsed().as_secs_f64();
+    let verdict = if stats.champions_found == 0 { "REFUTED" } else { "SATISFIABLE" };
+    let done_rec = serde_json::json!({ "done": {
+        "verdict": verdict,
+        "items": stats.items,
+        "forks": stats.forks,
+        "refuted": stats.refuted,
+        "champions_found": stats.champions_found,
+        "cap_hit": cap_hit,
+        "memo_hits": stats.memo_hits,
+        "secs": secs,
+        "champions": champions,
+    }});
+    {
+        let mut s = sink.lock().unwrap();
+        s.line(&done_rec.to_string());
+        s.sync();
+    }
+    eprintln!(
+        "narrow-split DONE {spec_name} L={len} wrap {wrap_lo}..{wrap_hi} split({threads}): \
+         items={} forks={} refuted={} memo_hit={} champions={} cap_hit={cap_hit} in {:.0}s -> {verdict}",
+        stats.items, stats.forks, stats.refuted, stats.memo_hits, stats.champions_found, secs
+    );
+    eprintln!("  benefit_hist: {}", stats.benefit_hist_compact());
+    for (i, ch) in champions.iter().take(5).enumerate() {
+        let w: Vec<String> =
+            ch.words()[..len as usize].iter().map(|w| format!("{w:#06x}")).collect();
+        eprintln!("  champion {i}: words {} binding_free={}", w.join(" "), ch.binding_free);
+    }
+    let result = serde_json::json!({
+        "run": header["narrow_split"],
+        "verdict": verdict,
+        "items": stats.items,
+        "champion_cap": champion_cap,
+        "cap_hit": cap_hit,
+        "champions": champions,
+        "champion_words": champions.iter()
+            .map(|c| c.words()[..spec.slots as usize].iter().map(|w| format!("{w:#06x}")).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+        "stats": stats,
+        "secs": secs,
+    });
+    let result_path = path.with_extension("result.json");
+    std::fs::write(&result_path, serde_json::to_string_pretty(&result).unwrap()).expect("write result");
+    eprintln!("result -> {}", result_path.display());
 }
 
 /// Inspect a trace's LAST snapshot: where the ladder is, and how good the best

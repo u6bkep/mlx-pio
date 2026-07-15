@@ -417,6 +417,96 @@ pub fn spec_classify(champ: &Program) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------
+// tx_a narrow-engine fixture (real-firmware pivot): the shipped tx_a
+// (rs485-eth dme_pio.rs) as an EngineSpec for the narrowing engine's
+// bracket searches. MIRRORS the fixture in tests/narrow_engine.rs
+// (`tx_a_spec` / `tx_a_words`) byte for byte — the runner binary's
+// `narrow-split` subcommand and the #[ignore] tests must search the
+// SAME spec or their verdicts aren't comparable. If you touch the
+// schedule here, touch the test copy too (the runner-vs-test
+// item-count cross-check is the drift alarm).
+
+/// NCfg for a searchable space: config fields from `Config`, wrap from
+/// arguments, code irrelevant (the engine owns it).
+fn narrow_cfg_for(config: Config, wrap_bottom: u8, wrap_top: u8) -> crate::narrow::NCfg {
+    let mut p = Program::empty(config);
+    p.wrap_bottom = wrap_bottom;
+    p.wrap_top = wrap_top;
+    crate::narrow::NCfg::from_program(&p, 0)
+}
+
+/// The shipped tx_a: IRQ→DI toggler with the jmp-PIN parity absorber,
+/// `.side_set 1 opt` on DI, wrap 0..1.
+pub fn tx_a_narrow_words(side: &SideCfg) -> [u16; 32] {
+    use crate::encode::encode_insn;
+    use crate::ir::{JmpCond, WaitSrc};
+    let insns = [
+        // low: wait 1 irq 0 side 1
+        Insn { op: Op::Wait { polarity: true, src: WaitSrc::Irq, index: 0 }, delay: 0, sideset: Some(1) },
+        // jmp PIN high(2)
+        Insn::plain(Op::Jmp { cond: JmpCond::Pin, target: 2 }),
+        // high: wait 1 irq 0 side 0
+        Insn { op: Op::Wait { polarity: true, src: WaitSrc::Irq, index: 0 }, delay: 0, sideset: Some(0) },
+        // jmp low(0)
+        Insn::plain(Op::Jmp { cond: JmpCond::Always, target: 0 }),
+    ];
+    let mut code = [encode_insn(&Insn::nop_for(side), side); 32];
+    for (i, ins) in insns.iter().enumerate() {
+        code[i] = encode_insn(ins, side);
+    }
+    code
+}
+
+/// tx_a's environment and observable: DI on pin 0 (side-set base 0,
+/// captured with OE), DE on pin 8 (external stimulus, jmp_pin), IRQ 0
+/// pulses from the "sequencer". The schedule covers: idempotent
+/// force-highs while DE is low (the parity absorber), toggling while DE
+/// is high across varied gaps, and a DE drop mid-stream. The returned
+/// spec has `expected` EMPTY — fill it with
+/// `run_spec(&spec, tx_a_narrow_words(&side))` at slots=4 wrap 0..1.
+pub fn tx_a_narrow_spec(cycles: u32) -> (crate::narrow::engine::EngineSpec, SideCfg) {
+    use crate::narrow::Stim;
+    let side = SideCfg { count: 2, en: true }; // .side_set 1 opt
+    let config = Config {
+        side,
+        pins: PinMap { sideset_base: 0, in_base: 16, ..PinMap::default() },
+        jmp_pin: 8,
+        ..Config::default()
+    };
+    let cfg = narrow_cfg_for(config, 0, 1);
+
+    // DE (pin 8): low, then high through the "frame", low again, high.
+    let mut stim_values = Vec::with_capacity(cycles as usize);
+    for c in 0..cycles {
+        let de_high = (60..300).contains(&c) || (340..cycles.saturating_sub(10)).contains(&c);
+        stim_values.push(if de_high { 1u32 << 8 } else { 0 });
+    }
+    // IRQ pulses: parity-absorber hits while DE low, then bit-ish
+    // cadence while high (varied gaps), one stray after the DE drop.
+    let mut irq_sets = Vec::new();
+    for c in [10u32, 25, 40, 70, 82, 90, 102, 118, 126, 140, 160, 168, 190, 210, 240, 265, 290, 310, 350, 365, 380, 400, 430] {
+        if c < cycles {
+            irq_sets.push((c, 1u8));
+        }
+    }
+
+    let spec = crate::narrow::engine::EngineSpec {
+        cfg,
+        slots: 4,
+        cycles,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0, 8],
+        stim: Stim { mask: 1 << 8, values: stim_values },
+        irq_sets,
+        expected: vec![],
+        seed: vec![],
+        memo_cap: 1 << 20,
+    };
+    (spec, side)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

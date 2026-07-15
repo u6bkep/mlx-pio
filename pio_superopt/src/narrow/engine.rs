@@ -104,7 +104,9 @@ pub struct EngineSpec {
 }
 
 /// A surviving candidate subspace: decided fields plus don't-cares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (serde: round-trips through the narrow-split runner's JSONL trace —
+/// unit-level resume re-reads settled units' champions verbatim.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Champion {
     pub decided: [u16; 32],
     pub value: [u16; 32],
@@ -121,7 +123,12 @@ impl Champion {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+/// (serde: round-trips through the narrow-split runner's JSONL trace;
+/// `default` keeps old traces readable if counters are added — but the
+/// runner refuses cross-revision resume anyway, so this is belt and
+/// braces for post-hoc analysis tooling only.)
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Stats {
     pub items: u64,
     pub forks: u64,
@@ -848,13 +855,13 @@ pub fn word_canon(w: u16, cfg: &NCfg) -> u16 {
 /// bits lands in the same full-word class — i.e. the partial words are
 /// behaviorally interchangeable wherever the search can still take
 /// them. Ids are exact (profile-interned), not hashes.
-struct WordQuotient {
+pub struct WordQuotient {
     canon: Vec<u16>,
     tables: FxMap<u16, FxMap<u16, u32>>,
 }
 
 impl WordQuotient {
-    fn build(cfg: &NCfg) -> WordQuotient {
+    pub fn build(cfg: &NCfg) -> WordQuotient {
         WordQuotient {
             canon: (0..=0xFFFFu16).map(|w| word_canon(w, cfg)).collect(),
             tables: FxMap::default(),
@@ -4562,7 +4569,9 @@ fn search_impl(
 
 /// Fold one worker's stats into the total: counters sum, the
 /// histogram sums elementwise, the max-tracker takes the max.
-fn merge_stats(into: &mut Stats, s: &Stats) {
+/// (pub: the narrow-split runner re-aggregates settled units from its
+/// trace on resume with the exact same fold.)
+pub fn merge_stats(into: &mut Stats, s: &Stats) {
     into.items += s.items;
     into.forks += s.forks;
     into.refuted += s.refuted;
@@ -4592,51 +4601,55 @@ fn merge_stats(into: &mut Stats, s: &Stats) {
     }
 }
 
-/// Parallel exhaustive search: same refutation verdicts as [`search`],
-/// wall-clock divided across `threads` workers.
-///
-/// Phase 1 runs the sequential engine on a TRUNCATED spec (a prefix of
-/// the expected trace); its champions-with-don't-cares are exactly the
-/// surviving frontier subspaces — the work units. The truncation cycle
-/// doubles until the unit count comfortably exceeds the thread count
-/// (the playground's measured straggler lesson: a too-shallow split
-/// collapses parallelism onto a few heavy groups for hours). Phase 2
-/// workers pull units off a shared counter and run the ordinary SEEDED
-/// search over the full spec — re-deriving the cheap shared prefix
-/// inside the unit, with a per-unit memo — so the result is
-/// deterministic regardless of scheduling.
-///
-/// Champion-list semantics vs [`search`]: the covered set of
-/// trace-reproducing programs is identical, but the REPRESENTATION may
-/// differ — binding-free units that name registers are expanded into
-/// explicit identity + register-mirror units (a seeded worker cannot
-/// carry the unbound twin), and P3's fresh-fork delay canonicalization
-/// does not see across the seed boundary, so workers may emit delay
-/// spellings the sequential walk canonicalized away. Zero-champion
-/// (impossibility) verdicts are exactly equivalent — that is this
-/// driver's job.
-pub fn search_split(spec: &EngineSpec, champion_cap: usize, threads: usize) -> SearchResult {
-    let threads = threads.max(1);
-    // 128x threads, not 16x: a shallow frontier makes units that are
-    // individually near-unconstrained, and on hard brackets EVERY unit
-    // is then hours deep (L=3 0..2 sat at 0/1520 settled for 16min+ at
-    // 25 busy cores). More, deeper-truncated units cost phase-1 a few
-    // extra cheap passes and bound both the head and the straggler
-    // tail; the 4M-cap fallback still guards the frontier explosion.
-    let target = (threads * 128).max(512);
+/// Phase-1 product of the split driver: an early verdict, or the
+/// deterministic work-unit list for phase 2. Public so the runner
+/// binary (`superopt narrow-split`) can dispatch the SAME units itself
+/// with per-unit trace lines and unit-level resume; [`search_split`]
+/// is the in-process driver over the same parts.
+pub enum SplitPlan {
+    /// The frontier never widened to `target` before the truncation
+    /// cycle reached the spec's full length — the sequential search is
+    /// the cheapest correct answer (no payload; the caller runs
+    /// [`search`] itself).
+    Sequential,
+    /// A truncated prefix already refuted the space: the full space is
+    /// empty. The payload carries the phase-1 walk's stats.
+    Refuted(SearchResult),
+    /// Work units for phase 2.
+    Units(SplitUnits),
+}
 
-    // Phase 1: widen the frontier until it feeds every thread. The
-    // frontier can leap orders of magnitude between adjacent cycles
-    // (one fetch fans every operand field), so grow the truncation
-    // cycle gently and keep the last under-target frontier as a
-    // fallback if a pass overflows the unit cap.
+pub struct SplitUnits {
+    /// Per-unit seed sets in deterministic enumeration order — the
+    /// unit id IS the index (stable across runs of the same spec +
+    /// target on the same engine revision; the narrow-split runner's
+    /// resume keys on it). Binding-free register-naming units are
+    /// already expanded into explicit identity + mirror twins.
+    pub seeds: Vec<Vec<(u8, u16, u16)>>,
+    /// Frontier walk stats (LAST widening pass only), with
+    /// `champions_found` zeroed — its champions were work units, not
+    /// solutions. Merge into the final aggregate exactly once.
+    pub phase1: Stats,
+    /// The truncation cycle the frontier was taken at.
+    pub frontier_cycle: u32,
+    /// Unit count before mirror expansion.
+    pub pre_mirror: usize,
+}
+
+/// Phase 1 of [`search_split`]: widen a truncated-spec frontier until
+/// it holds at least `target` units (or resolve the search outright).
+/// Deterministic — same spec + target ⇒ same plan, bit for bit.
+pub fn split_units(spec: &EngineSpec, target: usize) -> SplitPlan {
+    // Widen the frontier until it feeds every thread. The frontier can
+    // leap orders of magnitude between adjacent cycles (one fetch fans
+    // every operand field), so grow the truncation cycle gently and
+    // keep the last under-target frontier as a fallback if a pass
+    // overflows the unit cap.
     let mut c = 1u32;
     let mut prev: Option<(Vec<Champion>, Stats)> = None;
     let (units, phase1) = loop {
         if c >= spec.cycles {
-            // Never got wide enough — the sequential search IS the
-            // cheapest correct answer.
-            return search_impl(spec, champion_cap, true, None, None);
+            return SplitPlan::Sequential;
         }
         let mut spec_t = spec.clone();
         spec_t.cycles = c;
@@ -4650,7 +4663,11 @@ pub fn search_split(spec: &EngineSpec, champion_cap: usize, threads: usize) -> S
         }
         if r.champions.is_empty() {
             // Refuted on the prefix: the full space is empty.
-            return SearchResult { champions: Vec::new(), stats: r.stats, champion_cap_hit: false };
+            return SplitPlan::Refuted(SearchResult {
+                champions: Vec::new(),
+                stats: r.stats,
+                champion_cap_hit: false,
+            });
         }
         if r.champions.len() >= target {
             break (r.champions, r.stats);
@@ -4689,10 +4706,76 @@ pub fn search_split(spec: &EngineSpec, champion_cap: usize, threads: usize) -> S
         }
         seeds.push(id);
     }
+    SplitPlan::Units(SplitUnits { seeds, phase1, frontier_cycle: c, pre_mirror: units.len() })
+}
+
+/// Run ONE split work unit (a phase-1 seed set) over the full spec:
+/// the ordinary seeded search, uninstrumented (no per-worker stderr or
+/// env-gated dump channels — the coordinator owns reporting), with the
+/// caller's config-shared [`WordQuotient`] scratch and an optional
+/// live item counter (bumped in 2^20 chunks). The unit's verdict is
+/// scheduling-independent; both [`search_split`] and the runner's
+/// narrow-split subcommand dispatch through this.
+pub fn search_unit(
+    spec: &EngineSpec,
+    seed: &[(u8, u16, u16)],
+    champion_cap: usize,
+    progress: Option<&std::sync::atomic::AtomicU64>,
+    wq: &mut WordQuotient,
+) -> SearchResult {
+    let mut spec_w = spec.clone();
+    spec_w.seed = seed.to_vec();
+    search_impl(&spec_w, champion_cap, false, progress, Some(wq))
+}
+
+/// Parallel exhaustive search: same refutation verdicts as [`search`],
+/// wall-clock divided across `threads` workers.
+///
+/// Phase 1 runs the sequential engine on a TRUNCATED spec (a prefix of
+/// the expected trace); its champions-with-don't-cares are exactly the
+/// surviving frontier subspaces — the work units. The truncation cycle
+/// doubles until the unit count comfortably exceeds the thread count
+/// (the playground's measured straggler lesson: a too-shallow split
+/// collapses parallelism onto a few heavy groups for hours). Phase 2
+/// workers pull units off a shared counter and run the ordinary SEEDED
+/// search over the full spec — re-deriving the cheap shared prefix
+/// inside the unit, with a per-unit memo — so the result is
+/// deterministic regardless of scheduling.
+///
+/// Champion-list semantics vs [`search`]: the covered set of
+/// trace-reproducing programs is identical, but the REPRESENTATION may
+/// differ — binding-free units that name registers are expanded into
+/// explicit identity + register-mirror units (a seeded worker cannot
+/// carry the unbound twin), and P3's fresh-fork delay canonicalization
+/// does not see across the seed boundary, so workers may emit delay
+/// spellings the sequential walk canonicalized away. Zero-champion
+/// (impossibility) verdicts are exactly equivalent — that is this
+/// driver's job.
+pub fn search_split(spec: &EngineSpec, champion_cap: usize, threads: usize) -> SearchResult {
+    let threads = threads.max(1);
+    // 128x threads, not 16x: a shallow frontier makes units that are
+    // individually near-unconstrained, and on hard brackets EVERY unit
+    // is then hours deep (L=3 0..2 sat at 0/1520 settled for 16min+ at
+    // 25 busy cores). More, deeper-truncated units cost phase-1 a few
+    // extra cheap passes and bound both the head and the straggler
+    // tail; the 4M-cap fallback still guards the frontier explosion.
+    let target = (threads * 128).max(512);
+
+    let su = match split_units(spec, target) {
+        SplitPlan::Sequential => {
+            // Never got wide enough — the sequential search IS the
+            // cheapest correct answer.
+            return search_impl(spec, champion_cap, true, None, None);
+        }
+        SplitPlan::Refuted(r) => return r,
+        SplitPlan::Units(su) => su,
+    };
+    let seeds = &su.seeds;
     eprintln!(
-        "narrow-split: {} units (frontier cycle {c}, {} pre-mirror) on {threads} threads",
+        "narrow-split: {} units (frontier cycle {}, {} pre-mirror) on {threads} threads",
         seeds.len(),
-        units.len()
+        su.frontier_cycle,
+        su.pre_mirror
     );
 
     // Phase 2: dynamic pull off a shared counter; per-unit results are
@@ -4713,9 +4796,7 @@ pub fn search_split(spec: &EngineSpec, champion_cap: usize, threads: usize) -> S
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(seed) = seeds.get(i) else { break };
-                    let mut spec_w = spec.clone();
-                    spec_w.seed = seed.clone();
-                    let r = search_impl(&spec_w, champion_cap, false, Some(&live), Some(&mut wq));
+                    let r = search_unit(spec, seed, champion_cap, Some(&live), &mut wq);
                     results.lock().unwrap().push((i, r));
                     done.fetch_add(1, Ordering::Relaxed);
                 }
@@ -4743,7 +4824,7 @@ pub fn search_split(spec: &EngineSpec, champion_cap: usize, threads: usize) -> S
     let mut rs = results.into_inner().unwrap();
     rs.sort_unstable_by_key(|&(i, _)| i);
     let mut champions = Vec::new();
-    let mut stats = phase1;
+    let mut stats = su.phase1;
     let mut cap_hit = false;
     for (_, r) in &rs {
         champions.extend(r.champions.iter().copied());
