@@ -135,6 +135,22 @@ Genome → score → search, end to end, fast and deterministic:
   dump before each purge and at search end).
 - **Discuss one-way doors** (correctness redefinitions, oracle changes)
   before implementing.
+- **Runtree convention for resumable long runs** (2026-07-15): the
+  `narrow-split` resume gate compares the trace header's `git_rev` +
+  `dirty` against `git rev-parse HEAD` / `git status -uno` **at
+  resume time, in the resuming process's cwd** — so any commit or
+  dirty tracked file in the launch tree silently breaks resume.
+  Standing fix: launch AND resume long runs from the dedicated
+  worktree `../pio_optimization.runtree`. Per launch: `git -C
+  ../pio_optimization.runtree checkout <rev>`, place the launch
+  binary at its `pio_superopt/target/release/superopt`, launch with
+  an absolute `--trace` path. Move the pointer only between runs;
+  never commit or rebuild in the runtree while a run it anchors is
+  live or unresumed. (Validated 2026-07-15 by resuming a copy of the
+  completed w12 trace from the runtree: header accepted, 1.38M
+  settled units recognized, byte-identical DONE totals in 1s.)
+  Engine-side fix candidate stays open: pin a build-time rev instead
+  of runtime HEAD (mining doc §5).
 
 ## Roadmap shape (after the spec oracle lands)
 

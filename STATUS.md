@@ -12,13 +12,14 @@ L=4 rediscovery ladder unlocks.**
 
 ## RUN LIVE: 0..2 monster (unit `pio-l3-monsters`, detached, resumable)
 
-Started ~12:20 after 1..2 finished; ~49% settled at 17:26, ETA
-~22:30–23:00. Log `/data/pio_optimization/runs/l3_monsters.log` (check
-mtime); trace `narrow-split-l3-w02.jsonl`. **RESUME CAVEAT: the header
-pins runtime HEAD (024bb2a) + dirty flag — this session's doc commits
-break a naive resume. If resume is needed:**
-`git stash && git checkout 024bb2a`, rerun the exact command (handoff
-doc §1), then return to master. Do NOT rebuild the binary.
+Started ~12:20 after 1..2 finished; ~51% settled at 17:40, ETA
+~22:45. Log `/data/pio_optimization/runs/l3_monsters.log` (check
+mtime); trace `narrow-split-l3-w02.jsonl`. **If resume is needed, run
+it from the RUNTREE** (`../pio_optimization.runtree`, pinned at launch
+rev 024bb2a, launch binary preserved at its
+`pio_superopt/target/release/superopt`): cd there, rerun the exact
+command (handoff doc §1). Validated live against a copy of the w12
+trace. Master is free to advance.
 
 ## w12 trace mined (docs/analysis/narrow-split-w12-unit-mining.md)
 
@@ -56,3 +57,9 @@ Big searches serialized + gated (systemd-run --user, MemoryMax=48G,
 MemorySwapMax=0). Magnitude gates = idle-box WALL-CLOCK + items.
 `systemctl --user` unreliable from monitor shells — use log mtime.
 Runner resume: same command, same rev, same params.
+**Runtree convention (2026-07-15): long runs LAUNCH FROM and RESUME
+FROM `../pio_optimization.runtree`** — before each launch, `git -C
+../pio_optimization.runtree checkout <launch rev>` and build (or copy)
+the binary there; the run's resume identity (runtime HEAD + dirty) is
+then pinned to the runtree, and master/main tree stay free. Never
+commit/build in the runtree mid-run. Details: docs/architecture.md.
