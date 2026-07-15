@@ -421,12 +421,21 @@ fn p3_delay_normal_form() {
     );
 }
 
-/// Ticket 007 gate: consulted-STATE generalization. Slot 0 is seeded to
-/// `set x, <data free>` (32 x-values); slot 1 is searched against an
-/// impossible period-3 duty trace. Slot-1 subtrees that never read X
-/// record state patterns without the X component, so the 31 later
-/// x-children hit records the first child wrote — sharing a monolithic
-/// state key can never exhibit (x differs at every fork state).
+/// Ticket 007 gate: consulted-STATE generalization. The prologue
+/// diversifies X over 32 concrete values — slot 0 `set x, <data
+/// free>` writes an x-TAG (011 stage b), slot 1 `mov isr, x` is a
+/// value read that COLLAPSES it into 32 children (x = isr = imm) —
+/// and slot 2 alone loops (wrap 2..2) against an impossible period-3
+/// duty trace. Slot-2 subtrees that never read X/ISR record state
+/// patterns without those components, so the 31 later imm-children
+/// hit records the first child wrote — sharing a monolithic state key
+/// can never exhibit (x and isr differ at every fork state).
+///
+/// (Re-rigged for 011 stage (b): the original L=2 rig relied on the
+/// eager 32-way SetData fetch fork, which no longer exists — the
+/// collapse at the seeded reader recreates the diversity explicitly.
+/// The widening/battery gates in narrow_soundness.rs own the
+/// laziness behavior itself.)
 #[test]
 fn consulted_state_shares_across_unread_register() {
     let config = Config {
@@ -443,8 +452,8 @@ fn consulted_state_shares_across_unread_register() {
     let expected =
         (0..18u32).map(|c| if c % 3 < 2 { 1 | 1 << 16 } else { 1 << 16 }).collect();
     let mut spec = EngineSpec {
-        cfg: cfg_for(config, 0, 1),
-        slots: 2,
+        cfg: cfg_for(config, 2, 2),
+        slots: 3,
         cycles: 18,
         inputs: vec![],
         output_pins: vec![0],
@@ -452,7 +461,8 @@ fn consulted_state_shares_across_unread_register() {
         stim: Stim::default(),
         irq_sets: vec![],
         expected,
-        seed: vec![(0, 0xFFE0, 0xE020)], // set x, <data undecided>
+        // set x, <data undecided> / mov isr, x (the collapse reader)
+        seed: vec![(0, 0xFFE0, 0xE020), (1, 0xFFFF, 0xA0C1)],
         memo_cap: 0,
     };
     let off = search(&spec, 10);

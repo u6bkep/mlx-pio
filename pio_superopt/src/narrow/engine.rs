@@ -189,6 +189,13 @@ pub struct Stats {
     /// of champion-free, recordable subtrees at finalize, BEFORE the
     /// benefit gate) — where the memo's value actually lives.
     pub benefit_hist: [u64; 32],
+    /// 011 stage (b) collapse-site counters: tags created (completed
+    /// SET X/Y with undecided data), collapse FORKS paid (a value
+    /// read forked the defining field), and singleton rewrites (the
+    /// field was already decided by an alias's collapse).
+    pub tags_created: u64,
+    pub tag_collapses: u64,
+    pub tag_rewrites: u64,
 }
 
 impl Stats {
@@ -209,6 +216,38 @@ pub struct SearchResult {
     pub stats: Stats,
     /// True if the champion list was truncated at the cap.
     pub champion_cap_hit: bool,
+}
+
+/// x/y provenance TAGS (ticket 011 stage b): `Some((slot, fmask))`
+/// means the register's TRUE value is the (still undecided) field's
+/// future value and the `NState` slot holds a placeholder (the 0 the
+/// zero-filled code word wrote). Created by a completed `SET X/Y`
+/// whose 5-bit data is undecided — the fetch no longer forks it —
+/// and propagated by op-none register MOVs (pure tag copies). Any
+/// read that needs the VALUE collapses the tag: the defining field is
+/// forked THEN (deferred demand), one child per legal value, register
+/// rewritten, field decided. Die-on-transform: MOV `!`/`::` and every
+/// non-copy consumer collapse first (no Fn1 in this build — 012
+/// stage 4 owns transforms). INVARIANT: a placeholder is never
+/// consulted — `tag_value_needs` is the audited read table, and every
+/// state projection (`project_state`) encodes a live tag structurally
+/// instead of projecting the placeholder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+struct RegTags {
+    x: Option<(u8, u16)>,
+    y: Option<(u8, u16)>,
+}
+
+impl RegTags {
+    #[inline]
+    fn any(&self) -> bool {
+        self.x.is_some() || self.y.is_some()
+    }
+    /// SC bits of the tagged registers (pre-filter skip test).
+    #[inline]
+    fn sc_bits(&self) -> u16 {
+        (if self.x.is_some() { SC_X } else { 0 }) | (if self.y.is_some() { SC_Y } else { 0 })
+    }
 }
 
 /// A work item: partial assignment + evaluator checkpoint. Copy — a
@@ -242,6 +281,8 @@ struct Item {
     /// DFS-monotone id for first-outcome-per-fork counting.
     dd: u32,
     dd_id: u32,
+    /// x/y provenance tags (011 stage b) — see [`RegTags`].
+    tags: RegTags,
 }
 
 /// A forkable bit-field of one slot: contiguous `mask`, candidate raw
@@ -647,7 +688,19 @@ fn demand(decided: u16, value: u16, cfg: &NCfg) -> Option<Field> {
         4 => &[(0x00E0, FieldKind::PushPullBits)], // low 5 bits dead
         5 => &[(0x00E0, FieldKind::MovDst), (0x0018, FieldKind::MovOp), (0x0007, FieldKind::MovSrc)],
         6 => &[(0x0060, FieldKind::IrqBits), (0x001F, FieldKind::IrqIdx)], // bit7 dead
-        _ => &[(0x00E0, FieldKind::SetDst), (0x001F, FieldKind::SetData)],
+        // SET: the 5-bit data is NOT consulted at execution for a
+        // register destination — it flows into the register's TAG
+        // (011 stage b) and is forked only when something reads the
+        // value (the collapse fork in the cycle loop). Pin/pindir
+        // (and reserved) destinations stay eager: the latch write is
+        // capture-visible this cycle.
+        _ => {
+            if decided & 0x00E0 == 0x00E0 && matches!((value >> 5) & 0x7, 1 | 2) {
+                &[(0x00E0, FieldKind::SetDst)]
+            } else {
+                &[(0x00E0, FieldKind::SetDst), (0x001F, FieldKind::SetData)]
+            }
+        }
     };
     for &(mask, kind) in operand_fields {
         if let Some(f) = need(mask, kind) {
@@ -1135,8 +1188,10 @@ fn peek_tick(st: &NState, cfg: &NCfg) -> bool {
 
 /// Full fork-point identity, kept per frame for record projection and
 /// the hit dump. `next_input` covers the streamed-input driver position
-/// (preloaded inputs live in the FIFO already).
-type MemoKey = (u32, u32, NState);
+/// (preloaded inputs live in the FIFO already). The tag block rides
+/// along (011 stage b): record-side projection must encode a tagged
+/// register structurally, never its placeholder.
+type MemoKey = (u32, u32, NState, RegTags);
 
 // --- Consulted-state components (ticket 007) -------------------------
 // The memo key splits into an always-read CORE (hashed) and PATTERN
@@ -1185,35 +1240,51 @@ fn key_core(cycle: u32, next_input: u32, st: &NState) -> KeyCore {
     }
 }
 
+/// Structural encoding of a possibly-tagged register value for state
+/// patterns (011 stage b): a concrete u32 maps to itself; a live tag
+/// maps to a marker word carrying the tag IDENTITY (slot + fmask).
+/// Pattern equality is then structural tag equality — same tag
+/// matches (sound: the record's claim quantifies over the field, see
+/// ticket 011 §3), differing tags miss, concrete-vs-tag miss. The
+/// placeholder u32 is NEVER projected.
+#[inline]
+fn proj_reg(v: u32, tag: Option<(u8, u16)>) -> u64 {
+    match tag {
+        Some((s, m)) => (1u64 << 63) | ((s as u64) << 16) | m as u64,
+        None => v as u64,
+    }
+}
+
 /// Append the values of `mask`'s components in canonical order. FIFOs
 /// are read-normalized (level + queued words in pop order), so
 /// observably-equal FIFOs with different buffer layouts compare equal.
-fn project_state(st: &NState, mask: u16, out: &mut Vec<u32>) {
+/// X/Y encode through `proj_reg` (tag-aware).
+fn project_state(st: &NState, tags: RegTags, mask: u16, out: &mut Vec<u64>) {
     if mask & SC_X != 0 {
-        out.push(st.x);
+        out.push(proj_reg(st.x, tags.x));
     }
     if mask & SC_Y != 0 {
-        out.push(st.y);
+        out.push(proj_reg(st.y, tags.y));
     }
     if mask & SC_ISR != 0 {
-        out.push(st.isr);
+        out.push(st.isr as u64);
     }
     if mask & SC_OSR != 0 {
-        out.push(st.osr);
+        out.push(st.osr as u64);
     }
     if mask & SC_ISR_CNT != 0 {
-        out.push(st.isr_count as u32);
+        out.push(st.isr_count as u64);
     }
     if mask & SC_OSR_CNT != 0 {
-        out.push(st.osr_count as u32);
+        out.push(st.osr_count as u64);
     }
     if mask & SC_IRQ != 0 {
-        out.push(st.irq_flags as u32);
+        out.push(st.irq_flags as u64);
     }
     if mask & SC_TX != 0 {
-        out.push(st.tx.level() as u32);
+        out.push(st.tx.level() as u64);
         for i in 0..st.tx.level() {
-            out.push(st.tx.peek(i));
+            out.push(st.tx.peek(i) as u64);
         }
     }
     // RX projects its LEVEL only: no ISA path reads RX contents (there
@@ -1223,7 +1294,7 @@ fn project_state(st: &NState, mask: u16, out: &mut Vec<u32>) {
     // 2026-07-12: full-contents RX was the single largest state-miss
     // component, 44% of near-miss diffs.)
     if mask & SC_RX != 0 {
-        out.push(st.rx.level() as u32);
+        out.push(st.rx.level() as u64);
     }
 }
 
@@ -1265,7 +1336,13 @@ fn word_state_reads(w: u16, cfg: &NCfg) -> u16 {
             // (008 stage 4).
             src | SC_ISR | if cfg.autopush { SC_ISR_CNT | SC_RX } else { 0 }
         }
-        3 => SC_OSR | SC_OSR_CNT | if cfg.autopull { SC_TX } else { 0 },
+        // OUT always reads the OSR data. The shift counter is a real
+        // READ (threshold compare) only with autopull on; without it
+        // the old count feeds nothing but the new count — that
+        // dependency rides the OSR `CntProv` twin and is consulted
+        // only if the counter is actually read later (011 stage a,
+        // mirroring IN's autopush conditioning above).
+        3 => SC_OSR | if cfg.autopull { SC_OSR_CNT | SC_TX } else { 0 },
         4 => {
             let if_flag = if (w >> 6) & 1 != 0 { u16::MAX } else { 0 };
             if (w >> 7) & 1 != 0 {
@@ -1317,17 +1394,20 @@ enum Prov {
 
 const CNT_PROV_CAP: usize = 4;
 
-/// Segment-local provenance of the ISR shift counter (008 stage 4) —
-/// its value is usually PROGRAM-determined: a completed PUSH or
-/// MOV→ISR resets it, OUT→ISR sets it to the OUT's BitCount, and IN
-/// saturating-adds its BitCount (probe census 2026-07-12: isr_count-
-/// only diffs were 35% of state misses). Like X/Y `Prov`, tracked from
-/// pop within one fork-free segment: a READ of the counter consults
-/// exactly the tracked sources — the SC_ISR_CNT state pattern iff the
-/// pop-time value still feeds it, plus the decided BitCount fields
-/// accumulated since — instead of unconditionally adding the state
-/// component. Unlike X/Y, an accumulation chain (several INs) needs a
-/// field SET, not one field.
+/// Segment-local provenance of a shift counter (008 stage 4 built it
+/// for the ISR counter; 011 stage (a) instantiates a twin for the OSR
+/// counter) — its value is usually PROGRAM-determined. ISR: a
+/// completed PUSH or MOV→ISR resets it, OUT→ISR sets it to the OUT's
+/// BitCount, IN saturating-adds its BitCount (probe census
+/// 2026-07-12: isr_count-only diffs were 35% of state misses). OSR:
+/// a completed PULL or MOV→OSR resets it, OUT saturating-adds its
+/// BitCount. Like X/Y `Prov`, tracked from pop within one fork-free
+/// segment: a READ of the counter consults exactly the tracked
+/// sources — the counter's SC_* state pattern iff the pop-time value
+/// still feeds it, plus the decided BitCount fields accumulated since
+/// — instead of unconditionally adding the state component. Unlike
+/// X/Y, an accumulation chain (several INs/OUTs) needs a field SET,
+/// not one field. The instance's SC bit is passed at `consume`.
 #[derive(Clone, Copy)]
 struct CntProv {
     /// The pop-time counter still feeds the current value: no reset,
@@ -1354,10 +1434,11 @@ impl CntProv {
     }
 
     /// A read of the counter: consult the tracked sources into the
-    /// segment, after which the value is accounted.
-    fn consume(&mut self, seg_reads: &mut u16, seg_mask: &mut [u16; 32]) {
+    /// segment, after which the value is accounted. `bit` is this
+    /// instance's state component (SC_ISR_CNT or SC_OSR_CNT).
+    fn consume(&mut self, bit: u16, seg_reads: &mut u16, seg_mask: &mut [u16; 32]) {
         if self.base_pop {
-            *seg_reads |= SC_ISR_CNT;
+            *seg_reads |= bit;
         }
         self.flush(seg_mask);
         self.base_pop = false;
@@ -1428,19 +1509,58 @@ fn word_cnt_writes(w: u16) -> CntEffect {
     }
 }
 
+/// How a COMPLETED execution writes the OSR shift counter (011 stage
+/// a, the `word_cnt_writes` twin): OUT saturating-adds its BitCount
+/// regardless of destination (a possible autopull zeroing first is a
+/// function of the threshold compare, which consulted the counter);
+/// PULL resets it to 0 on every completing path (pop, or the empty
+/// nonblocking X read — an IFEMPTY guard-skip leaves the counter, but
+/// the guard's read consulted it first, so both arms end fully
+/// accounted; a blocked PULL stalls and never completes); MOV→OSR
+/// resets it to 0. There is no OSR analog of OUT→ISR's `Set`.
+fn word_osr_cnt_writes(w: u16) -> CntEffect {
+    match (w >> 13) & 0x7 {
+        3 => CntEffect::Accum,
+        4 if (w >> 7) & 1 == 1 => CntEffect::Reset,
+        5 if (w >> 5) & 0x7 == 7 => CntEffect::Reset,
+        _ => CntEffect::None,
+    }
+}
+
 /// Consume a word's state reads into the segment, routing X/Y through
-/// their provenance and the ISR shift counter through `CntProv`.
+/// their provenance and the two shift counters through their
+/// `CntProv` instances.
+///
+/// A TAGGED register (011 stage b) routes to the bare SC_X/SC_Y
+/// pattern bit instead of `Prov`: the projection encodes the tag
+/// IDENTITY structurally, so the resulting pattern component IS a
+/// condition on the defining field ("this register carries field
+/// (s, m)'s future value") — the CntProv routing idea expressed on
+/// the pattern side. Tag identity is load-bearing for the reads that
+/// reach here while tagged (op-none MOV copies, PULL's
+/// over-approximated X/Y listing): two probers whose tags name
+/// DIFFERENT defining fields decide different program slots at the
+/// eventual collapse, so their futures are not interchangeable —
+/// structural tag equality is exactly the right condition. Value
+/// reads never reach here tagged (they collapse first).
+#[allow(clippy::too_many_arguments)]
 fn consume_reads(
     r: u16,
     x_prov: Prov,
     y_prov: Prov,
+    tags: RegTags,
     cnt_prov: &mut CntProv,
+    osr_cnt_prov: &mut CntProv,
     seg_reads: &mut u16,
     seg_mask: &mut [u16; 32],
 ) {
-    *seg_reads |= r & !(SC_X | SC_Y | SC_ISR_CNT);
-    for (bit, prov) in [(SC_X, x_prov), (SC_Y, y_prov)] {
+    *seg_reads |= r & !(SC_X | SC_Y | SC_ISR_CNT | SC_OSR_CNT);
+    for (bit, prov, tag) in [(SC_X, x_prov, tags.x), (SC_Y, y_prov, tags.y)] {
         if r & bit != 0 {
+            if tag.is_some() {
+                *seg_reads |= bit;
+                continue;
+            }
             match prov {
                 Prov::Fork => *seg_reads |= bit,
                 Prov::Field(s, m) => seg_mask[s as usize] |= m,
@@ -1449,7 +1569,10 @@ fn consume_reads(
         }
     }
     if r & SC_ISR_CNT != 0 {
-        cnt_prov.consume(seg_reads, seg_mask);
+        cnt_prov.consume(SC_ISR_CNT, seg_reads, seg_mask);
+    }
+    if r & SC_OSR_CNT != 0 {
+        osr_cnt_prov.consume(SC_OSR_CNT, seg_reads, seg_mask);
     }
 }
 
@@ -1468,13 +1591,20 @@ fn consume_reads(
 /// imm-consults-only-when-read win within a segment while making every
 /// cross-segment dependency explicit. Over-consulting (the register may
 /// never be read again) only adds record conditions, never unsoundness.
-fn flush_prov(x_prov: Prov, y_prov: Prov, cnt_prov: &mut CntProv, seg_mask: &mut [u16; 32]) {
+fn flush_prov(
+    x_prov: Prov,
+    y_prov: Prov,
+    cnt_prov: &mut CntProv,
+    osr_cnt_prov: &mut CntProv,
+    seg_mask: &mut [u16; 32],
+) {
     for p in [x_prov, y_prov] {
         if let Prov::Field(s, m) = p {
             seg_mask[s as usize] |= m;
         }
     }
     cnt_prov.flush(seg_mask);
+    osr_cnt_prov.flush(seg_mask);
 }
 
 /// Which scratch registers a COMPLETED execution of this word definitely
@@ -1490,6 +1620,107 @@ fn word_reg_writes(w: u16) -> (bool, bool, bool) {
         7 => (f == 1, f == 2, true),
         _ => (false, false, false),
     }
+}
+
+/// 011 stage (b): does EXECUTING this (fetch-decided or pending) word
+/// need the concrete VALUE of x / y this cycle? Audited line-by-line
+/// against `exec_op` (the 012 §1 read taxonomy). Pure tag copies —
+/// op-none MOV between registers — are NOT value needs (the tag
+/// moves); everything else `word_state_reads` lists as an X/Y read
+/// either needs the value (collapse) or provably does not read it
+/// this cycle (a PULL with data queued, PUSH's over-approximation).
+/// PULL's empty nonblocking read of physical X is binding-relevant:
+/// it collapses BOTH registers so the binding predicate `x != y` is
+/// evaluated on true values (ticket 011 §4).
+fn tag_value_needs(w: u16, st: &NState, cfg: &NCfg) -> (bool, bool) {
+    match (w >> 13) & 0x7 {
+        0 => match (w >> 5) & 0x7 {
+            1 | 2 => (true, false), // !x / x-- (the decrement writes v-1)
+            3 | 4 => (false, true),
+            5 => (true, true), // x != y
+            _ => (false, false),
+        },
+        2 => match (w >> 5) & 0x7 {
+            1 => (true, false), // IN shifts the low bc bits of the source
+            2 => (false, true),
+            _ => (false, false),
+        },
+        4 => {
+            if is_pull_empty_read(w, st, cfg) {
+                (true, true)
+            } else {
+                (false, false)
+            }
+        }
+        5 => {
+            let (dst, op, src) = ((w >> 5) & 0x7, (w >> 3) & 0x3, w & 0x7);
+            let copy = op == 0 && matches!(dst, 1 | 2);
+            match src {
+                1 if !copy => (true, false),
+                2 if !copy => (false, true),
+                _ => (false, false),
+            }
+        }
+        _ => (false, false), // WAIT/OUT/IRQ/SET read no scratch register value
+    }
+}
+
+/// 011 stage (b): tag transitions of a COMPLETED execution (mirrors
+/// `word_reg_writes` timing — stalled executions skip their writes).
+/// A fetched `SET X/Y` with undecided data CREATES a tag; an op-none
+/// register-to-register MOV COPIES the source's tag (possibly None —
+/// a concrete copy); every other definite write of x/y clears the
+/// tag (the written value is concrete: OUT data, MOV from a concrete
+/// source or after a die-on-transform collapse, decided SET data,
+/// pending words' data immediates). Returns whether a tag was
+/// created (stats).
+fn apply_tag_effect(tags: &mut RegTags, w: u16, pending: bool, decided: u16, pc: u8) -> bool {
+    match (w >> 13) & 0x7 {
+        3 => match (w >> 5) & 0x7 {
+            1 => tags.x = None,
+            2 => tags.y = None,
+            _ => {}
+        },
+        5 => {
+            let (dst, op, src) = ((w >> 5) & 0x7, (w >> 3) & 0x3, w & 0x7);
+            if matches!(dst, 1 | 2) {
+                let t = if op == 0 {
+                    match src {
+                        1 => tags.x,
+                        2 => tags.y,
+                        _ => None,
+                    }
+                } else {
+                    None // die-on-transform: src collapsed pre-exec
+                };
+                if dst == 1 {
+                    tags.x = t;
+                } else {
+                    tags.y = t;
+                }
+            }
+        }
+        7 => {
+            let dst = (w >> 5) & 0x7;
+            if matches!(dst, 1 | 2) {
+                let t = if !pending && decided & 0x001F != 0x001F {
+                    Some((pc, 0x001Fu16))
+                } else {
+                    None
+                };
+                if dst == 1 {
+                    tags.x = t;
+                } else {
+                    tags.y = t;
+                }
+                return t.is_some();
+            }
+        }
+        // JMP X--/Y-- writes v-1, but only after a value read that
+        // collapsed the tag — the register is already concrete here.
+        _ => {}
+    }
+    false
 }
 
 /// Pattern components a pending stall re-check reads each cycle.
@@ -1691,7 +1922,7 @@ impl RecList {
 /// not a scan of every record ever stored.
 #[derive(Default)]
 struct MemoEntry {
-    sets: Vec<(u16, FxMap<Vec<u32>, RecList>)>,
+    sets: Vec<(u16, FxMap<Vec<u64>, RecList>)>,
 }
 
 /// One frame of the fork tree, mirroring the DFS stack (LIFO makes each
@@ -1875,7 +2106,7 @@ fn close_child(
                 // The record's state pattern: fork-time values of the
                 // components the subtree read.
                 let mut vals = Vec::new();
-                project_state(&f.key.2, f.state_reads, &mut vals);
+                project_state(&f.key.2, f.key.3, f.state_reads, &mut vals);
                 let entry = memo.entry(key_core(f.key.0, f.key.1, &f.key.2)).or_default();
                 let table = match entry.sets.iter_mut().position(|(m, _)| *m == f.state_reads) {
                     Some(i) => &mut entry.sets[i].1,
@@ -2020,7 +2251,7 @@ const PROBE_HIT: usize = 3;
 /// values differ between two same-mask projections. TX is
 /// variable-length (level + words), so the cursors advance per-side;
 /// RX projects its level only.
-fn component_diff(mask: u16, a: &[u32], b: &[u32]) -> u16 {
+fn component_diff(mask: u16, a: &[u64], b: &[u64]) -> u16 {
     let mut diff = 0u16;
     let (mut i, mut j) = (0usize, 0usize);
     for bit in [SC_X, SC_Y, SC_ISR, SC_OSR, SC_ISR_CNT, SC_OSR_CNT, SC_IRQ] {
@@ -2130,7 +2361,7 @@ impl ProbeLog {
         it_decided: &[u16; 32],
         it_value: &[u16; 32],
         slots: u8,
-        proj: &mut Vec<u32>,
+        proj: &mut Vec<u64>,
     ) {
         use std::io::Write;
         let st = &key.2;
@@ -2141,7 +2372,7 @@ impl ProbeLog {
                 continue;
             }
             proj.clear();
-            project_state(st, mask, proj);
+            project_state(st, key.3, mask, proj);
             match table.get(proj.as_slice()) {
                 None => {
                     // Nearest record: min differing-component count over
@@ -2279,7 +2510,7 @@ fn find_single_conflict(
     delay_mask: u16,
     wide: bool,
     mirror_blocked: bool,
-    proj: &mut Vec<u32>,
+    proj: &mut Vec<u64>,
     patch_skip: &mut u64,
 ) -> Option<(usize, u16, u16)> {
     for &(mask, ref table) in &entry.sets {
@@ -2287,7 +2518,7 @@ fn find_single_conflict(
             continue;
         }
         proj.clear();
-        project_state(&it.st, mask, proj);
+        project_state(&it.st, it.tags, mask, proj);
         if let Some(list) = table.get(proj.as_slice()) {
             'recs: for i in 0..list.recs.len() {
                 if list.recs[i].bound && it.unbound {
@@ -2472,8 +2703,13 @@ impl FamilyProbe {
         core: &KeyCore,
         delay_mask: u16,
         mirror_blocked: bool,
-        proj: &mut Vec<u32>,
+        proj: &mut Vec<u64>,
     ) {
+        // 011 stage (b): a tagged prober's races would walk the
+        // placeholder — measurement only, skip for census validity.
+        if it.tags.any() {
+            return;
+        }
         self.misses += 1;
         let Some((slot, cmask, cval)) = find_single_conflict(
             spec, entry, it, delay_mask, true, mirror_blocked, proj, &mut self.patch_skip,
@@ -2699,12 +2935,16 @@ fn fam_walk_rec(
             }
         }
         if w.unbound && peek_tick(&st, cfg) {
+            // NOTE (011 stage b): this measurement walk does not track
+            // x/y tags — a family walk crossing a tag-creating SET
+            // races the placeholder. Measurement only, never engine-
+            // visible; callers skip tagged probers.
             let demands_binding = if !will_execute(&st, cfg, gpio_in) {
                 false
             } else if let Some(pw) = st.pending_exec {
                 word_touches_regs(pw)
             } else {
-                st.x != st.y && is_pull_empty_read(cfg.code[fetch_pc & 31], &st, cfg)
+                is_pull_empty_read(cfg.code[fetch_pc & 31], &st, cfg) && st.x != st.y
             };
             if demands_binding {
                 w.cause = "binding";
@@ -2843,9 +3083,10 @@ impl PairRace {
         it: &Item,
         delay_mask: u16,
         mirror_blocked: bool,
-        proj: &mut Vec<u32>,
+        proj: &mut Vec<u64>,
     ) {
-        if delay_mask == 0 {
+        if delay_mask == 0 || it.tags.any() {
+            // Tagged probers (011 stage b) would race the placeholder.
             return;
         }
         let Some((slot, cmask, cval)) = find_single_conflict(
@@ -3359,6 +3600,7 @@ fn junk_walk(
     mut x_prov: Prov,
     mut y_prov: Prov,
     mut cnt_prov: CntProv,
+    mut osr_cnt_prov: CntProv,
     wcyc: &mut u64,
     // Dead-demand census out-param: set when the walk's executing
     // words read the start item's armed tag registers. Only meaningful
@@ -3413,6 +3655,23 @@ fn junk_walk(
             if demand(it.decided[fetch_pc], it.value[fetch_pc], cfg).is_some() {
                 return false; // fetch-demand fork edge
             }
+        }
+        // 011 stage (b): the walk cannot collapse a tag — a word that
+        // needs a tagged register's VALUE this cycle is a fork edge
+        // (the main loop's collapse fork owns it). Checked BEFORE the
+        // jmp_taken peek below, which reads x/y; covers fetched,
+        // stalled-re-executing, and pending words. Tag-value-free
+        // windows (copies, writes, unrelated ops) walk straight
+        // through — strictly stronger than the pre-(b) walk, which
+        // bailed at the SET's own fetch demand.
+        if it.tags.any() && it.st.delay_count == 0 && peek_tick(&it.st, cfg) {
+            let xw = it.st.pending_exec.unwrap_or(it.value[fetch_pc & 31]);
+            let (nx, ny) = tag_value_needs(xw, &it.st, cfg);
+            if (nx && it.tags.x.is_some()) || (ny && it.tags.y.is_some()) {
+                return false; // tag-value read: fork edge
+            }
+        }
+        if fetching {
             if memo_on {
                 w_mask[fetch_pc] |=
                     fetch_footprint(it.decided[fetch_pc], it.value[fetch_pc], cfg)
@@ -3436,7 +3695,7 @@ fn junk_walk(
             }
             if memo_on {
                 let r = word_state_reads(exec_word, cfg);
-                consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut w_reads, &mut w_mask);
+                consume_reads(r, x_prov, y_prov, it.tags, &mut cnt_prov, &mut osr_cnt_prov, &mut w_reads, &mut w_mask);
             }
             // Dead-demand census (walk starts at a completion, so a
             // present tag is always armed here).
@@ -3447,12 +3706,15 @@ fn junk_walk(
             }
         }
         if it.unbound && peek_tick(&it.st, cfg) {
+            // Pull-empty first: with a live tag the value-need bail
+            // above already fired, so `x != y` never compares a
+            // placeholder (011 stage b).
             let demands_binding = if !will_execute(&it.st, cfg, gpio_in) {
                 false
             } else if let Some(w) = it.st.pending_exec {
                 word_touches_regs(w)
             } else {
-                it.st.x != it.st.y && is_pull_empty_read(it.value[fetch_pc & 31], &it.st, cfg)
+                is_pull_empty_read(it.value[fetch_pc & 31], &it.st, cfg) && it.st.x != it.st.y
             };
             if demands_binding {
                 return false; // binding fork edge
@@ -3473,9 +3735,21 @@ fn junk_walk(
         }
         it.cycle += 1;
         let completed = ticked && pre_delay == 0 && it.st.stall == Stall::None;
+        // 011 stage (b): mirror tag transitions exactly as the main
+        // loop does (unconditional — the walk's own bail decisions
+        // depend on them).
+        if completed {
+            apply_tag_effect(
+                &mut it.tags,
+                exec_word,
+                exec_pending,
+                it.decided[fetch_pc & 31],
+                fetch_pc as u8,
+            );
+        }
         if memo_on && completed {
             let (wx, wy, imm) = word_reg_writes(exec_word);
-            let p = if imm && !exec_pending {
+            let p = if imm && !exec_pending && it.decided[fetch_pc] & 0x001F == 0x001F {
                 Prov::Field(fetch_pc as u8, 0x001F)
             } else {
                 Prov::Accounted
@@ -3496,6 +3770,13 @@ fn junk_walk(
                 // core-known count (provenance unchanged).
                 CntEffect::Set | CntEffect::Reset => cnt_prov.reset(),
                 CntEffect::Accum | CntEffect::None => {}
+            }
+            match word_osr_cnt_writes(exec_word) {
+                CntEffect::Accum if !exec_pending => {
+                    osr_cnt_prov.accum_field(fetch_pc as u8, 0x001F, &mut w_mask)
+                }
+                CntEffect::Reset => osr_cnt_prov.reset(),
+                _ => {} // pending Accum folds in a core-known count
             }
         }
         // A completed UNDECIDED delay contributes no cond and counts a
@@ -3522,7 +3803,7 @@ fn junk_walk(
     if refuted && memo_on {
         // The walk is a segment tail ending here: flush its live field
         // provenance like every other segment end (review S1).
-        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut w_mask);
+        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut w_mask);
         *seg_reads |= w_reads;
         for s in 0..32 {
             seg_mask[s] |= w_mask[s];
@@ -3573,6 +3854,7 @@ fn search_impl(
         unbound: true,
         dd: 0,
         dd_id: 0,
+        tags: RegTags::default(),
     };
     for s in spec.slots as usize..32 {
         root.decided[s] = 0xFFFF;
@@ -3679,9 +3961,9 @@ fn search_impl(
     // every cap purge.
     let mut min_benefit: u32 = 4;
     // Scratch for probe-side state projection.
-    let mut proj: Vec<u32> = Vec::new();
+    let mut proj: Vec<u64> = Vec::new();
     let mut frames: Vec<Frame> = vec![Frame {
-        key: (0, 0, root.st),
+        key: (0, 0, root.st, root.tags),
         decided: [0u16; 32],
         children_left: 1,
         consulted_mask: [0u16; 32],
@@ -3712,7 +3994,7 @@ fn search_impl(
                 .collect();
             eprintln!("narrow-search: fork attribution: {}", named.join(" "));
             eprintln!(
-                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} walks={} wcyc={} cyc={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={}",
+                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} walks={} wcyc={} cyc={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={} tags={}/{}c/{}r",
                 stats.items,
                 stats.forks,
                 stats.refuted,
@@ -3730,7 +4012,10 @@ fn search_impl(
                 stats.memo_recs_scanned as f64 / stats.memo_rec_scans.max(1) as f64,
                 stats.memo_max_recs,
                 stats.champions_found,
-                stack.len()
+                stack.len(),
+                stats.tags_created,
+                stats.tag_collapses,
+                stats.tag_rewrites
             );
             if let Some(d) = dd.as_ref() {
                 d.print("beat");
@@ -3763,7 +4048,17 @@ fn search_impl(
         // record read neither X nor Y (then it covers the twin too).
         if memo_on {
             let core = key_core(it.cycle, it.next_input, &it.st);
-            let mirror_blocked = it.unbound && it.st.x != it.st.y;
+            // Tagged registers (011 stage b) compare structurally:
+            // tag-identical x/y are provably equal (not blocked); a
+            // tag-vs-concrete or tag-vs-different-tag pair is treated
+            // as "may differ" (blocked) — blocking more only loses
+            // sharing, never soundness. The placeholder u32 is never
+            // compared.
+            let regs_eq = match (it.tags.x, it.tags.y) {
+                (None, None) => it.st.x == it.st.y,
+                (a, b) => a.is_some() && a == b,
+            };
+            let mirror_blocked = it.unbound && !regs_eq;
             let mut outcome = PROBE_NOCORE;
             let mut hit: Option<(Conds, u16)> = None;
             if let Some(entry) = memo.get(&core) {
@@ -3774,7 +4069,7 @@ fn search_impl(
                         continue;
                     }
                     proj.clear();
-                    project_state(&it.st, mask, &mut proj);
+                    project_state(&it.st, it.tags, mask, &mut proj);
                     if let Some(list) = table.get(&proj) {
                         outcome = PROBE_COND_MISS;
                         stats.memo_rec_scans += 1;
@@ -3829,7 +4124,7 @@ fn search_impl(
                     if let Some(entry) = memo.get(&core) {
                         pl.miss(
                             outcome,
-                            &(it.cycle, it.next_input, it.st),
+                            &(it.cycle, it.next_input, it.st, it.tags),
                             entry,
                             mirror_blocked,
                             &it.decided,
@@ -3868,7 +4163,7 @@ fn search_impl(
                     }
                 }
                 if let Some(d) = dump.as_mut() {
-                    d.hit(&(it.cycle, it.next_input, it.st), &conds, &it.decided, &it.value, spec.slots);
+                    d.hit(&(it.cycle, it.next_input, it.st, it.tags), &conds, &it.decided, &it.value, spec.slots);
                 }
                 let top = frames.last_mut().expect("root frame");
                 top.state_reads |= rmask;
@@ -3887,6 +4182,7 @@ fn search_impl(
         let mut x_prov = Prov::Fork;
         let mut y_prov = Prov::Fork;
         let mut cnt_prov = CntProv::fork();
+        let mut osr_cnt_prov = CntProv::fork();
 
         while it.cycle < spec.cycles {
             // Deterministic per-cycle environment (idempotent, so a fork
@@ -3928,7 +4224,7 @@ fn search_impl(
                     dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::DeadRefute);
                 }
                 if memo_on {
-                    flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+                    flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                     merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                     close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                 }
@@ -4052,7 +4348,14 @@ fn search_impl(
                         // untouched. `cfg.code` needs no restore: every
                         // path out of this fork loop abandons the item.
                         let child_value = it.value[fetch_pc] | v;
+                        // 011 stage (b): the lookahead consults the
+                        // candidate word's register sources — a word
+                        // reading a TAGGED register cannot be
+                        // pre-filtered on the placeholder; the pushed
+                        // child collapses the tag at execution
+                        // instead (skipping only loses pruning).
                         if writes_pin_latch(child_value)
+                            && word_state_reads(child_value, &cfg) & it.tags.sc_bits() == 0
                             && demand(it.decided[fetch_pc] | field.mask, child_value, &cfg)
                                 .is_none()
                         {
@@ -4066,7 +4369,7 @@ fn search_impl(
                             // conditions even for values never pushed.
                             if memo_on {
                                 let r = word_state_reads(child_value, &cfg);
-                                consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut seg_reads, &mut seg_mask);
+                                consume_reads(r, x_prov, y_prov, it.tags, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_reads, &mut seg_mask);
                             }
                             // Dead-demand census: the lookahead READS
                             // the candidate word's sources even when
@@ -4119,11 +4422,11 @@ fn search_impl(
                         dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::DeadRefute);
                     }
                     if memo_on {
-                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                         merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                         if pushed > 0 {
                             frames.push(Frame {
-                                key: (it.cycle, it.next_input, it.st),
+                                key: (it.cycle, it.next_input, it.st, it.tags),
                                 decided: it.decided,
                                 children_left: pushed,
                                 consulted_mask: [0u16; 32],
@@ -4141,6 +4444,107 @@ fn search_impl(
                     }
                     continue 'items;
                 }
+            }
+
+            // 011 stage (b) — TAG COLLAPSE. A cycle about to EXECUTE a
+            // word (fetched — fully fetch-decided past the demand fork
+            // above — or pending) that needs the VALUE of a tagged
+            // register forks the defining field HERE: the deferred
+            // demand the tag-creating write dodged, paid only on paths
+            // that actually read. One child per legal field value;
+            // every register aliasing THIS tag (MOV copies) rewrites
+            // together; the field becomes decided; children re-enter
+            // this cycle (env application is idempotent). Binding-
+            // relevant events (PULL empty read; a pending word touching
+            // registers on an unbound item) force BOTH registers
+            // concrete before the binding predicate is evaluated
+            // (ticket 011 §4). Runs BEFORE the deferred-target fork
+            // below and the binding fork — both peek x/y. Placeholder
+            // values are never consulted.
+            if it.tags.any() && it.st.delay_count == 0 && peek_tick(&it.st, &cfg) {
+                let exec_word = it.st.pending_exec.unwrap_or(it.value[fetch_pc & 31]);
+                let (mut nx, mut ny) = tag_value_needs(exec_word, &it.st, &cfg);
+                if it.unbound && it.st.pending_exec.is_some() && word_touches_regs(exec_word) {
+                    // The binding fork will compare x != y.
+                    nx = true;
+                    ny = true;
+                }
+                let need = if nx && it.tags.x.is_some() {
+                    it.tags.x
+                } else if ny && it.tags.y.is_some() {
+                    it.tags.y
+                } else {
+                    None
+                };
+                if let Some((s, m)) = need {
+                    let alias_x = it.tags.x == Some((s, m));
+                    let alias_y = it.tags.y == Some((s, m));
+                    let sh = m.trailing_zeros();
+                    if it.decided[s as usize] & m == m {
+                        // The field was already decided (an alias of
+                        // this tag collapsed earlier): deterministic
+                        // in-place rewrite, no fork. The register's
+                        // value IS the decided field — Field prov.
+                        let v = ((it.value[s as usize] & m) >> sh) as u32;
+                        if alias_x {
+                            it.st.x = v;
+                            it.tags.x = None;
+                            x_prov = Prov::Field(s, m);
+                        }
+                        if alias_y {
+                            it.st.y = v;
+                            it.tags.y = None;
+                            y_prov = Prov::Field(s, m);
+                        }
+                        stats.tag_rewrites += 1;
+                        // Fall through: the cycle continues concretely.
+                    } else {
+                        values.clear();
+                        Field { mask: m, kind: FieldKind::SetData }.values_into(&cfg, &mut values);
+                        for &v in &values {
+                            let mut child = it;
+                            child.decided[s as usize] |= m;
+                            child.value[s as usize] |= v;
+                            let raw = ((v & m) >> sh) as u32;
+                            if alias_x {
+                                child.st.x = raw;
+                                child.tags.x = None;
+                            }
+                            if alias_y {
+                                child.st.y = raw;
+                                child.tags.y = None;
+                            }
+                            stack.push(child);
+                            stats.forks += 1;
+                            stats.fork_kinds[kind_idx(FieldKind::SetData)] += 1;
+                        }
+                        stats.tag_collapses += 1;
+                        if memo_on {
+                            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
+                            merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
+                            frames.push(Frame {
+                                // Key snapshot keeps the PRE-collapse
+                                // tags: records at this frame pattern
+                                // the tag identity, generalizing over
+                                // every field value (011 §3).
+                                key: (it.cycle, it.next_input, it.st, it.tags),
+                                decided: it.decided,
+                                children_left: values.len() as u32,
+                                consulted_mask: [0u16; 32],
+                                consulted_value: [0u16; 32],
+                                any_champion: false,
+                                recordable: true,
+                                bound_seen: !it.unbound,
+                                state_reads: 0,
+                                items_at_open: stats.items,
+                            });
+                        }
+                        continue 'items;
+                    }
+                }
+            }
+
+            if fetching {
                 // 008 deferred target demand: a JMP consults its target
                 // only on a TAKEN execution (exec_op writes pc from it
                 // iff `take`). Fork the target here, at consult time —
@@ -4195,11 +4599,11 @@ fn search_impl(
                             dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::DeadRefute);
                         }
                         if memo_on {
-                            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+                            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                             if pushed > 0 {
                                 frames.push(Frame {
-                                    key: (it.cycle, it.next_input, it.st),
+                                    key: (it.cycle, it.next_input, it.st, it.tags),
                                     decided: it.decided,
                                     children_left: pushed,
                                     consulted_mask: [0u16; 32],
@@ -4231,7 +4635,7 @@ fn search_impl(
             let exec_pending = it.st.pending_exec.is_some();
             if memo_on && it.st.delay_count == 0 && peek_tick(&it.st, &cfg) {
                 let r = word_state_reads(exec_word, &cfg);
-                consume_reads(r, x_prov, y_prov, &mut cnt_prov, &mut seg_reads, &mut seg_mask);
+                consume_reads(r, x_prov, y_prov, it.tags, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_reads, &mut seg_mask);
             }
             // Dead-demand census: this cycle's executing word reads an
             // ARMED tag's register — the fork is live. Pending tags
@@ -4267,15 +4671,24 @@ fn search_impl(
             // re-enter this cycle (the environment re-application is
             // idempotent) bound, and step straight through.
             if it.unbound && peek_tick(&it.st, &cfg) {
+                // 011 stage (b): the collapse block above forced any
+                // tagged x/y concrete before every binding-relevant
+                // event, so the predicates below never compare a
+                // placeholder. (`is_pull_empty_read` is evaluated
+                // FIRST so `x != y` only runs on the collapsed path.)
                 let demands_binding = if !will_execute(&it.st, &cfg, gpio_in) {
                     false
                 } else if let Some(w) = it.st.pending_exec {
                     word_touches_regs(w)
                 } else {
-                    it.st.x != it.st.y
-                        && is_pull_empty_read(cfg.code[it.st.pc as usize], &it.st, &cfg)
+                    is_pull_empty_read(cfg.code[it.st.pc as usize], &it.st, &cfg)
+                        && it.st.x != it.st.y
                 };
                 if demands_binding {
+                    debug_assert!(
+                        !it.tags.any(),
+                        "binding event reached with a live tag — collapse rule broken"
+                    );
                     it.unbound = false;
                     let mut twin = it;
                     // The twin is distinct unless state AND words are
@@ -4308,10 +4721,10 @@ fn search_impl(
                         pushed = 2;
                     }
                     if memo_on {
-                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                         merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                         frames.push(Frame {
-                            key: (it.cycle, it.next_input, it.st),
+                            key: (it.cycle, it.next_input, it.st, it.tags),
                             decided: it.decided,
                             children_left: pushed,
                             consulted_mask: [0u16; 32],
@@ -4364,7 +4777,7 @@ fn search_impl(
                     dd_note(&mut dd, it.dd, it.dd_id, DdOutcome::DeadRefute);
                 }
                 if memo_on {
-                    flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+                    flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                     merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                     close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                 }
@@ -4376,14 +4789,31 @@ fn search_impl(
             // not left stalled)? Only then is delay consulted, and only
             // then does the P3 nop-run state advance.
             let completed = ticked && pre_delay == 0 && it.st.stall == Stall::None;
+            // 011 stage (b): tag transitions ride every completion
+            // (search semantics, NOT memo accounting — unconditional).
+            // A fetched SET X/Y with undecided data creates a tag;
+            // op-none register MOVs copy; other definite writes clear.
+            if completed {
+                if apply_tag_effect(
+                    &mut it.tags,
+                    exec_word,
+                    exec_pending,
+                    it.decided[fetch_pc & 31],
+                    fetch_pc as u8,
+                ) {
+                    stats.tags_created += 1;
+                }
+            }
             // A completed execution's register writes update the
             // segment provenance (stalled executions skip their writes,
             // so this must be post-step and completion-gated). Exec'd
             // words come from data — their immediates are core-covered,
-            // hence Accounted.
+            // hence Accounted. A SET whose data is UNDECIDED wrote a
+            // TAG, not a value — its prov is moot (reads route through
+            // the tag) and must not flush a spurious field consult.
             if memo_on && completed {
                 let (wx, wy, imm) = word_reg_writes(exec_word);
-                let p = if imm && !exec_pending {
+                let p = if imm && !exec_pending && it.decided[fetch_pc] & 0x001F == 0x001F {
                     Prov::Field(fetch_pc as u8, 0x001F)
                 } else {
                     Prov::Accounted
@@ -4405,6 +4835,13 @@ fn search_impl(
                     // unchanged).
                     CntEffect::Set | CntEffect::Reset => cnt_prov.reset(),
                     CntEffect::Accum | CntEffect::None => {}
+                }
+                match word_osr_cnt_writes(exec_word) {
+                    CntEffect::Accum if !exec_pending => {
+                        osr_cnt_prov.accum_field(fetch_pc as u8, 0x001F, &mut seg_mask)
+                    }
+                    CntEffect::Reset => osr_cnt_prov.reset(),
+                    _ => {} // pending Accum folds in a core-known count
                 }
             }
             // A FETCHED canonical nop (P3 only applies without side-set,
@@ -4431,7 +4868,7 @@ fn search_impl(
                     let mut dd_walk_read = false;
                     if junk_walk(
                         spec, &cfg, &irq_at, &it, delay_mask, memo_on,
-                        &mut seg_mask, &mut seg_reads, x_prov, y_prov, cnt_prov,
+                        &mut seg_mask, &mut seg_reads, x_prov, y_prov, cnt_prov, osr_cnt_prov,
                         &mut stats.walk_cycles, &mut dd_walk_read,
                     ) {
                         stats.refuted += 1;
@@ -4446,7 +4883,7 @@ fn search_impl(
                             dd_note(&mut dd, it.dd, it.dd_id, out);
                         }
                         if memo_on {
-                            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+                            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                             close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                         }
@@ -4484,10 +4921,10 @@ fn search_impl(
                         pushed = max as u32 + 1;
                     }
                     if memo_on {
-                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+                        flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
                         merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
                         frames.push(Frame {
-                            key: (it.cycle, it.next_input, it.st),
+                            key: (it.cycle, it.next_input, it.st, it.tags),
                             decided: it.decided,
                             children_left: pushed,
                             consulted_mask: [0u16; 32],
@@ -4530,7 +4967,7 @@ fn search_impl(
             champion_cap_hit = true;
         }
         if memo_on {
-            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut seg_mask);
+            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
             merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
             close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, true, spec.slots);
         }
@@ -4599,6 +5036,9 @@ pub fn merge_stats(into: &mut Stats, s: &Stats) {
     for i in 0..32 {
         into.benefit_hist[i] += s.benefit_hist[i];
     }
+    into.tags_created += s.tags_created;
+    into.tag_collapses += s.tag_collapses;
+    into.tag_rewrites += s.tag_rewrites;
 }
 
 /// Phase-1 product of the split driver: an early verdict, or the
@@ -4978,13 +5418,14 @@ pub fn run_spec_state(spec: &EngineSpec, code: [u16; 32]) -> (Vec<u32>, bool, NS
 #[cfg(test)]
 mod item_size {
     /// Item is Copy and forked by struct copy; ticket 011 measured 252
-    /// bytes pre-census. The dead-demand tag (dd + dd_id, 8 bytes)
-    /// must not push it past the budget — a fork is still a small
-    /// stack copy.
+    /// bytes pre-census. The dead-demand tag (dd + dd_id, 8 bytes) and
+    /// the 011 stage-(b) x/y tag block (RegTags, 12 bytes) must keep a
+    /// fork a small stack copy (ticket budget: Item ≈ 300-330 with the
+    /// FULL tag design; this build carries only the x/y slice).
     #[test]
     fn stays_within_budget() {
         let sz = std::mem::size_of::<super::Item>();
-        eprintln!("Item = {sz} bytes (252 pre-census + 8 tag)");
-        assert!(sz <= 264, "Item grew past budget: {sz}");
+        eprintln!("Item = {sz} bytes (252 pre-census + 8 dd + 12 tags)");
+        assert!(sz <= 280, "Item grew past budget: {sz}");
     }
 }
