@@ -26,11 +26,14 @@ repaired memo — 0..0 560.2M items/94s (was 5.33B/26min pre-stage-2:
 9.5x items, 17x wall from the day's compounded levers), 0..1
 781.9M/57s, 1..1 704.8M/38s. CAVEAT LIFTED for the proven brackets.**
 
-**OVERNIGHT RUN (2026-07-13→14): unit pio-overnight, detached, 10h
-cap, runs/overnight_monsters.log — all five rest brackets in order
-(0..1, 1..1, then MONSTERS 2..2, 1..2, 0..2) on the repaired engine.
-If all refute: footprint <=3 impossible, L=4 ladder unlocks. Check
-this log first next session.**
+**OVERNIGHT RESULT (2026-07-14 am): 2..2 REFUTED — 132.0B items,
+3.92B memo hits, 0 champions, 10,520s (2h55m; matches the 27%@50min
+extrapolation). 0..1/1..1 re-certified en route (781.9M/29s,
+704.8M/25s). FOUR of six L=3 brackets now proven. 1..2 died at the
+10h cap at 60.5% settled (1,015,146/1,679,192 units, ~235.3B worker
+items, ~7h — vs 6% settled at the pre-repair kill); not resumable
+(test path, not runner). 0..2 never started. NO more long runs for
+now (user) — remaining monsters wait for S2 relaxation + 008-B.**
 
 ## Superposition (ticket 011) — v1 scope NEEDS RE-CUT after census
 
@@ -66,11 +69,13 @@ MERGED (912cb77: ISR_CNT CntProv provenance — bracket-neutral,
 −26% memo entries, first instance of the superposition tag pattern);
 009 gap check + data-driven serializer battery entries in flight.
 
-## L=3 ladder: 3 of 6 REFUTED; monsters await superposition
+## L=3 ladder: 4 of 6 REFUTED; 1..2 and 0..2 remain
 
-0..0 (5.33B/26min), 0..1 (782.9M/29s), 1..1 (716.5M/26s, post-stage-4
-counts) proven. Monsters 2..2/1..2/0..2: 2..2 = 27% settled at the
-50-min gate on the stage-2 engine (~3h full).
+0..0 (560.2M/94s repaired-memo re-cert), 0..1 (781.9M/29s), 1..1
+(704.8M/25s), 2..2 (132.0B/2h55m) proven. 1..2 ~60% settled at the
+overnight 10h cap; 0..2 untouched. Strategy (user, 2026-07-14): no
+long runs; land S2 relaxation + 008-B first, rerun monsters on the
+faster engine.
 
 ## Ticket 008: stages 1,2,4 landed; walk chapter closed (3b/3d
 reverted, post-mortems in ticket; 3b has USER-DIRECTED re-evaluation

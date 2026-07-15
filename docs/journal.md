@@ -4,6 +4,26 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-14 — overnight monsters: 2..2 REFUTED; 1..2 dies at 10h cap at 60.5%
+
+Unit pio-overnight (10h RuntimeMaxSec, 48G-gated, detached) ran the
+five rest brackets on the repaired-memo engine
+(runs/overnight_monsters.log). Results: 0..1 781.9M items/29s and
+1..1 704.8M/25s re-certified; **2..2 REFUTED — 132,001,704,296 items,
+110.3B refuted, 3.92B memo hits, 0 champions, 10,520s (2h55m)**,
+matching the 27%-settled@50min extrapolation. Four of six L=3
+brackets now proven. 1..2 was killed by the cap at 1,015,146/1,679,192
+units settled (60.5%, ~235.3B worker items, ~7h) — vs 6% settled when
+the pre-repair engine was killed at 52B items; the settle rate was
+decaying into the deep-unit tail (~350 units/10s heartbeat at the
+end), so a finish needs well over the naive ~5h extrapolation. Not
+resumable (#[ignore] test path). 0..2 never started. User ruling:
+NO more long runs for now; push S2 relaxation review, 008-B
+outcome-predicate reads, and the lemma/proof-engine track in
+parallel (worktree wave 2 launched), then revisit the monsters.
+Also removed a stray diff3 base marker left in this file by a wave-1
+merge.
+
 ## 2026-07-13 — memo purge-loop plateau fixed (perf finding 1/3)
 
 External perf review flagged the cap-hit purge in `close_child`: one
@@ -26,7 +46,6 @@ exactly where a single pass had left the table at ~94% of cap. This
 workload's benefit spread masks the worst case; the fix is hardening
 (bounded table + no rescan-per-insertion plateau) at zero cost.
 
-||||||| df81c3a
 ## 2026-07-13 — dead-demand census (ticket 011 first measurement): shift plumbing is LIVE, MOV copies are the dead mass
 
 Env-gated instrument (`PIO_NARROW_DEAD_DEMAND=1`, agent worktree): at
