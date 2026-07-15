@@ -61,7 +61,7 @@ fn main() {
         su.pre_mirror
     );
     for (i, seed) in su.seeds.iter().enumerate() {
-        let line = serde_json::json!({ "unit": i, "seed": seed });
+        let line = serde_json::json!({ "unit": i, "seed": seed.0, "constraints": seed.1 });
         writeln!(w, "{line}").unwrap();
     }
 }

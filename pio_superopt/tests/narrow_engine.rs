@@ -43,14 +43,44 @@ fn mirror_program(words: &[u16; 32], slots: u8) -> [u16; 32] {
 /// A binding-free champion additionally claims its register-mirror
 /// reproduces the trace; check that claim too.
 fn assert_champions_sound(spec: &EngineSpec, champions: &[pio_superopt::narrow::engine::Champion]) {
+    let mut rng = 0xD1B54A32D192ED03u64;
     for (i, ch) in champions.iter().enumerate() {
-        let (trace, oob) = run_spec_oob(spec, ch.words());
-        assert!(!oob, "champion {i} executes out of footprint (UB on hardware)");
-        assert_eq!(
-            trace,
-            spec.expected,
-            "champion {i} does not reproduce the spec trace"
-        );
+        // E1: `words()` materializes constrained fields at their
+        // MINIMUM allowed member; additionally check the maximum and
+        // a seeded-random member per set (ticket 012 §4).
+        let mut fills: Vec<[u16; 32]> = vec![ch.words()];
+        if !ch.constraints.is_empty() {
+            let mut maxes = ch.words();
+            let mut rnd = ch.words();
+            for &(s, m, a) in ch.constraints.as_slice() {
+                let (s, sh) = (s as usize, m.trailing_zeros());
+                maxes[s] = (maxes[s] & !m) | (((31 - a.leading_zeros()) as u16) << sh);
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let k = ((rng >> 32) as u32) % a.count_ones();
+                let (mut member, mut seen) = (0u16, 0u32);
+                for r in 0..32u16 {
+                    if a >> r & 1 != 0 {
+                        if seen == k {
+                            member = r;
+                            break;
+                        }
+                        seen += 1;
+                    }
+                }
+                rnd[s] = (rnd[s] & !m) | (member << sh);
+            }
+            fills.push(maxes);
+            fills.push(rnd);
+        }
+        for (k, w) in fills.iter().enumerate() {
+            let (trace, oob) = run_spec_oob(spec, *w);
+            assert!(!oob, "champion {i} materialization {k} executes out of footprint (UB on hardware)");
+            assert_eq!(
+                trace,
+                spec.expected,
+                "champion {i} materialization {k} does not reproduce the spec trace"
+            );
+        }
         if ch.binding_free {
             assert_eq!(
                 run_spec(spec, mirror_program(&ch.words(), spec.slots)),
@@ -61,9 +91,10 @@ fn assert_champions_sound(spec: &EngineSpec, champions: &[pio_superopt::narrow::
     }
 }
 
-/// Does some champion subspace cover this concrete program?
+/// Does some champion subspace cover this concrete program? (E1:
+/// `admits` checks decided bits AND value-set constraints.)
 fn covered(champions: &[pio_superopt::narrow::engine::Champion], words: &[u16; 32]) -> bool {
-    champions.iter().any(|ch| (0..32).all(|s| words[s] & ch.decided[s] == ch.value[s]))
+    champions.iter().any(|ch| ch.admits(words))
 }
 
 /// Is this word inside the engine's enumerated space? The exclusions
@@ -124,9 +155,7 @@ fn census_l1(spec: &EngineSpec, side: &SideCfg, champions: &[pio_superopt::narro
             return true;
         }
         c[0] = mirror_word(w);
-        champions
-            .iter()
-            .any(|ch| ch.binding_free && (0..32).all(|s| c[s] & ch.decided[s] == ch.value[s]))
+        champions.iter().any(|ch| ch.binding_free && ch.admits(&c))
     };
     let mut n_match = 0u32;
     for w in 0..=0xFFFFu16 {
@@ -179,6 +208,7 @@ fn square_wave_l2_rediscovered() {
         irq_sets: vec![],
         expected: vec![],
         seed: vec![],
+        seed_constraints: vec![],
         memo_cap: 1 << 20,
     };
     spec.expected = run_spec(&spec, reference);
@@ -238,6 +268,7 @@ fn period3_l1_impossible() {
         irq_sets: vec![],
         expected,
         seed: vec![],
+        seed_constraints: vec![],
         memo_cap: 1 << 20,
     };
     let result = search(&spec, 10);
@@ -280,6 +311,7 @@ fn mov_toggle_l1_census_exact() {
         irq_sets: vec![],
         expected: vec![],
         seed: vec![],
+        seed_constraints: vec![],
         memo_cap: 1 << 20,
     };
     spec.expected = run_spec(&spec, reference);
@@ -334,6 +366,7 @@ fn nop_l1_census_exact() {
         irq_sets: vec![],
         expected: vec![],
         seed: vec![],
+        seed_constraints: vec![],
         memo_cap: 1 << 20,
     };
     spec.expected = run_spec(&spec, reference);
@@ -392,6 +425,7 @@ fn p3_delay_normal_form() {
         // Both slots pinned to the MOV family to keep the space small;
         // delays remain fully searchable, which is what P3 quotients.
         seed: vec![(0, 0xE000, 0xA000), (1, 0xE000, 0xA000)],
+        seed_constraints: vec![],
         memo_cap: 1 << 20,
     };
     let reference = words_of(&[], &SideCfg::NONE);
@@ -463,6 +497,7 @@ fn consulted_state_shares_across_unread_register() {
         expected,
         // set x, <data undecided> / mov isr, x (the collapse reader)
         seed: vec![(0, 0xFFE0, 0xE020), (1, 0xFFFF, 0xA0C1)],
+        seed_constraints: vec![],
         memo_cap: 0,
     };
     let off = search(&spec, 10);
@@ -518,6 +553,7 @@ fn memo_on_off_equivalence() {
             irq_sets: vec![],
             expected: vec![],
             seed: vec![],
+            seed_constraints: vec![],
             memo_cap: 0,
         };
         let reference = words_of(
@@ -556,6 +592,7 @@ fn memo_on_off_equivalence() {
             irq_sets: vec![],
             expected,
             seed: vec![],
+            seed_constraints: vec![],
             memo_cap: 0,
         });
     }
@@ -576,6 +613,7 @@ fn memo_on_off_equivalence() {
             irq_sets: vec![],
             expected: vec![],
             seed: vec![(0, 0xFFFF, 0xE043), (1, 0xFFFF, 0x8080)],
+            seed_constraints: vec![],
             memo_cap: 0,
         };
         let mut w = words_of(&[], &SideCfg::NONE);
@@ -655,6 +693,7 @@ fn memo_set_immediate_conditions_survive_fork_boundary() {
             (2, 0xE0FF, 0xA023), // mov x, null; <delay undecided>
             (3, 0xFFFF, 0xA001), // mov pins, x
         ],
+        seed_constraints: vec![],
         memo_cap: 0,
     };
     // Witness: imm=2, target=3, delay=0. Pass 1 (pin low) falls
@@ -724,6 +763,7 @@ fn pull_empty_binding_fork() {
             irq_sets: vec![],
             expected: vec![],
             seed: vec![(0, 0xFFFF, SET_Y_3), (1, 0xFFFF, PULL_NOBLOCK)],
+            seed_constraints: vec![],
             memo_cap: 1 << 20,
         }
     };
@@ -792,6 +832,7 @@ fn s5_p2_seeded_mov_dst_not_pruned() {
             (2, 0xFFFF, 0xA002), // mov pins, y
             (3, 0xFFFF, 0x0003), // jmp 3 (park)
         ],
+        seed_constraints: vec![],
         memo_cap: 0,
     };
     let mut w = words_of(&[], &SideCfg::NONE);
@@ -843,6 +884,7 @@ fn s5_p4_seeded_jmp_fallthrough_not_pruned() {
             (0, 0xE0E0, 0x0000), // jmp always, <target undecided>, delay free
             (1, 0xFFFF, 0xE000), // set pins, 0
         ],
+        seed_constraints: vec![],
         memo_cap: 0,
     };
     let mut w = words_of(&[], &SideCfg::NONE);
@@ -897,6 +939,7 @@ fn s6_partial_field_seed_rejected() {
             (1, 0xFFFF, 0x8080), // pull noblock (TX empty -> reads X, x != y)
             (2, 0xE0F9, 0xA001), // mov pins, <src>; PARTIAL src mask: bit0 = 1
         ],
+        seed_constraints: vec![],
         memo_cap: 0,
     };
     let mut w = words_of(&[], &SideCfg::NONE);
@@ -1001,6 +1044,7 @@ fn tx_a_spec(cycles: u32) -> (EngineSpec, SideCfg) {
         irq_sets,
         expected: vec![],
         seed: vec![],
+        seed_constraints: vec![],
         memo_cap: 1 << 20,
     };
     (spec, side)
@@ -1192,6 +1236,7 @@ fn instrumentation_flags_do_not_change_search() {
         irq_sets: vec![],
         expected: vec![],
         seed: vec![],
+        seed_constraints: vec![],
         memo_cap: 64,
     };
     spec.expected = run_spec(&spec, reference);
@@ -1321,6 +1366,7 @@ fn split_agrees_with_sequential() {
         irq_sets: vec![],
         expected: vec![],
         seed: vec![],
+        seed_constraints: vec![],
         memo_cap: 1 << 20,
     };
     spec.expected = run_spec(&spec, reference);
@@ -1345,8 +1391,7 @@ fn split_agrees_with_sequential() {
             let m = mirror_program(&w, spec.slots);
             let ok = covered(&par.champions, &m)
                 || par.champions.iter().any(|sp| {
-                    sp.binding_free
-                        && (0..32).all(|s| m[s] & sp.decided[s] == mirror_program(&sp.words(), spec.slots)[s] & sp.decided[s])
+                    sp.binding_free && sp.admits(&mirror_program(&m, spec.slots))
                 });
             assert!(ok, "sequential champion {i}'s mirror not covered by split");
         }
@@ -1888,6 +1933,7 @@ fn champion_family_mine() {
             irq_sets: vec![],
             expected: vec![],
             seed: vec![],
+            seed_constraints: vec![],
             memo_cap: 0,
         };
         let reference = words_of(&e.reference, &side);
@@ -1921,6 +1967,7 @@ fn champion_family_mine() {
             irq_sets: vec![],
             expected: ref_spec.expected.clone(),
             seed: vec![],
+            seed_constraints: vec![],
             memo_cap: 1 << 21,
         };
         let t = std::time::Instant::now();
@@ -2098,6 +2145,7 @@ fn pair_fingerprint_census() {
                 irq_sets: vec![],
                 expected: vec![],
                 seed: vec![],
+                seed_constraints: vec![],
                 memo_cap: 0,
             })
             .collect()
@@ -2447,6 +2495,7 @@ fn tiny_champion_eyeball() {
             irq_sets: vec![],
             expected: vec![],
             seed: vec![],
+            seed_constraints: vec![],
             memo_cap: 0,
         };
         let reference = words_of(&e.reference, &side);
@@ -2489,6 +2538,7 @@ fn tiny_champion_eyeball() {
             irq_sets: vec![],
             expected: ref_spec.expected.clone(),
             seed: vec![],
+            seed_constraints: vec![],
             memo_cap: 1 << 21,
         };
         let t = Instant::now();
