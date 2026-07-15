@@ -1,116 +1,72 @@
 # STATUS — current frontier
 
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
-> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-13 (night).
+> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-15 (~3am).
+> **Session handoff (read first): `docs/handoff-2026-07-15.md`** — overnight
+> run details, resume commands, queued decisions.
 
-## SOUNDNESS: all 6 findings resolved; L=3 ladder RE-CERTIFIED
+## OVERNIGHT RUN LIVE: unit `pio-l3-monsters` (detached, 24h cap, RESUMABLE)
 
-Codex review (gpt-5.6-sol, one-shot) found 6 holes; all now fixed and
-merged with red-green adversarial micro-specs (gate suite 12 -> 17
-tests incl. new narrow_soundness.rs): S4 decided-delay walk records
-(1544a45, confirmed by re-derivation); S1 cross-fork Prov::Field loss
-(RED: memo-off 8 champions vs memo-on 0; flush_prov at all segment
-ends); S3 bound-record-refutes-unbound-prober (RED: champion vanished
-memo-on; Rec::bound flag, -3% hits); S2 binding-frame mixed-root
-records (confirmed flow-gap, REFUTED-as-exploitable by an
-identity-completeness argument — 4 blocked constructions — but fixed
-conservatively anyway: binding frames unrecordable + upward
-recordability poisoning, **-41% memo hits on 2..2 — REVIEWABLE
-RELAXATION CANDIDATE after verdicts**, argument documented in the S2/S3
-merge + test comments); S5/S6 seeded-search guards (P2/P4 off in
-seeded slots; validate_seed whole-field check; 3 RED micro-specs).
-Purge plateau hardened (bounded multi-pass, provable cap). Early
-re-verify pre-S2/S3: 0..1 764.9M/29s, 1..1 698.4M/26s, verdicts hold.
-**Verdict campaign result: ALL THREE proven brackets RE-REFUTE on the
-repaired memo — 0..0 560.2M items/94s (was 5.33B/26min pre-stage-2:
-9.5x items, 17x wall from the day's compounded levers), 0..1
-781.9M/57s, 1..1 704.8M/38s. CAVEAT LIFTED for the proven brackets.**
+Brackets 1..2 then 0..2 via the new `narrow-split` runner subcommand.
+Log: `/data/pio_optimization/runs/l3_monsters.log`; unit-level JSONL
+traces `narrow-split-l3-w12.jsonl` / `-w02.jsonl` alongside. If it
+dies, rerun the same command (in handoff doc) — it resumes, skipping
+settled units. Do NOT rebuild the binary before resuming (trace header
+pins the engine rev).
 
-**OVERNIGHT RESULT (2026-07-14 am): 2..2 REFUTED — 132.0B items,
-3.92B memo hits, 0 champions, 10,520s (2h55m; matches the 27%@50min
-extrapolation). 0..1/1..1 re-certified en route (781.9M/29s,
-704.8M/25s). FOUR of six L=3 brackets now proven. 1..2 died at the
-10h cap at 60.5% settled (1,015,146/1,679,192 units, ~235.3B worker
-items, ~7h — vs 6% settled at the pre-repair kill); not resumable
-(test path, not runner). 0..2 never started. NO more long runs for
-now (user) — remaining monsters wait for S2 relaxation + 008-B.**
+## L=3 ladder: 4 of 6 proven; monsters running on a much faster engine
 
-## Superposition (ticket 011) — v1 scope NEEDS RE-CUT after census
+0..0, 0..1 (700.56M/29s post-tags), 1..1 (632.8M/25s), 2..2
+(132.0B/2h55m, pre-tags engine) REFUTED. Tonight's engine gained:
+011(b) x/y Field tags (−10.3% items at L=3, wall-neutral), S2
+relaxation (memo hits 1.366%→1.938% on the 2..2 mine — the −41%
+poisoning fully recovered), S7 soundness fix. All proven-bracket
+verdicts re-held on the launch tree.
 
-Dead-demand census (merged ff6a4b3): **BitCount (28.6% of fork mass)
-is ~0% dead** — shift chains re-read within cycles; dead-demand
-deletion gets nothing there (needs 008-B outcome-predicate reads).
-Collapsible = MOV->reg copies (75% dead x ~15.4% mass ~= 11.5%) +
-SetData (~100% dead, tiny). Amend ticket 011 v1 before building:
-target = MOV/SetData class; BitCount + the 86% state-div wall class
-need outcome-predicate read semantics (008-B), not laziness. The
-suspicious exact 0.7500 MovSrc dead fraction needs a structural look.
+## Landed tonight (all gated, all merged to master)
 
-## Headline: realness tests point the monsters at DATA-PLANE SUPERPOSITION
+- **011(a)+(b)**: OSR-count CntProv twin; x/y Field(slot,mask) tags,
+  die-on-transform. Ticket 011 re-cut (stops at (b); Fn1 → 012 stage 4).
+- **S7** (new soundness finding from the S2 review): P1 prune + pin
+  pre-filter didn't charge killed words' reads to the FORK frame's own
+  record (segment-only was insufficient — deviation from review doc
+  documented in commit). Red-green canary in narrow_soundness.rs
+  (NOTE: fast suite now ~5 min because of it).
+- **S2 relaxation**: binding frames record again; upward poisoning
+  narrowed to exact conflict-poison. Rec::bound/S5/S6 untouched.
+- **012 ticket** (outcome-predicate reads design) + **stage-0 census**
+  (PIO_NARROW_PRED_CENSUS=1, sequential only): first table says 2-way
+  predicate kinds = 5.4% of collapses at 16x; in-sub 51% at 1.1x;
+  ctr-thresh/out-pinvis have no surface until OSR tags (stage 4).
+- **Proof engine Layer 1**: `equiv()` driver (smt/equiv.rs) — 3-valued,
+  ∀-inputs (symbolic FIFO words+occupancy), preconditions, loose/strict
+  tiers, counterexample replay on the real emulator. 2,144 word_canon
+  pairs PROVEN universal; CL1/CL2 conditional lemmas proven; 0 mirror
+  divergences. Config coverage (not opcodes) is the binding limit.
+- **Runner `narrow-split`**: unit-level resumable bracket searches,
+  per-unit telemetry JSONL, byte-identical to the test path.
+- **Tiny-champion eyeball** (docs/analysis/): toggler+bit-copier full
+  champion dumps; candidate lemmas CL1-CL6; multi-seed + 2x horizon
+  both caught real impostors.
 
-Two measurements on the 2..2 wall (probes 2acc442, journal "night"):
-(1) **86.0%** of single-conflict cond-misses are output-equal but
-STATE-divergent (capture divergence 52/19.7M) — the wall is dead-state
-divergence downstream of data-plane forks; conditioned word-interchange
-lemmas cap at **13.3%**. (2) Fork attribution: Delay 44% (stage-2
-residue), **BitCount 28.6%, MovSrc 15.2%** — data-plane fields carry
-~35-45% of fork mass. **Next flagship: provenance-tag symbols for
-x/y/ISR/OSR/counters** (design → staged build; subsumes 008-original
-outcome-grouping; enables multi-case specs → RX flagship). Control
-plane (pc/delay/stall/latches/clkdiv) stays concrete.
+## Queued (priority order — see handoff doc for detail)
 
-## Working mode (user, 2026-07-13): parallel worktree waves
-
-Agents implement in isolated worktrees (specs + fast gates); merges
-serialize through review + idle-box verdict runs. Wave 1: pair census
-MERGED (47.2M canon-rep pairs → 684K strict fingerprints, ~69:1;
-99.68% mass cross-spelling — champion/L=4-side prize); 008 stage 4
-MERGED (912cb77: ISR_CNT CntProv provenance — bracket-neutral,
-−26% memo entries, first instance of the superposition tag pattern);
-009 gap check + data-driven serializer battery entries in flight.
-
-## L=3 ladder: 4 of 6 REFUTED; 1..2 and 0..2 remain
-
-0..0 (560.2M/94s repaired-memo re-cert), 0..1 (781.9M/29s), 1..1
-(704.8M/25s), 2..2 (132.0B/2h55m) proven. 1..2 ~60% settled at the
-overnight 10h cap; 0..2 untouched. Strategy (user, 2026-07-14): no
-long runs; land S2 relaxation + 008-B first, rerun monsters on the
-faster engine.
-
-## Ticket 008: stages 1,2,4 landed; walk chapter closed (3b/3d
-reverted, post-mortems in ticket; 3b has USER-DIRECTED re-evaluation
-triggers: larger L, or any evaluator cycle-optimization pass).
-
-## Champion-family census (canonicalization program, step 1 done)
-
-Solution-dense battery: champion sets collapse ~250,000:1 (L=3);
-input variation splits only ~0.3% (output-only specs — serializer
-entries in flight); strict (+final state) tier still leaves 62K-71K
-member lemma-grade families. Readable conditioned lemmas surfaced
-(pin-writer spellings; jmp !x ≡ always @x==0; OUT count saturation).
-Dumps: runs/champ_mine.jsonl, runs/pair_census.jsonl.
+1. Bank overnight verdicts; per-unit tail analysis from the traces.
+2. T1 open follow-up: adversarial rig for tag-blind projection
+   (011(b) agent couldn't make it red; invariant shipped defensively).
+3. 012 stage 1 (JMP zero-test predicates on tags).
+4. Mirror config-coverage extension (68.7K battery-only pairs blocked
+   on supported_config, only 17.5K on opcodes); then rule library.
+5. 008 §3b re-measurement trigger FIRED (evaluator-adjacent cost
+   changed tonight) — re-test walk economics when convenient.
+6. Sequential instrumented 1..2 slice (pred-census + near-miss probe
+   on a monster wall); ≤4 impossibility re-proof via equiv.
 
 ## Ops rules
 
-Big searches serialized + gated (`systemd-run --user -p MemoryMax=48G
--p MemorySwapMax=0 -p RuntimeMaxSec=3000`); >50 min = too slow, build
-the lever. Magnitude gates = idle-box WALL-CLOCK + item counts (±2s
-bracket noise observed; byte-identical code measured 24-49s across
-box states). `systemctl --user` unreliable from monitor shells — use
-log mtime. Worktree agents: smokes ≤150s single-threaded only.
+Big searches serialized + gated (systemd-run --user, MemoryMax=48G,
+MemorySwapMax=0). Magnitude gates = idle-box WALL-CLOCK + items.
+`systemctl --user` unreliable from monitor shells — use log mtime.
+Runner resume: same command, same rev, same params.
 
-## Queued
-
-Superposition design doc + staged build (flagship); Codex one-shot
-engine review (gpt-5.6-sol, single message, after wave 1 settles);
-ladder-subsumption design doc (length-reducing pair rules); monsters
-verdict once superposition lands. Then ticket 010 / multi-case specs
-→ phase-invariant RX.
-
-## Shard twin — COMPLETE (2a3a2e7); hand shard_pio/ to Christian
-
-## Bench (idle) / paused
-
--0 pinger / -1 responder on [3][4][4][4], worktree
-Raven-Firmware.single-sm-tx-bench UNPUSHED @350ede86. Paused: SMT
-len-4, compress2, len-5 fleet, ticket 006 runner migration.
+## Shard twin — COMPLETE (2a3a2e7); bench/paused items unchanged

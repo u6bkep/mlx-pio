@@ -4,6 +4,70 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-15 (night) — proof-engine Layer 1, 011(b) tags, S7, S2 relaxed, resumable runner; monsters relaunched
+
+Wave-2 day (5 worktree agents + 2 surveys, all merged and gated).
+Strategy rulings (user): no un-resumable long runs; lemma/proof-engine
+track promoted; 011+012 are ONE lattice (tags = value provenance,
+value-set constraints = field knowledge; ticket 011 re-cut to stop at
+(b), Fn1 → 012 stage 4). Landed, in merge order:
+
+1. **Ticket 012** (outcome-predicate reads design; the 0.7500 MovSrc
+   dead fraction explained as a census artifact of first-outcome +
+   LIFO — dst≠osr, 3/4 by construction).
+2. **Tiny-champion eyeball** (docs/analysis/tiny-champion-eyeball.md):
+   toggler L2 = 260 champions/1 strict family; bit-copier L2 = 332/123
+   strict/3 loose; caught a data-coincidence champion (mov pc,::osr)
+   via multi-seeding and a horizon-only split (pull ifempty noblock)
+   via 2x horizon. Candidate lemmas CL1-CL6; CL1-3 = one mechanism
+   (known-value/satisfied-guard invariants) — all state-conditioned,
+   invisible to per-word quotients.
+3. **SMT equiv() driver** (smt/equiv.rs): 3-valued, ∀-inputs (symbolic
+   FIFO words+occupancy), StatePred preconditions, loose/strict tiers,
+   mandatory counterexample replay on the real emulator. 2,144
+   word_canon pairs PROVEN universal (~1.8ms each), zero refutations,
+   ZERO mirror divergences; CL1 proven under x==0 (refuted without),
+   CL2 proven for all 32 bit-counts. Binding limit is CONFIG coverage
+   (68.7K pairs blocked on supported_config incl. tx_a) not opcodes
+   (17.5K).
+4. **S2 relaxation review** (docs/analysis/s2-relaxation-review.md):
+   identity-completeness argument holds for the binding frame itself;
+   full revert refuted by a cross-sibling construction (keep narrowed
+   poison propagation); found **S7 live on master** — P1 prune (and,
+   it turned out, the pin pre-filter) never charged killed words'
+   reads to the fork frame's own record; wrong-transfer refutations
+   demonstrated via probe-log; champion loss blocked only by benefit-
+   gate constants.
+5. **Runner narrow-split** (591e3de): unit-level resumable bracket
+   searches; byte-identical to the test path (L=2 0..1 50,390,555 on
+   pre-tag tree); resume gate = SIGINT at 38% + rerun → byte-identical
+   final stats; header pins engine rev. Split refactor: pub
+   split_units/search_unit.
+6. **011(a)+(b)** (4d731d3/b6abfb9/9386ce3): OSR-count CntProv twin
+   (memo entries −12% on 2..2 mine); x/y Field tags die-on-transform.
+   L=2 smokes: verdicts identical, items −10 to −12%. L=3 on merged
+   tree: 0..1 700.94M/29s, 1..1 632.8M/25s (−10.3%, wall-neutral).
+   92% of tag writes never fork. T2 walk-bail rig red-green; T1
+   (tag-blind projection) could NOT be made red — invariant shipped
+   defensively, adversarial rig queued.
+7. **S7 fix + S2 relaxation + 012 stage-0** (23e4089/fa9b0f8/dcaca96):
+   S7 needed fork-local kill accumulators seeded into the fork frame's
+   own pattern (the review doc's segment-only one-liner was
+   insufficient — verified live; pin-prefilter had the same gap);
+   canary green both sides. S2: binding frames record again, poisoning
+   narrowed to exact conflict-poison; 150s 2..2 mine hits
+   1.366%→1.938% at equal wall = the −41% fully recovered (conflicts
+   rare: 140K vs 13.7M tags). Stage-0 census first table: 2-way
+   predicate kinds 5.4% of collapses at 16x; in-sub 51% at 1.1x;
+   ctr-thresh/out-pinvis zero by construction until OSR tags.
+
+Launch tree verdict gates: L=2 0..1 45,201,271 items, L=3 0..1
+700,564,042/29s, all REFUTED champions=0. **Overnight relaunched
+~3am: unit pio-l3-monsters, 1..2 then 0..2, resumable traces under
+/data/pio_optimization/runs/ — see docs/handoff-2026-07-15.md.**
+Fast suite note: narrow_soundness now ~5min (S7 canary). 008 §3b
+re-measurement trigger fired (evaluator-adjacent cost changed).
+
 ## 2026-07-14 — overnight monsters: 2..2 REFUTED; 1..2 dies at 10h cap at 60.5%
 
 Unit pio-overnight (10h RuntimeMaxSec, 48G-gated, detached) ran the
