@@ -196,6 +196,10 @@ pub struct Stats {
     pub tags_created: u64,
     pub tag_collapses: u64,
     pub tag_rewrites: u64,
+    /// Frames that detected an identity/twin mixed-spelling value
+    /// conflict in their consulted union (`Frame::merge`) — the
+    /// conflict-poison source the S2-relaxed `recordable` carries.
+    pub merge_conflicts: u64,
 }
 
 impl Stats {
@@ -1942,13 +1946,21 @@ struct Frame {
     /// Union of pattern state components read anywhere in the subtree.
     state_reads: u16,
     any_champion: bool,
-    /// False when a record would be unsound: a binding fork below mixes
-    /// runs from two root states (identity S, twin sigma(S)) under one
-    /// key, or a value conflict surfaced in the consulted union.
-    /// Propagated to the parent at close (S2 fix): a poisoned child's
-    /// conds merge upward with clobbered/mixed-spelling values, so no
-    /// ancestor of a poisoned frame may record either.
+    /// False when a record would be unsound because an unresolved
+    /// mixed-spelling value CONFLICT surfaced in this subtree's
+    /// consulted union (identity and twin sides of a binding fork
+    /// consulted the same decided bits under different spellings —
+    /// `Frame::merge`). Propagated to the parent at close: a poisoned
+    /// frame's conds merge upward clobbered, so no ancestor may record
+    /// either (the §5.1 cross-sibling construction in
+    /// s2-relaxation-review.md kills any full revert of that
+    /// propagation). A merely-binding frame is RECORDABLE (S2 relaxed,
+    /// review §3: identity-completeness + `Rec::bound`); conflict-free
+    /// twin-only conds over-restrict, never under-restrict.
     recordable: bool,
+    /// Diagnostic (deterministic): this frame itself detected a merge
+    /// conflict — distinguishes own-conflict from propagated poison.
+    conflicted: bool,
     /// True when any part of this frame's subtree executed under a
     /// BOUND item: the frame opened on a bound item, this IS a binding
     /// fork's frame, or a binding fork closed below (propagated at
@@ -1977,6 +1989,7 @@ impl Frame {
         let overlap = self.consulted_mask[slot] & mask & self.decided[slot];
         if self.consulted_value[slot] & overlap != value & overlap {
             self.recordable = false;
+            self.conflicted = true;
         }
         self.consulted_mask[slot] |= mask;
         self.consulted_value[slot] = (self.consulted_value[slot] & !mask) | (value & mask);
@@ -2119,12 +2132,17 @@ fn close_child(
                 stats.memo_entries = (stats.memo_entries as i64 + delta) as u64;
             }
         }
+        stats.merge_conflicts += f.conflicted as u64;
         let parent = frames.last_mut().expect("synthetic root below every frame");
         parent.state_reads |= f.state_reads;
-        // Binding-domain and poison propagation (S2/S3 fixes): a
+        // Binding-domain (S3) and CONFLICT-poison propagation: a
         // subtree that touched bound items taints every ancestor's
-        // record the same way, and a poisoned frame's conds (merged
-        // below) are mixed-spelling — the parent must not record.
+        // record the same way, and a conflict-poisoned frame's conds
+        // (merged below) are mixed-spelling/clobbered — the parent
+        // must not record either (s2-relaxation-review.md §5.1: with
+        // the binding frame itself recordable again, `recordable`
+        // carries exactly conflict-poison, and deleting this
+        // propagation is unsound against the cross-sibling clobber).
         parent.bound_seen |= f.bound_seen;
         parent.recordable &= f.recordable;
         for &(s, m, v) in &conds {
@@ -3971,6 +3989,7 @@ fn search_impl(
         state_reads: 0,
         any_champion: false,
         recordable: false,
+        conflicted: false,
         bound_seen: !root.unbound,
         items_at_open: 0,
     }];
@@ -3994,7 +4013,7 @@ fn search_impl(
                 .collect();
             eprintln!("narrow-search: fork attribution: {}", named.join(" "));
             eprintln!(
-                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} walks={} wcyc={} cyc={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={} tags={}/{}c/{}r",
+                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} walks={} wcyc={} cyc={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={} tags={}/{}c/{}r conf={}",
                 stats.items,
                 stats.forks,
                 stats.refuted,
@@ -4015,7 +4034,8 @@ fn search_impl(
                 stack.len(),
                 stats.tags_created,
                 stats.tag_collapses,
-                stats.tag_rewrites
+                stats.tag_rewrites,
+                stats.merge_conflicts
             );
             if let Some(d) = dd.as_ref() {
                 d.print("beat");
@@ -4477,6 +4497,7 @@ fn search_impl(
                                 consulted_value: [0u16; 32],
                                 any_champion: false,
                                 recordable: true,
+                                conflicted: false,
                                 bound_seen: !it.unbound,
                                 state_reads: kill_reads,
                                 items_at_open: stats.items,
@@ -4586,6 +4607,7 @@ fn search_impl(
                                 consulted_value: [0u16; 32],
                                 any_champion: false,
                                 recordable: true,
+                                conflicted: false,
                                 bound_seen: !it.unbound,
                                 state_reads: 0,
                                 items_at_open: stats.items,
@@ -4662,6 +4684,7 @@ fn search_impl(
                                     consulted_value: [0u16; 32],
                                     any_champion: false,
                                     recordable: true,
+                                    conflicted: false,
                                     bound_seen: !it.unbound,
                                     state_reads: 0,
                                     items_at_open: stats.items,
@@ -4782,14 +4805,23 @@ fn search_impl(
                             consulted_mask: [0u16; 32],
                             consulted_value: [0u16; 32],
                             any_champion: false,
-                            // S2 fix: the two children run from two
-                            // roots (identity S, twin sigma(S)) with
-                            // two word spellings — the consulted union
-                            // does not describe one condition set at
-                            // one root, so this frame never records,
-                            // and (via close_child propagation)
-                            // neither does any ancestor.
-                            recordable: false,
+                            // S2 relaxed (s2-relaxation-review.md §3/§7):
+                            // the identity child alone enumerates every
+                            // completion from this frame's key state
+                            // (both children are bound, so P1 is off
+                            // below — wall 1), and a bound prober's run
+                            // crosses the asymmetric event exactly as
+                            // identity did (wall 4). Identity/twin
+                            // disagreement on a co-consulted decided bit
+                            // trips `Frame::merge`'s conflict check
+                            // (wall 3) and poisons this frame and, via
+                            // close_child propagation, its ancestors —
+                            // the §5.1 cross-sibling clobber is why that
+                            // propagation must stay. Records here carry
+                            // `Rec::bound` (S3) and never refute unbound
+                            // probers.
+                            recordable: true,
+                            conflicted: false,
                             // Both children are bound from here on.
                             bound_seen: true,
                             state_reads: 0,
@@ -4983,6 +5015,7 @@ fn search_impl(
                             consulted_value: [0u16; 32],
                             any_champion: false,
                             recordable: true,
+                            conflicted: false,
                             bound_seen: !it.unbound,
                             state_reads: 0,
                             items_at_open: stats.items,
@@ -5091,6 +5124,7 @@ pub fn merge_stats(into: &mut Stats, s: &Stats) {
     into.tags_created += s.tags_created;
     into.tag_collapses += s.tag_collapses;
     into.tag_rewrites += s.tag_rewrites;
+    into.merge_conflicts += s.merge_conflicts;
 }
 
 /// Phase-1 product of the split driver: an early verdict, or the

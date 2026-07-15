@@ -655,6 +655,187 @@ fn p1_pruned_reads_must_be_consulted() {
     );
 }
 
+// --- S2 relaxation gates (s2-relaxation-review.md §6.1) ---------------
+//
+// The binding-fork frame is recordable again (review §3: identity-
+// completeness + `Rec::bound`), and `recordable` upward propagation now
+// carries exactly CONFLICT-poison (`Frame::merge` mixed-spelling value
+// conflicts). Two green gates pin the relaxed surface:
+//
+// On the §5.1 cross-sibling construction (two binding forks under one
+// parent, a register-naming field decided above it, consulted by
+// fork-1 on both sides and by fork-2's twin only): it resisted
+// construction as a spec. The identity side's post-binding control
+// flow is INDEPENDENT of the searched field whenever the field's value
+// lives in Y (the only asymmetric channel, PULL's physical-X read,
+// then feeds the twin's registers, not the identity's), so "identity
+// consults b in fork-1 but not in fork-2" needs identity behavior to
+// vary across siblings of one parent — which the same independence
+// forbids; flipping the roles (field in X) un-arms the binding
+// (x == y at the pull). The shipped propagation is strictly MORE
+// conservative than §5.1 needs — ANY in-subtree conflict poisons the
+// whole ancestor path, whereas §5.1 only requires the conflicting
+// frame's ancestors — so the construction being unreachable does not
+// weaken the pin: `s2_conflict_poison_fires` below demonstrates the
+// conflict detector live on the mixed-spelling consults that §5.1
+// composes, and champion equality would flip if the propagation were
+// deleted against any reachable variant.
+
+const OUT_X_2: u16 = 0x6022; // out x, 2
+const JMP_NOT_X_6: u16 = 0x0026; // jmp !x, 6
+const JMP_5: u16 = 0x0005; // jmp 5 (always)
+
+/// S2-relaxation gate (ii): twin-divergence. A small recording frame
+/// (slot1's fetch forks) sits above binding forks (slot2 pull with
+/// x=2 != y); the PULL's physical-X read makes identity osr=2 vs twin
+/// osr=<loader imm>, so `out x,2` + `jmp !x,6` DIVERGES the twin's
+/// control flow: twins with imm & 3 == 0 reach slot6 (`mov pins,osr`,
+/// self-mirror) which the identity side never fetches — records above
+/// those binding forks carry twin-only conds. The witness champion is
+/// reachable ONLY as a binding twin (seeds pin the identity spelling).
+/// Champion lists must be identical memo on/off.
+#[test]
+fn s2_twin_divergence_records_green() {
+    let config = Config {
+        pins: PinMap { out_base: 0, out_count: 2, ..PinMap::default() },
+        ..Config::default()
+    };
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config, 0, 6),
+        slots: 7,
+        cycles: 7,
+        inputs: vec![],
+        output_pins: vec![0, 1],
+        capture_pins: vec![0, 1],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![
+            (0, 0xFFFF, SET_X_2),
+            // slot1 searched (the recording frames above the binding)
+            (2, 0xFFFF, PULL_NOBLOCK),
+            (3, 0xFFFF, OUT_X_2),
+            (4, 0xFFFF, JMP_NOT_X_6),
+            (5, 0xFFFF, JMP_5), // identity parks here
+            (6, 0xFFFF, MOV_PINS_OSR), // twin-only observable
+        ],
+        memo_cap: 0,
+    };
+    // The twin champion: mirror of [set x,2 / set y,0 / pull / out x,2
+    // / jmp !x,6 / jmp 5 / mov pins,osr]. Its identity spelling parks
+    // at slot5 with pins idle; the twin pulls physical X = 0, zeroes
+    // its register file through `out y,2`, takes `jmp !y,6`, and
+    // drives pins 00 at cycle 5.
+    let w_ident = {
+        let mut w = [NOP_WORD; 32];
+        w[0] = SET_X_2;
+        w[1] = 0xE040; // set y, 0
+        w[2] = PULL_NOBLOCK;
+        w[3] = OUT_X_2;
+        w[4] = JMP_NOT_X_6;
+        w[5] = JMP_5;
+        w[6] = MOV_PINS_OSR;
+        w
+    };
+    let w_twin = mirror_program(&w_ident, 7);
+    spec.expected = run_spec(&spec, w_twin);
+    assert_eq!(spec.expected[2] & 0x3, 0x3, "pins idle high pre-divergence");
+    assert_eq!(spec.expected[5] & 0x3, 0x0, "twin trace must end pins=00");
+    assert_ne!(run_spec(&spec, w_ident), spec.expected, "identity spelling must refute");
+
+    let off = search(&spec, 100_000);
+    assert!(!off.champion_cap_hit);
+    assert!(
+        covered(&off.champions, &w_twin),
+        "memo-off search failed to find the twin champion — rig broken"
+    );
+    spec.memo_cap = 1 << 20;
+    let on = search(&spec, 100_000);
+    eprintln!(
+        "s2 twin-divergence: off champs={} items={} | on champs={} items={} hits={} conflicts={}",
+        off.champions.len(),
+        off.stats.items,
+        on.champions.len(),
+        on.stats.items,
+        on.stats.memo_hits,
+        on.stats.merge_conflicts
+    );
+    assert!(
+        covered(&on.champions, &w_twin),
+        "S2 RED: relaxed record killed the twin champion's prober"
+    );
+    assert_eq!(
+        off.champions, on.champions,
+        "S2 RED: champion lists diverge between memo off/on under the relaxation"
+    );
+}
+
+/// S2-relaxation gate (iii): the conflict detector fires live. A
+/// wrapping loop re-fetches the register-naming seed slot0 AFTER the
+/// binding fork on BOTH sides — the identity consults `set x,2`, the
+/// twin consults the mirrored `set y,2` on the same decided bits —
+/// exactly the mixed-spelling merge §5.1 composes across siblings.
+/// The frames must conflict-poison (merge_conflicts > 0) and champion
+/// lists must match memo on/off, twin champions included.
+#[test]
+fn s2_conflict_poison_fires() {
+    let config = Config {
+        pins: PinMap { out_base: 0, out_count: 2, ..PinMap::default() },
+        ..Config::default()
+    };
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config, 0, 3),
+        slots: 4,
+        cycles: 12,
+        inputs: vec![],
+        output_pins: vec![0, 1],
+        capture_pins: vec![0, 1],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![
+            (0, 0xFFFF, SET_X_2),
+            (1, 0xFFE0, 0xE040), // set y, <imm free> — 011(b) tag + collapse
+            (2, 0xFFFF, PULL_NOBLOCK),
+            (3, 0xFFFF, MOV_PINS_Y),
+        ],
+        memo_cap: 0,
+    };
+    let w_wit = {
+        let mut w = [NOP_WORD; 32];
+        w[0] = SET_X_2;
+        w[1] = SET_Y_1; // pins <- 01 each loop
+        w[2] = PULL_NOBLOCK;
+        w[3] = MOV_PINS_Y;
+        w
+    };
+    spec.expected = run_spec(&spec, w_wit);
+    let off = search(&spec, 100_000);
+    assert!(!off.champion_cap_hit);
+    assert!(covered(&off.champions, &w_wit), "identity witness lost — rig broken");
+    // The witness's register-mirror twin (reachable only through the
+    // binding fork: seeds pin the identity spelling).
+    let w_twin = mirror_program(&w_wit, 4);
+    assert!(covered(&off.champions, &w_twin), "twin champion lost memo-off");
+    spec.memo_cap = 1 << 20;
+    let on = search(&spec, 100_000);
+    eprintln!(
+        "s2 conflict gate: off champs={} | on champs={} items={} hits={} conflicts={}",
+        off.champions.len(),
+        on.champions.len(),
+        on.stats.items,
+        on.stats.memo_hits,
+        on.stats.merge_conflicts
+    );
+    assert!(
+        on.stats.merge_conflicts > 0,
+        "conflict detector never fired — the rig no longer exercises \
+         mixed-spelling merges (wall 3) and the poison path is unpinned"
+    );
+    assert!(covered(&on.champions, &w_twin), "S2 RED: twin champion lost memo-on");
+    assert_eq!(off.champions, on.champions, "S2 RED: champion lists diverge");
+}
+
 /// Diagnostic: memo-on run of the P1 rig for env-driven dumps.
 #[test]
 #[ignore]
