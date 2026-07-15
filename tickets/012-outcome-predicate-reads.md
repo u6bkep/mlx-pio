@@ -1,10 +1,134 @@
 # 012 — 008-B: outcome-predicate reads (value-set constraints)
 
-**Status:** design (this doc; no implementation) · **Source:** dead-demand
+**Status:** stage 1 (E1) in implementation (2026-07-15 amendment
+below; stage 0 census landed dcaca96) · **Source:** dead-demand
 census (merged ff6a4b3, journal 2026-07-13) + realness tests (2acc442);
 the read-rule half of ticket 011's superposition program. Line numbers
 below are against master @ 719d66c (engine.rs ~4750 lines,
 mod.rs `exec_op` 382-677).
+
+---
+
+## AMENDMENT 2026-07-15 (evening) — E1 re-cut: environment-read predicates land FIRST
+
+**Source:** w12 monster trace mining + seed-orbit analysis
+(docs/analysis/narrow-split-w12-unit-mining.md, w12-seed-orbits.md).
+User rulings: E1 = new stage 1; seeds carry constraints; junk-window
+cleanliness relaxation = separate ticket after E1; implement before
+re-measuring (long runs are wall-clock expensive — land known-positive
+narrowing levers first).
+
+### Why the stage-0 census missed the mass
+
+Stage 0 instrumented 011(b)'s TAG-collapse sites; a WAIT never touches
+a tag, so the environment-read fan was invisible to it BY
+CONSTRUCTION. The w12 mining is the complementary measurement: 71% of
+the 1..2 monster's CPU was byte-identical repeat subtrees, ~87% of the
+redundant mass slot-0 prologue respelling, and the biggest exact
+orbits are the satisfied-WAIT alphabet (124 of 126 members; the
+excluded indices reproduce the config's pin-idle/DE/irq-stim map
+precisely). There are two read planes: (i) tagged-register reads
+(the original ladder, needs 011), and (ii) reads of the CONCRETE
+environment through undecided SELECT fields (WaitPol/WaitSrc/WaitIdx
+choose WHICH known signal to read). Plane (ii) carries the monster
+mass and needs no tags at all.
+
+### §1 taxonomy amendment
+
+Reclassify `WAIT gpio/pin` (mod.rs:421-432) from "Ctl/external,
+non-target" to **Pred(met-now) on the select fields**: at fork time
+the gpio state is concrete in the item, so met(pol, src, idx) is a
+deterministic per-raw-value evaluation — the §2 fork rule applies
+with the environment in place of a tag replay. `WAIT irq` stays
+excluded: pol=1 clears a per-idx flag (the original reason), and
+pol=0 irq waits were absent from the w12 orbits for a reason not yet
+understood (see open checks) — do not scope irq until that is
+explained.
+
+### Stage E1 — met-now WAIT grouping (the new stage 1)
+
+Mechanism, per the §2 fork rule with these specifics:
+
+- WaitPol/WaitSrc keep today's eager concrete forks (2- and 3-wide —
+  cheap, and forking them first makes the idx partition a clean
+  SINGLE-FIELD set per (pol, src) branch; no cross-field constraints,
+  §7's exclusion stands).
+- At the WaitIdx demand with pol/src concrete: evaluate the wait
+  condition per allowed idx against the item's concrete gpio state
+  (reuse the emulator's own condition eval — do NOT reimplement the
+  in_base mapping). Partition = {met-now} ∪ {unmet, individually}.
+  Met arm writes nothing (gpio/pin sources), so met-now is ONE
+  outcome class: push one child with Constraint(slot, idx-fmask,
+  met_set) (singleton ⇒ decide as today; all-met ⇒ no fork at all,
+  §2 rule 2). Unmet values fork concretely as today — their stall
+  futures genuinely diverge (DE toggles, self-driven pins).
+- Re-execution (loop return or jmp back into the slot) re-partitions
+  the CURRENT allowed set at the new cycle — §2 "later predicate
+  read intersects" verbatim; the met set can only shrink.
+- Fork-frame read accounting: the partition evaluation consults the
+  gpio state and the field — charge per the S7 discipline (the
+  fork frame's OWN record carries the killed/grouped values' reads).
+
+E1 delivers the identical substrate the original stage 1 was designed
+to force — Item constraint block, class enumeration, set-valued conds
++ P ⊆ S probing + partition drop rule (§3), champion sets (§4),
+junk_walk single-class rule (§4) — with NO 011(b) dependency and a
+monster-scale measured payoff (the original stage 1's honest
+expectation was "small"). Original stages renumber: zero-test JMPs →
+stage 2, dec transform → stage 3, counter thresholds → stage 4, OUT
+pin-classes → stage 5.
+
+### Scope delta: seeds carry constraints (REQUIRED, was deferred)
+
+§ "Split driver" deferred constraint-carrying seeds. E1 cannot leave
+it deferred: phase 1's truncated search is exactly where the met fan
+explodes into 60+ frontier units, and if frontier champions cannot
+carry their constraint the fan re-materializes as seeds and the
+split layer keeps paying it. Frontier units (Champion) and seed
+tuples gain the constraint block; `validate_seed` extends to check
+constraint well-formedness (S6-style: within values_into, nonempty,
+fmask consistent with the slot's decided bits); unit resume traces
+serialize it (Champion already derives serde). This is the one
+genuinely new soundness surface of the re-cut — S1-analog red-green
+micro-spec FIRST, per §3.
+
+### Explicitly out of E1
+
+- Stall-class future-grouping (grouping unmet waits by known
+  completion cycle from the stim timeline) — needs future-environment
+  reasoning; a later stage if the residue measures large.
+- WAIT irq (above). Open check: why were pol=0 irq waits absent from
+  the w12 orbits? (values_into for the idx field under src=irq /
+  canon / emulator semantics — answer in ~30 min of reading, do it
+  before any irq scoping.)
+- Delay ladders (73% of monster forks): the companion junk-window
+  cleanliness relaxation ("reads with window-invariant values don't
+  dirty the window") — separate ticket, sequenced after E1. The
+  deeper "delay as incremental threshold predicate" unification is
+  REJECTED for now: delay lives in KeyCore and this must not grow
+  into a memo-key redesign.
+
+### E1 gates (amendments to §6's standing gates)
+
+- Standing gates as written (fast suite, L1/L2 exact censuses, memo
+  on/off, split-vs-sequential, instrumentation-inert, determinism
+  locks, proven-bracket VERDICT identity — items are expected to DROP
+  on WAIT-bearing brackets; report deltas, verdicts must not change).
+- The widening micro-spec becomes a wait-set spec: a config where
+  `wait 0 <pin>` survives for a known index set ⇒ ONE champion whose
+  constraint covers the set, coverage = |set| balanced against the
+  exact census (vs |set| separate champions today).
+- Seed round-trip gate: split a WAIT-bearing bracket, SIGINT, resume
+  — byte-identical final stats with constraints in the trace.
+- Wall-clock magnitude gates DEFERRED to idle box / b-srv0 (user
+  ruling: implement first; the box is running the 0..2 monster).
+  Verdict/item gates run now at low test-thread counts.
+- Prediction logged pre-measurement (falsifiable): w02 (wrap 0..2, NO
+  prologue slot) should show duplicate-CPU fraction well below w12's
+  71%. Record the measured value here when the trace is mined:
+  **[PENDING — w02 lands ~2026-07-15 22:45]**.
+
+---
 
 ## Why this exists (measured)
 
