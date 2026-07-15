@@ -4,6 +4,35 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-15 (evening, later) — seed orbits named: the 71% is prologue respelling; runtree convention
+
+**Runtree convention landed** (73a3e43): long runs launch/resume from
+`../pio_optimization.runtree` pinned at the launch rev (launch binary
+preserved there). Validated by live-resuming a COPY of the completed
+w12 trace from the runtree: header accepted, 1.38M settled units
+recognized, byte-identical DONE totals in 1s. Master is free again;
+the stash/checkout dance in the earlier entry is obsolete.
+
+**Seed-orbit analysis** (docs/analysis/w12-seed-orbits.md; new
+`dump_seeds` bin + tools/orbit_analysis.py): re-derived phase-1 seeds
+bit-identically (1,383,452 / cycle 2 / 1,002,852 pre-mirror), joined
+on unit id. **~87% of the redundant CPU is slot-0 PROLOGUE
+respelling**: delay+op-hi 24.8%, delay-only 18.1%, the 126-orbits
+16.3%, delay+op-lo 14.4%, delay+op-hi+op-lo 13.3%; mirror twins
+inside the 10.5% mixed class; slot-1/2 cross-unit duplication <1%
+(the engine's in-unit levers were not missing anything — the gap is
+the phase-1 decomposition layer). The 126-orbits decoded exactly:
+124 satisfied-condition WAITs (CL3; the excluded indices reproduce
+the config — gpio0 idles high, gpio8=DE toggles, in_base=16 aliasing,
+irq stim kills all irq-waits) + 2 `mov pins,pins` (CL1/CL6), each at
+delays d and d+24 (**new candidate CL7: prologue phase congruence
+mod 24** — presumably the spec period in the pre-DE idle window;
+UNVERIFIED). Lever: seed-level quotient before phase 2 (canonicalize
+slot-0 under proven no-op rules, run one representative, replicate
+verdict); proof obligations = equiv() with config preconditions ⇒
+supported_config extension is now doubly motivated. Eyeball-battery
+lemmas CL1/CL3/CL6 are empirically THE mass at monster scale.
+
 ## 2026-07-15 (evening) — 1..2 monster REFUTED (5/6); w12 trace mined: 71% repeat work
 
 **1..2 REFUTED**: 363.97B items / 318.06B refuted / 657.1M memo hits /

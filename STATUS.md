@@ -25,11 +25,14 @@ trace. Master is free to advance.
 
 - **Recursive-unit-split driver: NOT justified** — 28.0/28 effective
   cores, max unit 3.1% of wall. At L=4 prefer deeper frontier cycle.
-- **71.1% of CPU was byte-identical repeat subtrees** (6,925 distinct
-  stat fingerprints / 1.38M units; seven 126-copy orbits @122s = 11%
-  of the run). Sound exploitation = seed-level quotient via the
-  equiv()/rule-library track — unit-granularity canonicalization is
-  now the top measured lever (3.5x ceiling on this workload).
+- **71.1% of CPU was byte-identical repeat subtrees**; seed-orbit
+  analysis (docs/analysis/w12-seed-orbits.md) NAMED it: **~87% of the
+  redundant mass is slot-0 PROLOGUE respelling** — satisfied-WAIT
+  no-ops (CL3, config-exact: pin-idle map + DE + irq stim all
+  visible in the exclusions), self-moves (CL1/CL6), and a d ≡ d+24
+  delay congruence (new CL7, spec-period, unverified). Lever = seed
+  quotient before phase 2 via proven rules; CL3 needs equiv()
+  supported_config extension (tx_a blocked on it → raises queue #5).
 - Fork attribution: Delay 73.1%, BitCount 11.8%, WaitIdx 4.8%.
 - Unit-keying soundness checked: identical unit counts across w12/w02
   are benign (wrap-back invisible on a 2-cycle prefix; units re-run
@@ -41,12 +44,16 @@ trace. Master is free to advance.
    memory + ladder close-out. Mine its trace:
    `python3 tools/mine_narrow_split.py <trace>` (stdout only, never
    into runs/).
-2. Seed-orbit identification: re-derive phase-1 seeds (deterministic),
-   join on unit index, name what the 126-orbits respell → feeds the
-   unit-quotient design.
+2. DONE (seed orbits named — see above). Follow-ups: verify the 24-
+   cycle congruence against spec.expected (cheap); confirm self-sync
+   mechanism on one delay-only group; then DISCUSS seed-quotient
+   lever design (one-way door: verdict replication across proven-
+   equivalent seeds).
 3. T1 open follow-up: adversarial rig for tag-blind projection.
 4. 012 stage 1 (JMP zero-test predicates on tags).
-5. Mirror config-coverage extension for equiv(); then rule library.
+5. Mirror config-coverage extension for equiv() — now doubly
+   motivated (CL3-with-preconditions on tx_a config is the seed-
+   quotient's proof engine); then rule library.
 6. 008 §3b re-measurement (trigger fired); sequential instrumented
    1..2 slice; ≤4 impossibility re-proof via equiv; runner header
    rev-pinning fix (build-time rev, see mining doc §5).
