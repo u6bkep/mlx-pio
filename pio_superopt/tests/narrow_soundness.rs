@@ -38,6 +38,7 @@ const MOV_OSR_NULL: u16 = 0xA0E3; // mov osr, null (resets osr + count)
 const PULL_NOBLOCK: u16 = 0x8080;
 const MOV_PINS_OSR: u16 = 0xA007; // mov pins, osr
 const NOP_WORD: u16 = 0xA042; // mov y, y — engine filler for slots >= slots
+const NOP_CANON_W: u16 = 0xA021; // mov x, x — the canonical nop (NOP_CANON)
 
 /// The S3 rig, shared by the red test and the diagnostic dump.
 ///
@@ -989,5 +990,214 @@ fn wait_met_now_grouping_one_champion() {
         r.stats.wait_partitions,
         r.stats.wait_all_met,
         r.stats.items
+    );
+}
+
+/// Frame-soundness micro-spec (012 §3, the S1-analog): constraints are
+/// NOT segment-local — they live on the item and cross frames — so a
+/// record formed at a frame whose item was CONSTRAINED at open must
+/// express the constrained field as the FRAME-OPEN set (a set-valued
+/// cond, prober match = P ⊆ S). The natural wrong implementation
+/// (drop undecided consulted bits exactly like the decided-filter)
+/// generalizes the record over the index field, and a prober with
+/// LARGER index knowledge at the same core is falsely refuted — its
+/// unexplored completions contain a champion.
+///
+/// Rig (L=6, wrap 1..5, everything seeded except slot0 delay, slot1
+/// index, slot3 delay):
+///   slot0 nop <d0 free>          — prologue respelling source
+///   slot1 wait 0 gpio <idx free> — the E1 partition field
+///   slot2 wait 1 gpio 8          — synchronizer (pin 8 rises at 44)
+///   slot3 nop <d3 free>          — the recording fork anchor
+///   slot4 set pins,0 / slot5 set pins,1 — the observable pulse loop
+///
+/// Stim: pins {4,5} HIGH on [24,40) (W1), pin 8 HIGH from 44, pin 4
+/// HIGH again on [46,60) (W2). Pin 0 is the driven output (idles
+/// HIGH), so index 0 is never met before slot4 runs.
+///
+/// RECORDERS (d0 = 23..31, DFS-first): slot1 executes inside W1 —
+/// met set A excludes {0,4,5}. All paths re-sync at slot2 (wake 44)
+/// and fork slot3's delay at ONE shared core K. The A-group's subtree
+/// is champion-free (4 is outside A, so W2 never stalls it — wrong
+/// pulse cadence) and records at K.
+///
+/// PROBERS (d0 = 0..22): slot1 executed BEFORE W1 — met set
+/// B = all-but-{0} ⊃ A. Their idx=4 members (second execution inside
+/// W2 stalls to 60 — the witness cadence) are champions for EVERY d0.
+/// A record at K without the frame-open set cond matches the idx=4
+/// probers (their decided pol/src/opcode conds all agree) and kills
+/// them — memo-on loses every champion the recorders' cohort didn't
+/// already bank. With the set cond, P = {4} ⊄ A misses.
+#[test]
+fn constraint_frame_open_set_conds() {
+    let config = Config {
+        pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 1, ..PinMap::default() },
+        ..Config::default()
+    };
+    let cycles = 72u32;
+    let mut stim_values = Vec::with_capacity(cycles as usize);
+    for c in 0..cycles {
+        let mut v = 0u32;
+        if (24..40).contains(&c) {
+            v |= (1 << 4) | (1 << 5); // W1
+        }
+        if c >= 44 {
+            v |= 1 << 8; // sync release
+        }
+        if (46..60).contains(&c) {
+            v |= 1 << 4; // W2
+        }
+        stim_values.push(v);
+    }
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config, 1, 5),
+        slots: 6,
+        cycles,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim { mask: (1 << 4) | (1 << 5) | (1 << 8), values: stim_values },
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![
+            (0, 0xE0FF, NOP_CANON_W), // nop, <d0 free>
+            (1, 0xFFE0, 0x2000),      // wait 0 gpio <idx free>
+            (2, 0xFFFF, 0x2088),      // wait 1 gpio 8
+            (3, 0xE0FF, NOP_CANON_W), // nop, <d3 free>
+            (4, 0xFFFF, 0xE000),      // set pins, 0
+            (5, 0xFFFF, 0xE001),      // set pins, 1
+        ],
+        seed_constraints: vec![],
+        memo_cap: 0,
+    };
+    // Witness: d0 = 0 (pre-W1 arrival), idx = 4, d3 = 0.
+    let mut w = [NOP_WORD; 32];
+    w[0] = NOP_CANON_W;
+    w[1] = 0x2004;
+    w[2] = 0x2088;
+    w[3] = NOP_CANON_W;
+    w[4] = 0xE000;
+    w[5] = 0xE001;
+    spec.expected = run_spec(&spec, w);
+    // Sanity: the W2 stall must be visible in the cadence (a pulse gap
+    // longer than the loop period).
+    assert_eq!(spec.expected[46] & 1, 0, "first pulse at 46");
+    assert_eq!(spec.expected[51] & 1, 1, "second pulse deferred by the W2 stall");
+
+    let off = search(&spec, 100_000);
+    assert!(!off.champion_cap_hit);
+    assert_champions_sound_widened(&spec, &off.champions);
+    // Champions: idx=4 for every d0 spelling (the prologue is
+    // trace-invisible), d3 = 0.
+    assert!(covered(&off.champions, &w), "witness (d0=0) lost memo-off — rig broken");
+    let mut w_rec = w;
+    w_rec[0] = NOP_CANON_W | 30 << 8; // a RECORDER-cohort d0
+    assert!(covered(&off.champions, &w_rec), "d0=30 witness lost memo-off — rig broken");
+
+    spec.memo_cap = 1 << 20;
+    let on = search(&spec, 100_000);
+    eprintln!(
+        "frame-open rig: off champs={} items={} | on champs={} items={} hits={} entries={} parts={} all_met={}",
+        off.champions.len(),
+        off.stats.items,
+        on.champions.len(),
+        on.stats.items,
+        on.stats.memo_hits,
+        on.stats.memo_entries,
+        on.stats.wait_partitions,
+        on.stats.wait_all_met,
+    );
+    for ch in &off.champions {
+        if !on.champions.contains(ch) {
+            eprintln!(
+                "  lost champion: v={:04x?} cons={:?}",
+                &ch.value[..6],
+                ch.constraints.as_slice()
+            );
+        }
+    }
+    assert!(
+        covered(&on.champions, &w_rec),
+        "E1 RED: a record from a CONSTRAINED frame refuted a larger-knowledge prober \
+         (frame-open set cond missing — the S1-analog hole)"
+    );
+    assert_eq!(
+        off.champions, on.champions,
+        "E1 RED: champion lists diverge between memo off/on"
+    );
+}
+
+/// Seed/trace round-trip (E1 amendment gate): a champion carrying a
+/// value-set constraint must survive serde (the narrow-split runner's
+/// JSONL unit lines re-read settled champions verbatim on resume),
+/// and a split search over a WAIT-bearing space must agree with the
+/// sequential search — frontier units carry their constraints as
+/// `EngineSpec::seed_constraints`.
+#[test]
+fn constraint_seed_and_serde_round_trip() {
+    use pio_superopt::narrow::engine::search_split;
+    let config = Config {
+        pins: PinMap { set_base: 0, set_count: 1, out_base: 0, out_count: 1, ..PinMap::default() },
+        ..Config::default()
+    };
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config, 0, 1),
+        slots: 2,
+        cycles: 8,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim { mask: (1 << 2) | (1 << 3), values: vec![(1 << 2) | (1 << 3)] },
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![
+            (0, 0xFFE0, 0x2000), // wait 0 gpio <idx free>
+            (1, 0xFFFF, 0xE000), // set pins, 0
+        ],
+        seed_constraints: vec![],
+        memo_cap: 1 << 20,
+    };
+    let mut w = [NOP_WORD; 32];
+    w[0] = 0x2001;
+    w[1] = 0xE000;
+    spec.expected = run_spec(&spec, w);
+
+    let seq = search(&spec, 10_000);
+    assert_eq!(seq.champions.len(), 1);
+    let ch = seq.champions[0];
+    assert!(!ch.constraints.is_empty(), "rig lost its constraint");
+
+    // serde round-trip, exactly the runner's champion path.
+    let json = serde_json::to_string(&seq.champions).expect("serialize champions");
+    let back: Vec<pio_superopt::narrow::engine::Champion> =
+        serde_json::from_str(&json).expect("deserialize champions");
+    assert_eq!(seq.champions, back, "champion constraints lost in serde round-trip");
+
+    // Constraint-carrying SEED: search the residual space under the
+    // champion's own constraint — must reproduce the same champion
+    // (this is the unit re-run shape).
+    let mut spec_seeded = spec.clone();
+    spec_seeded.seed_constraints = ch.constraints.as_slice().to_vec();
+    let re = search(&spec_seeded, 10_000);
+    assert_eq!(re.champions, seq.champions, "constraint-seeded re-run diverged");
+
+    // Split-vs-sequential on the WAIT-bearing space (units inherit
+    // constraints through UnitSeed).
+    let par = search_split(&spec, 10_000, 4);
+    assert_eq!(
+        par.stats.champions_found, seq.stats.champions_found,
+        "split champion count diverged on a WAIT-bearing space"
+    );
+    for m in [w, { let mut v = w; v[0] = 0x2004; v }] {
+        // idx=1 (witness, covered) and idx=4 (met too) both admitted?
+        let cov_seq = covered(&seq.champions, &m);
+        let cov_par = covered(&par.champions, &m);
+        assert_eq!(cov_seq, cov_par, "split/sequential coverage diverged on {:04x}", m[0]);
+    }
+    eprintln!(
+        "seed/serde round-trip: 1 champion, cons={:?}, split champs={} seq champs={}",
+        ch.constraints.as_slice(),
+        par.champions.len(),
+        seq.champions.len()
     );
 }

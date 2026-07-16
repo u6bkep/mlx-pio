@@ -2080,11 +2080,14 @@ fn stall_state_reads(stall: Stall) -> u16 {
     }
 }
 
-/// Per-slot consulted-condition set: `(mask, value)` of the DECIDED
-/// fields a subtree's evaluation read. The failure claim quantifies
-/// over everything else. `close_child` emits at most one entry per
-/// slot, in slot order — `RecList` packing relies on both.
-type Conds = Vec<(u8, u16, u16)>;
+/// Per-slot consulted-condition set, PACKED (see `pack_cond` /
+/// `pack_set_cond`): value conds `(mask, value)` on DECIDED fields the
+/// subtree read, plus set conds `(fmask, allowed)` on fields
+/// CONSTRAINED at frame open (012 §3). The failure claim quantifies
+/// over everything else. `close_child` emits at most one value cond
+/// and at most one set cond per slot, in (slot, value-before-set)
+/// order — `RecList` packing and `subsumes` rely on both.
+type Conds = Vec<u64>;
 
 /// The memo maps are hashed with FxHash: SipHash was ~25% of L=3
 /// search CPU (perf, 2026-07-12) and these keys carry no DoS surface.
@@ -2094,32 +2097,107 @@ type Conds = Vec<(u8, u16, u16)>;
 type FxMap<K, V> =
     std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
-/// Pack one cond as `slot << 32 | mask << 16 | value`.
+/// Pack one VALUE cond as `slot << 32 | mask << 16 | value` (bit 63
+/// clear). This singleton encoding is byte-identical pre-E1 — the hot
+/// probe path's common case is untouched.
 #[inline]
 fn pack_cond(s: u8, m: u16, v: u16) -> u64 {
     (s as u64) << 32 | (m as u64) << 16 | v as u64
 }
 
+/// Pack one SET cond (012 §3): discriminator bit 63 set, slot at bits
+/// 48..55, fmask at 32..47, the allowed raw-value set in the low 32.
+#[inline]
+fn pack_set_cond(s: u8, fmask: u16, allowed: u32) -> u64 {
+    (1u64 << 63) | (s as u64) << 48 | (fmask as u64) << 32 | allowed as u64
+}
+
+#[inline]
+fn cond_is_set(p: u64) -> bool {
+    p >> 63 != 0
+}
+
+#[inline]
+fn cond_slot(p: u64) -> u8 {
+    if cond_is_set(p) {
+        (p >> 48) as u8
+    } else {
+        (p >> 32) as u8
+    }
+}
+
+/// P ⊆ S probe test for a set cond (012 §3): the prober's knowledge of
+/// the field — decided singleton, constrained set, or the free full
+/// set — must be contained in the record's set. A free prober matches
+/// only a full-set cond, which emission never produces (a full
+/// frame-open set means no constraint existed) — kept exact anyway.
+#[inline]
+fn set_cond_admits(
+    decided: &[u16; 32],
+    value: &[u16; 32],
+    cons: &ConstraintSet,
+    s: usize,
+    fm: u16,
+    allowed: u32,
+) -> bool {
+    if decided[s] & fm == fm {
+        let raw = (value[s] & fm) >> fm.trailing_zeros();
+        allowed >> raw & 1 != 0
+    } else if let Some(a) = cons.get(s as u8, fm) {
+        a & !allowed == 0
+    } else {
+        let n = fm.count_ones();
+        let full = if n >= 5 { u32::MAX } else { (1u32 << (1u32 << n)) - 1 };
+        full & !allowed == 0
+    }
+}
+
+/// Does cond `pb` imply cond `pa` (every prober satisfying `pb`
+/// satisfies `pa`)? Same-slot only (caller aligns slots).
+/// value ⇒ value: pb demands at least pa's bits with pa's values.
+/// value ⇒ set: a pb-decided field is a singleton — member test.
+/// set ⇒ set: same field, Sb ⊆ Sa.
+/// set ⇒ value: never (a pb-matching prober may be undecided) —
+/// conservative; skipping an implication only costs list space.
+fn cond_implies(pb: u64, pa: u64) -> bool {
+    match (cond_is_set(pb), cond_is_set(pa)) {
+        (false, false) => {
+            let (ma, va) = ((pa >> 16) as u16, pa as u16);
+            let (mb, vb) = ((pb >> 16) as u16, pb as u16);
+            mb & ma == ma && vb & ma == va
+        }
+        (false, true) => {
+            let (fa, sa) = ((pa >> 32) as u16, pa as u32);
+            let (mb, vb) = ((pb >> 16) as u16, pb as u16);
+            mb & fa == fa && sa >> ((vb & fa) >> fa.trailing_zeros()) & 1 != 0
+        }
+        (true, true) => {
+            let (fa, sa) = ((pa >> 32) as u16, pa as u32);
+            let (fb, sb) = ((pb >> 32) as u16, pb as u32);
+            fb == fa && sb & !sa == 0
+        }
+        (true, false) => false,
+    }
+}
+
 /// Does record `a` subsume record `b` — does `a` fire on every item
-/// `b` fires on? True iff every cond of `a` is implied by a cond of
-/// `b` on the same slot: `b` demands at least `a`'s bits with the same
-/// values. Both packed lists are in ascending slot order.
+/// `b` fires on? True iff every cond of `a` is implied by some cond of
+/// `b` on the same slot. Both packed lists are in (slot, value-first)
+/// order; a slot carries at most one cond of each kind, so the
+/// same-slot scan below touches at most two entries.
 fn subsumes(a: &[u64], b: &[u64]) -> bool {
     let mut bi = 0usize;
     'conds: for &pa in a {
-        let (sa, ma, va) = ((pa >> 32) as u8, (pa >> 16) as u16, pa as u16);
-        while bi < b.len() {
-            let (sb, mb, vb) = ((b[bi] >> 32) as u8, (b[bi] >> 16) as u16, b[bi] as u16);
-            if sb < sa {
-                bi += 1;
-            } else if sb == sa {
-                if mb & ma == ma && vb & ma == va {
-                    continue 'conds;
-                }
-                return false;
-            } else {
-                return false;
+        let sa = cond_slot(pa);
+        while bi < b.len() && cond_slot(b[bi]) < sa {
+            bi += 1;
+        }
+        let mut j = bi;
+        while j < b.len() && cond_slot(b[j]) == sa {
+            if cond_implies(b[j], pa) {
+                continue 'conds;
             }
+            j += 1;
         }
         return false;
     }
@@ -2203,11 +2281,10 @@ impl RecList {
     /// unbound-safe record serves strictly more probers than a bound
     /// one). Skipping an absorption only costs list space, never
     /// soundness.
-    fn insert(&mut self, conds: &Conds, benefit: u32, bound: bool) -> i64 {
+    fn insert(&mut self, new_packed: &[u64], benefit: u32, bound: bool) -> i64 {
         // An existing record that subsumes the new one fires strictly
         // more often: the new record adds nothing. Keep the higher
         // benefit as the survivor's purge priority.
-        let new_packed: Vec<u64> = conds.iter().map(|&(s, m, v)| pack_cond(s, m, v)).collect();
         let mut benefit = benefit;
         for i in 0..self.recs.len() {
             if (!self.recs[i].bound || bound) && subsumes(self.conds_of(i), &new_packed) {
@@ -2448,29 +2525,38 @@ fn close_child(
         // filler-walk conds were 88% of all cond storage and pure
         // always-match scan overhead. Seeded bits INSIDE searched slots
         // stay: the binding fork mirrors those slots in the twin.)
+        //
+        // 012 §3 — the partition drop rule, generalized to FRAME-OPEN
+        // field knowledge: consulted bits UNDECIDED at frame open that
+        // a frame-open CONSTRAINT covers become a SET cond carrying the
+        // frame-open set (the subtree's claim is relative to it; prober
+        // match = P ⊆ S). Consulted undecided bits with NO frame-open
+        // constraint stay dropped: every partition below explored an
+        // exhaustive partition of the frame-open (free) set, by
+        // induction through the re-partition rule. Emitting the
+        // CURRENT set instead is the S1-analog hole — red-green pinned
+        // by `constraint_frame_open_set_conds`.
         let mut conds: Conds = Vec::new();
         for s in 0..search_slots as usize {
             let m = f.consulted_mask[s] & f.decided[s];
             if m != 0 {
-                conds.push((s as u8, m, f.consulted_value[s] & m));
+                conds.push(pack_cond(s as u8, m, f.consulted_value[s] & m));
+            }
+            let um = f.consulted_mask[s] & !f.decided[s];
+            if um != 0 {
+                for &(cs, cm, ca) in f.constraints.as_slice() {
+                    if cs as usize == s && cm & um != 0 {
+                        debug_assert!(ca.count_ones() >= 2, "singleton constraint survived");
+                        conds.push(pack_set_cond(cs, cm, ca));
+                    }
+                }
             }
         }
         let benefit = (stats.items - f.items_at_open).min(u32::MAX as u64) as u32;
-        // E1 TRANSITIONAL (commit 1, removed by the set-cond commit):
-        // a frame whose item carried a value-set constraint at open
-        // must express reads of that field as frame-open SET conds
-        // (ticket 012 §3). Until set-valued conds land, such frames
-        // simply do not record — sound (dropping records only loses
-        // pruning), and free-at-open frames stay recordable (their
-        // partitions below are exhaustive over the free set, so the
-        // decided-filter drop is sound for them, ticket 012 §3's
-        // induction). NOT propagated upward — unlike conflict poison,
-        // this is a per-frame emission limitation, not a claim defect.
-        let e1_recordable = f.constraints.is_empty();
-        if !f.any_champion && f.recordable && e1_recordable {
+        if !f.any_champion && f.recordable {
             stats.benefit_hist[(benefit.max(1).ilog2() as usize).min(31)] += 1;
         }
-        if !f.any_champion && f.recordable && e1_recordable && benefit >= *min_benefit {
+        if !f.any_champion && f.recordable && benefit >= *min_benefit {
             if (stats.memo_entries as usize) >= memo_cap {
                 if let Some(sn) = snap.as_mut() {
                     sn.write("purge", memo, *min_benefit, stats, frames);
@@ -2507,8 +2593,21 @@ fn close_child(
         // propagation is unsound against the cross-sibling clobber).
         parent.bound_seen |= f.bound_seen;
         parent.recordable &= f.recordable;
-        for &(s, m, v) in &conds {
-            parent.merge(s as usize, m, v);
+        for &p in &conds {
+            if cond_is_set(p) {
+                // Propagate the CONSULT (mask only): the parent's own
+                // finalize re-derives the set from ITS frame-open
+                // knowledge — its constraint snapshot, or the drop
+                // rule if the field was free at its open. The value
+                // bits are undecided at every enclosing frame (the
+                // field never decided above a live constraint), so
+                // the conflict check cannot false-fire.
+                let (s, fm) = (cond_slot(p) as usize, (p >> 32) as u16);
+                parent.merge(s, fm, f.consulted_value[s] & fm);
+            } else {
+                let (s, m, v) = (cond_slot(p) as usize, (p >> 16) as u16, p as u16);
+                parent.merge(s, m, v);
+            }
         }
         champ = f.any_champion;
     }
@@ -2557,8 +2656,16 @@ impl HitDump {
         }
         self.written += 1;
         let st = &key.2;
-        let conds_s: Vec<String> =
-            conds.iter().map(|&(s, m, v)| format!("[{s},{m:#06x},{v:#06x}]")).collect();
+        let conds_s: Vec<String> = conds
+            .iter()
+            .map(|&p| {
+                if cond_is_set(p) {
+                    format!("[{},{:#06x},\"S{:#010x}\"]", cond_slot(p), (p >> 32) as u16, p as u32)
+                } else {
+                    format!("[{},{:#06x},{:#06x}]", cond_slot(p), (p >> 16) as u16, p as u16)
+                }
+            })
+            .collect();
         let prober: Vec<String> = (0..slots as usize)
             .map(|s| format!("[{:#06x},{:#06x}]", it_decided[s], it_value[s]))
             .collect();
@@ -2780,12 +2887,37 @@ impl ProbeLog {
                     let fails: Vec<String> = (0..list.recs.len().min(4))
                         .map(|i| {
                             let benefit = list.recs[i].benefit;
+                            // NOTE: this diagnostic sees no prober
+                            // constraints, so set conds are judged on
+                            // decided-only knowledge (a constrained
+                            // prober may be reported as failing a set
+                            // cond it actually satisfies) — census
+                            // lines stay exact, detail lines are
+                            // best-effort.
                             let f = list.conds_of(i).iter().copied().find(|&p| {
-                                let (s, m, v) =
-                                    ((p >> 32) as usize, (p >> 16) as u16, p as u16);
-                                it_decided[s] & m != m || it_value[s] & m != v
+                                if cond_is_set(p) {
+                                    let (s, fm) = (cond_slot(p) as usize, (p >> 32) as u16);
+                                    !(it_decided[s] & fm == fm
+                                        && p as u32
+                                            >> ((it_value[s] & fm) >> fm.trailing_zeros())
+                                            & 1
+                                            != 0)
+                                } else {
+                                    let (s, m, v) =
+                                        ((p >> 32) as usize, (p >> 16) as u16, p as u16);
+                                    it_decided[s] & m != m || it_value[s] & m != v
+                                }
                             });
                             match f {
+                                Some(p) if cond_is_set(p) => {
+                                    let (s, fm) = (cond_slot(p) as usize, (p >> 32) as u16);
+                                    format!(
+                                        "{{\"slot\":{s},\"fmask\":{fm},\"want_set\":{},\"dec\":{},\"got\":{},\"benefit\":{benefit}}}",
+                                        p as u32,
+                                        it_decided[s] & fm,
+                                        it_value[s] & fm
+                                    )
+                                }
                                 Some(p) => {
                                     let (s, m, v) =
                                         ((p >> 32) as usize, (p >> 16) as u16, p as u16);
@@ -2906,6 +3038,9 @@ fn find_single_conflict(
                 }
                 let mut cand: Option<(usize, u16, u16)> = None;
                 for &p in list.conds_of(i) {
+                    if cond_is_set(p) {
+                        continue 'recs; // set conds: not a value-pair race
+                    }
                     let (s, m, v) = ((p >> 32) as usize, (p >> 16) as u16, p as u16);
                     if it.decided[s] & m != m {
                         continue 'recs; // undecided demand, not a pure pair
@@ -3875,7 +4010,16 @@ impl Snapshotter {
                             .conds_of(i)
                             .iter()
                             .map(|&p| {
-                                format!("[{},{},{}]", p >> 32, (p >> 16) as u16, p as u16)
+                                if cond_is_set(p) {
+                                    format!(
+                                        "[{},{},\"S{}\"]",
+                                        cond_slot(p),
+                                        (p >> 32) as u16,
+                                        p as u32
+                                    )
+                                } else {
+                                    format!("[{},{},{}]", p >> 32, (p >> 16) as u16, p as u16)
+                                }
                             })
                             .collect();
                         let pending = core
@@ -4487,17 +4631,27 @@ fn search_impl(
                             }
                             let conds = list.conds_of(i);
                             if conds.iter().all(|&p| {
-                                let (s, m, v) =
-                                    ((p >> 32) as usize, (p >> 16) as u16, p as u16);
-                                it.decided[s] & m == m && it.value[s] & m == v
+                                if !cond_is_set(p) {
+                                    // Value cond: the pre-E1 hot path,
+                                    // encoding untouched.
+                                    let (s, m, v) =
+                                        ((p >> 32) as usize, (p >> 16) as u16, p as u16);
+                                    it.decided[s] & m == m && it.value[s] & m == v
+                                } else {
+                                    // Set cond (012 §3): P ⊆ S.
+                                    let (s, fm) =
+                                        (cond_slot(p) as usize, (p >> 32) as u16);
+                                    set_cond_admits(
+                                        &it.decided,
+                                        &it.value,
+                                        &it.constraints,
+                                        s,
+                                        fm,
+                                        p as u32,
+                                    )
+                                }
                             }) {
-                                hit = Some((
-                                    conds
-                                        .iter()
-                                        .map(|&p| ((p >> 32) as u8, (p >> 16) as u16, p as u16))
-                                        .collect(),
-                                    mask,
-                                ));
+                                hit = Some((conds.to_vec(), mask));
                                 outcome = PROBE_HIT;
                                 break 'sets;
                             }
@@ -4568,8 +4722,20 @@ fn search_impl(
                 }
                 let top = frames.last_mut().expect("root frame");
                 top.state_reads |= rmask;
-                for &(s, m, v) in &conds {
-                    top.merge(s as usize, m, v);
+                for &p in &conds {
+                    if cond_is_set(p) {
+                        // The skipped subtree consulted the field; the
+                        // enclosing frames re-derive their own
+                        // frame-open sets at finalize (012 §3 —
+                        // sound: the prober's knowledge P ⊆ S shrank
+                        // from each ancestor's frame-open set through
+                        // exhaustive partitions on this very path).
+                        let (s, fm) = (cond_slot(p) as usize, (p >> 32) as u16);
+                        top.merge(s, fm, it.value[s] & fm);
+                    } else {
+                        let (s, m, v) = (cond_slot(p) as usize, (p >> 16) as u16, p as u16);
+                        top.merge(s, m, v);
+                    }
                 }
                 close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                 continue 'items;
