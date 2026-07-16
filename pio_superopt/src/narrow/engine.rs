@@ -1017,6 +1017,43 @@ fn wait_idx_groupable(decided: u16, value: u16, side_mask: u16) -> bool {
         && (value >> 5) & 0x3 < 2
 }
 
+/// Met-now evaluation of a groupable WAIT's index partition (012 E1):
+/// returns `(allowed, met)` raw-value sets for the slot's current
+/// allowed set against the concrete gpio state. The condition is the
+/// emulator's OWN predicate — `still_stalled` on a synthesized Wait
+/// stall is exec_op's WAIT condition verbatim, including the in_base
+/// mapping for pin waits.
+fn wait_met_now(
+    constraints: &ConstraintSet,
+    st: &NState,
+    cfg: &NCfg,
+    gpio_in: u32,
+    slot: u8,
+    w: u16,
+) -> (u32, u32) {
+    let pol = (w >> 7) & 1 != 0;
+    let src = (w >> 5) & 0x3;
+    debug_assert!(src < 2);
+    let allowed = constraints.get(slot, 0x001F).unwrap_or(u32::MAX);
+    debug_assert!(allowed != 0, "empty constraint on a live item");
+    let mut met = 0u32;
+    let mut sc = *st;
+    for raw in 0..32u8 {
+        if allowed >> raw & 1 == 0 {
+            continue;
+        }
+        sc.stall = if src == 0 {
+            Stall::WaitGpio { polarity: pol, index: raw }
+        } else {
+            Stall::WaitPin { polarity: pol, index: raw }
+        };
+        if !still_stalled(&sc, cfg, gpio_in) {
+            met |= 1 << raw;
+        }
+    }
+    (allowed, met)
+}
+
 /// Would the next `step` fetch `code[pc]`? (No pending delay, no forced
 /// word, and any stall resolves this cycle.)
 fn will_fetch(st: &NState, cfg: &NCfg, gpio_in: u32) -> bool {
@@ -4125,7 +4162,7 @@ fn junk_walk(
     mut y_prov: Prov,
     mut cnt_prov: CntProv,
     mut osr_cnt_prov: CntProv,
-    wcyc: &mut u64,
+    stats: &mut Stats,
     // Dead-demand census out-param: set when the walk's executing
     // words read the start item's armed tag registers. Only meaningful
     // to the caller when the walk refutes (a read seen before the
@@ -4152,7 +4189,7 @@ fn junk_walk(
         if it.cycle >= end {
             return false; // horizon or cap: never conclude from a walk
         }
-        *wcyc += 1;
+        stats.walk_cycles += 1;
         if let Some(&m) = irq_at.get(&it.cycle) {
             it.st.irq_flags |= m;
         }
@@ -4177,7 +4214,38 @@ fn junk_walk(
         }
         if fetching {
             if demand(it.decided[fetch_pc], it.value[fetch_pc], cfg).is_some() {
-                return false; // fetch-demand fork edge
+                // 012 E1 §4: a WaitIdx demand of a gpio/pin WAIT whose
+                // partition has a SINGLE nonempty class (every allowed
+                // index met now) is one outcome class for the whole
+                // family — the walk may continue; anything else is a
+                // fork edge, like every other demanded field. NOTE:
+                // on the current walk this is contract + measurement
+                // only — every WAIT is external-schedule-driven, so
+                // the `reads_external` bail below ends the walk this
+                // same cycle either way (a time-shifted family member
+                // may see different gpio). The rule becomes
+                // load-bearing only if the walk ever gains
+                // schedule-aware windows.
+                let wsm = if cfg.side_count > 0 {
+                    (((1u16 << cfg.side_count) - 1) << (5 - cfg.side_count)) << 8
+                } else {
+                    0
+                };
+                if wait_idx_groupable(it.decided[fetch_pc], it.value[fetch_pc], wsm) {
+                    let (allowed, met) = wait_met_now(
+                        &it.constraints, &it.st, cfg, gpio_in, fetch_pc as u8,
+                        it.value[fetch_pc],
+                    );
+                    if met == allowed {
+                        stats.walk_wait_continues += 1;
+                        // fall through: single class, no fork edge
+                    } else {
+                        stats.walk_wait_bails += 1;
+                        return false; // multi-class partition: fork edge
+                    }
+                } else {
+                    return false; // fetch-demand fork edge
+                }
             }
         }
         // 011 stage (b): the walk cannot collapse a tag — a word that
@@ -4817,36 +4885,9 @@ fn search_impl(
                 let mut wait_grouped = false;
                 if wait_idx_groupable(it.decided[fetch_pc], it.value[fetch_pc], side_mask) {
                     let w = it.value[fetch_pc];
-                    let pol = (w >> 7) & 1 != 0;
-                    let src = (w >> 5) & 0x3;
-                    let (allowed, had) = match it.constraints.get(fetch_pc as u8, 0x001F) {
-                        Some(a) => (a, true),
-                        None => (u32::MAX, false), // every raw 0..31 legal
-                    };
-                    debug_assert!(allowed != 0, "empty constraint on a live item");
-                    // Met-now evaluation per allowed index through the
-                    // emulator's OWN condition predicate:
-                    // `still_stalled` on a synthesized Wait stall is
-                    // exec_op's WAIT condition verbatim, including the
-                    // in_base mapping for pin waits — never
-                    // reimplemented here.
-                    let mut met = 0u32;
-                    {
-                        let mut sc = it.st;
-                        for raw in 0..32u8 {
-                            if allowed >> raw & 1 == 0 {
-                                continue;
-                            }
-                            sc.stall = if src == 0 {
-                                Stall::WaitGpio { polarity: pol, index: raw }
-                            } else {
-                                Stall::WaitPin { polarity: pol, index: raw }
-                            };
-                            if !still_stalled(&sc, &cfg, gpio_in) {
-                                met |= 1 << raw;
-                            }
-                        }
-                    }
+                    let (allowed, met) =
+                        wait_met_now(&it.constraints, &it.st, &cfg, gpio_in, fetch_pc as u8, w);
+                    let had = it.constraints.get(fetch_pc as u8, 0x001F).is_some();
                     // The partition consults the whole index field
                     // (every allowed value) against core-determined
                     // gpio (KeyCore latches + the deterministic stim
@@ -5712,7 +5753,7 @@ fn search_impl(
                     if junk_walk(
                         spec, &cfg, &irq_at, &it, delay_mask, memo_on,
                         &mut seg_mask, &mut seg_reads, x_prov, y_prov, cnt_prov, osr_cnt_prov,
-                        &mut stats.walk_cycles, &mut dd_walk_read,
+                        &mut stats, &mut dd_walk_read,
                     ) {
                         stats.refuted += 1;
                         stats.look_refuted += 1;
