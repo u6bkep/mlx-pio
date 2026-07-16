@@ -1201,3 +1201,206 @@ fn constraint_seed_and_serde_round_trip() {
         seq.champions.len()
     );
 }
+
+// --- 012 E2: side-field outcome grouping -----------------------------
+
+const SIDE_OPT_MASK: u16 = 0x1800;
+const SIDE_ENABLED_0: u16 = 0x1000;
+const SIDE_ENABLED_1: u16 = 0x1800;
+
+/// GREEN: with DI's output latch constant HIGH at every arrival,
+/// optional no-side and enabled side=1 are one outcome class. The
+/// grouped search must agree with three exact Side spellings, do less
+/// work than their separate searches, and retain a constraint that
+/// admits both known NOP champions.
+#[test]
+fn side_no_change_grouping_matches_exact_enumeration() {
+    use pio_superopt::ir::SideCfg;
+    let config = Config {
+        side: SideCfg { count: 2, en: true },
+        pins: PinMap { sideset_base: 0, ..PinMap::default() },
+        ..Config::default()
+    };
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config, 0, 0),
+        slots: 1,
+        cycles: 4,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![(0, 0x0700, 0)], // delay 0; Side/opcode/operands free
+        seed_constraints: vec![],
+        memo_cap: 1 << 20,
+    };
+    let mut witness = [NOP_WORD; 32];
+    witness[0] = NOP_CANON_W;
+    spec.expected = run_spec(&spec, witness);
+
+    let grouped = search(&spec, 200_000);
+    assert!(!grouped.champion_cap_hit);
+    assert_champions_sound_widened(&spec, &grouped.champions);
+    assert!(grouped.stats.side_partitions > 0, "E2 partition never fired");
+
+    let mut exact_items = 0u64;
+    let mut exact_verdicts = Vec::new();
+    for side in [0, SIDE_ENABLED_0, SIDE_ENABLED_1] {
+        let mut concrete = spec.clone();
+        concrete.seed.push((0, SIDE_OPT_MASK, side));
+        let r = search(&concrete, 200_000);
+        assert!(!r.champion_cap_hit);
+        exact_items += r.stats.items;
+        exact_verdicts.push(!r.champions.is_empty());
+    }
+    assert_eq!(exact_verdicts, vec![true, false, true], "exact Side census changed");
+    assert!(!grouped.champions.is_empty(), "grouped verdict differs from exact census");
+    assert!(
+        grouped.stats.items < exact_items,
+        "E2 did not collapse work: grouped={} exact-sum={exact_items}",
+        grouped.stats.items
+    );
+
+    let mut side1 = witness;
+    side1[0] |= SIDE_ENABLED_1;
+    let ch = grouped
+        .champions
+        .iter()
+        .find(|ch| ch.admits(&witness) && ch.admits(&side1))
+        .expect("known no-side/side=1 NOP champion pair was not grouped");
+    assert!(
+        ch.constraints.as_slice().contains(&(0, SIDE_OPT_MASK, (1 << 0) | (1 << 3))),
+        "known grouped champion lacks the no-side/side=1 constraint: {:?}",
+        ch.constraints.as_slice()
+    );
+    eprintln!(
+        "side GREEN: grouped items={} exact-sum={exact_items} champs={} side_parts={}",
+        grouped.stats.items,
+        grouped.champions.len(),
+        grouped.stats.side_partitions
+    );
+}
+
+/// RED / later-arrival canary: slot0's side=1 equals the HIGH latch on
+/// its first execution, slot1 drives DI LOW, and wrap-back re-executes
+/// slot0 with a different latch. The first partition is {no-side,
+/// side=1}; on re-arrival it MUST split, because only side=1 restores
+/// HIGH and reproduces the witness trace. A wrong implementation that
+/// trusts the old class (or executes its minimum no-side representative)
+/// loses the sole champion. Starting directly from the carried class
+/// also locks the split-layer seed path.
+#[test]
+fn side_constraint_reconsults_after_latch_changes_on_wrap() {
+    use pio_superopt::ir::SideCfg;
+    let config = Config {
+        side: SideCfg { count: 2, en: true },
+        pins: PinMap {
+            set_base: 0,
+            set_count: 1,
+            sideset_base: 0,
+            ..PinMap::default()
+        },
+        ..Config::default()
+    };
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config, 0, 1),
+        slots: 2,
+        cycles: 6,
+        inputs: vec![],
+        output_pins: vec![0],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![
+            (0, !SIDE_OPT_MASK, NOP_CANON_W), // NOP, Side free
+            (1, 0xFFFF, 0xE000),              // set pins, 0; no side
+        ],
+        seed_constraints: vec![],
+        memo_cap: 0,
+    };
+    let mut side1 = [NOP_WORD; 32];
+    side1[0] = NOP_CANON_W | SIDE_ENABLED_1;
+    side1[1] = 0xE000;
+    spec.expected = run_spec(&spec, side1);
+    assert_eq!(spec.expected.iter().map(|w| w & 1).collect::<Vec<_>>(), vec![1, 0, 1, 0, 1, 0]);
+
+    let mut stale_min = side1;
+    stale_min[0] = NOP_CANON_W;
+    assert_ne!(
+        run_spec(&spec, stale_min),
+        spec.expected,
+        "RED rig broken: stale no-side representative unexpectedly survives wrap-back"
+    );
+
+    let off = search(&spec, 10_000);
+    assert!(!off.champion_cap_hit);
+    assert_champions_sound_widened(&spec, &off.champions);
+    assert!(covered(&off.champions, &side1), "later-arrival side=1 champion lost");
+    assert!(
+        off.stats.side_partitions >= 2,
+        "Side class was not re-consulted after the latch changed"
+    );
+
+    // The exact class emitted at the first arrival, as carried by a
+    // frontier unit. It is all-no-change initially, then must split on
+    // wrap-back; a no-reconsult variant loses side=1 here.
+    let mut seeded = spec.clone();
+    seeded.seed_constraints = vec![(0, SIDE_OPT_MASK, (1 << 0) | (1 << 3))];
+    let from_seed = search(&seeded, 10_000);
+    assert!(
+        covered(&from_seed.champions, &side1),
+        "E2 RED: carried Side class survived stale and lost the changing-latch champion"
+    );
+
+    spec.memo_cap = 1 << 20;
+    let on = search(&spec, 10_000);
+    assert_eq!(off.champions, on.champions, "E2 RED: memo changed the champion set");
+    assert!(covered(&on.champions, &side1));
+    eprintln!(
+        "side RED: off/on champs={}/{} items={}/{} parts={} seeded_parts={}",
+        off.champions.len(),
+        on.champions.len(),
+        off.stats.items,
+        on.stats.items,
+        off.stats.side_partitions,
+        from_seed.stats.side_partitions
+    );
+}
+
+/// Scope guard: side-set-to-PINDIRS is deliberately outside E2. Even
+/// though this tiny rig happens to have a no-change direction spelling,
+/// the engine must use the ordinary concrete Side fork.
+#[test]
+fn side_pindir_falls_back_to_concrete_forking() {
+    use pio_superopt::ir::SideCfg;
+    let config = Config {
+        side: SideCfg { count: 2, en: true },
+        side_pindir: true,
+        pins: PinMap { sideset_base: 0, ..PinMap::default() },
+        ..Config::default()
+    };
+    let mut spec = EngineSpec {
+        cfg: cfg_for(config, 0, 0),
+        slots: 1,
+        cycles: 2,
+        inputs: vec![],
+        output_pins: vec![],
+        capture_pins: vec![0],
+        stim: Stim::default(),
+        irq_sets: vec![],
+        expected: vec![],
+        seed: vec![(0, !SIDE_OPT_MASK, NOP_CANON_W)],
+        seed_constraints: vec![],
+        memo_cap: 1 << 20,
+    };
+    let mut plain = [NOP_WORD; 32];
+    plain[0] = NOP_CANON_W;
+    spec.expected = run_spec(&spec, plain);
+    let r = search(&spec, 10_000);
+    assert!(!r.champion_cap_hit);
+    assert!(!r.champions.is_empty());
+    assert_eq!(r.stats.side_partitions, 0, "PINDIR side-set entered E2");
+    assert!(r.stats.fork_kinds[0] > 0, "ordinary Side fork did not run");
+}
