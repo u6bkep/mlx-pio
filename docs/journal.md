@@ -4,6 +4,26 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-16 — 2..2 re-proven under E1+E2 (28.03B items, 33 min = 4.7x/5.3x) + fresh mining for the 013 recut
+
+- Full 2..2 on post-E2 master (gated unit, 3.8G peak): REFUTED,
+  28.03B items / 1,969s / 31.8 effective cores — vs 132.0B / 2h55m
+  pre-E1. This IS the E1+E2 idle-box magnitude gate at scale.
+- Mining (docs/analysis/w22-post-e2-mining.md): **Delay now 76.2% of
+  forks** (BitCount 10.3%; Side 0.14%); duplicate CPU fell to
+  **41.5%** (was 63–71%) and **E2's side-only class = 0 groups** —
+  the collapse works end-to-end (frontier seeds carry the
+  {no-side, side1} constraint from birth; verified in dump_seeds).
+  Remaining dup is FLAT (76K × 82ms top group) — quotient prize
+  halved and per-copy value collapsed; the old exact-twin monsters
+  are gone (heavy end = 14 near-twins, not byte-identical).
+- 013 ruling input: v1 stands or falls on IN-UNIT delay-ladder
+  collapse — next evidence step is a DelayPair race census on this
+  bracket (~15 min instrumented), per the 07-13 "size by pair-race,
+  not fail-bit histograms" lesson.
+- Census-script note: seeds now carry constraints; tools keying on
+  `seed` alone see benign "identical seed" groups.
+
 ## 2026-07-16 — 008 §3b re-measured under E1+E2: STILL LOSES (2.5–3.0x wall) — walk chapter closed terminally
 
 - User picked the §3b re-test (both standing triggers had fired).

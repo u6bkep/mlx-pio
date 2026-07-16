@@ -64,13 +64,21 @@ kept for provenance. Detail: journal + ticket 008. Bonus: master-side
 runs = the deferred E1+E2 idle-box wall gates (L=3 9.5s/8.3s; 2..2
 ~40min-pace vs 2h55m pre-E1).
 
+## 2..2 re-proven post-E2 + mined (docs/analysis/w22-post-e2-mining.md)
+
+REFUTED again: 28.03B items / 33 min (4.7x items, 5.3x wall vs
+pre-E1) — the at-scale E1+E2 magnitude gate. **Delay = 76.2% of
+forks; duplicate CPU 41.5% (was 63–71%); E2's side-only class = 0
+groups** (constraint transport works end-to-end). Remaining dup is
+flat/cheap — quotient prize halved. Old exact-twin monsters gone.
+
 ## Queued (priority order)
 
-1. **013 v1 ruling** (recut ticket: in-unit Delay wall 74% is the
-   remaining named fork mass; v2 mechanism proven, its class dead;
-   split-layer evidence void). User call on build vs re-mine first
-   (a fresh 2..2 full run is ~40 min post-E2 and would give a
-   post-E1+E2 wall census for the recut).
+1. **013 v1 ruling.** Delay is 76% of in-unit forks and the only big
+   named mass left; all split-layer evidence for v1/v2 is dead. Next
+   evidence step (cheap, ~15 min): DelayPair race census on the
+   post-E2 2..2 to size v1's collapsible fraction BEFORE building
+   (07-13 lesson: pair races, not histograms). Then build-or-drop.
 3. L=4 ladder design: deeper frontier cycle (3+) before recursive
    split; decide bracket order; seed-quotient DISCUSSION (one-way
    door: verdict replication across proven-equivalent seeds) —
