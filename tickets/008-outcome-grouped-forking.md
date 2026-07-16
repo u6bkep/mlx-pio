@@ -75,6 +75,23 @@ STATUS "predicate-valued patterns".
    cycle-optimization pass lands on the evaluator (break-even is
    steps/kill × ns/step vs items-saved × µs/item; a faster step()
    moves it directly). Do not log-and-forget.**
+   **RE-MEASURED 2026-07-16 (trigger fired: E1+E2 changed per-item
+   economics) — VERDICT UNCHANGED, AND TERMINAL. Branch measure-3b
+   (kept): revert-of-revert + 3 drift fixes (tag-gate sw_fire — the
+   walk concrete-walks 011b placeholder registers, S7 canary caught
+   it; conservative walk read accounting; walk kills charge full
+   decided+state). Full suite green. Idle-box, post-E2 engine:
+   L=3 smokes 2.9–3.0x WORSE wall (9.5s→27.8s, 8.3s→24.8s); L=2
+   +23%; 2..2 15-min gated slices 105,265 vs 41,762 units settled
+   (2.52x, same 280,384-unit universe). Mechanism: steps/kill
+   IMPROVED to ~340 (was 563) but items-saved-per-kill collapsed to
+   0.72 (kill rate 79%) — E1/E2 already collapsed the co-refuting
+   redundancy the walk harvested; it now re-proves subtrees the
+   engine refutes in ~1 item. The depth-compounding premise is dead
+   too (item reduction 23%, was 50%). Memo hits also fell 14x under
+   walk records (partly the conservative port). WALK CHAPTER CLOSED
+   TERMINALLY: both triggers fired and the answer is the food supply
+   is gone, not the economics knob. 3c stays moot.**
 3c. **Adaptive walk budget (user, 2026-07-13) — MOOT while 3b is
    reverted**, but the two control knobs it would tune were
    identified empirically: where to fire (population kill-rate) and

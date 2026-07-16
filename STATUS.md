@@ -52,15 +52,25 @@ suite green, smokes byte-identical. Codex ops gotchas: reasoning
 effort defaults to NONE (override to high); worktree git metadata is
 outside its sandbox (commit on its behalf).
 
+## 008 §3b re-measured (2026-07-16): STILL LOSES — walk chapter closed TERMINALLY
+
+Both standing triggers consumed. Under E1+E2: L=3 wall 2.9–3.0x
+worse, 2..2 slice 2.52x fewer units settled; steps/kill improved
+(340) but items-saved-per-kill collapsed to 0.72 — E1/E2 ate the
+co-refuting redundancy the walk harvested. Port needed 3 drift fixes
+(tag-gate sw_fire — S7 canary caught the raw port concrete-walking
+011b placeholders; conservative read accounting). Branch measure-3b
+kept for provenance. Detail: journal + ticket 008. Bonus: master-side
+runs = the deferred E1+E2 idle-box wall gates (L=3 9.5s/8.3s; 2..2
+~40min-pace vs 2h55m pre-E1).
+
 ## Queued (priority order)
 
-1. **013 v1 next?** (recut ticket: in-unit Delay wall 74% is the
-   remaining named mass; v2 mechanism proven, class dead) — or
-   measurement session first now that E1+E2 shrank everything.
-   User call.
-2. E1+E2 idle-box wall-clock magnitude gates + 008 §3b re-measurement
-   (revert 95b1b32 to test) — box is free; the E2 frontier shrink
-   (−74.8% units) changes split economics, worth measuring together.
+1. **013 v1 ruling** (recut ticket: in-unit Delay wall 74% is the
+   remaining named fork mass; v2 mechanism proven, its class dead;
+   split-layer evidence void). User call on build vs re-mine first
+   (a fresh 2..2 full run is ~40 min post-E2 and would give a
+   post-E1+E2 wall census for the recut).
 3. L=4 ladder design: deeper frontier cycle (3+) before recursive
    split; decide bracket order; seed-quotient DISCUSSION (one-way
    door: verdict replication across proven-equivalent seeds) —

@@ -4,6 +4,37 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-16 — 008 §3b re-measured under E1+E2: STILL LOSES (2.5–3.0x wall) — walk chapter closed terminally
+
+- User picked the §3b re-test (both standing triggers had fired).
+  Port: branch `measure-3b` (kept; f403e50) = revert-of-revert of
+  95b1b32 + 3 drift fixes the 07-13 walk needed on the modern engine:
+  (1) **tag-gate sw_fire** — the walk concrete-walks 011b PLACEHOLDER
+  register values and bogusly refutes; found because the S7 canary
+  (p1_pruned_reads_must_be_consulted) went red on the raw port —
+  the red-green suite caught a real soundness hole in a measurement
+  branch, exactly as designed; (2) walk reads recorded as bare state
+  components (walk predates tags/counter provenance); (3) walk kills
+  charge full decided set + full state pattern (byte-identical-only
+  records; conservative, handicaps 3b's memo somewhat). Full suite
+  green after fixes.
+- **Results (idle box, post-E2 master vs +walk):** L=2 smokes +23%
+  wall; L=3 0..1 9.53s→27.78s (2.9x), 1..1 8.31s→24.76s (3.0x);
+  2..2 gated 15-min slices settled 105,265 vs 41,762 units (2.52x;
+  identical 280,384-unit universe, verified). Verdicts identical
+  everywhere.
+- **Mechanism: the walk's food supply is gone.** steps/kill IMPROVED
+  (563→~340) but items-saved-per-kill collapsed to 0.72 at 79% kill
+  rate — E1/E2 already collapse the co-refuting redundancy 3b
+  harvested; the walk now burns ~24B emulator cycles re-proving
+  subtrees the engine refutes in ~1 item. Item reduction is 23%
+  (was 50%) → the depth-compounding premise is dead as well.
+- Side benefit: the master-side runs double as the deferred E1+E2
+  idle-box wall-clock magnitude gates (L=3 25s/21s → 9.5s/8.3s vs
+  pre-E2; 2..2 on track for ~40 min vs 2h55m pre-E1 = ~4.4x).
+- Ticket 008 §3b updated: CLOSED TERMINALLY (triggers consumed);
+  3c stays moot. Traces in scratchpad only (throwaway).
+
 ## 2026-07-16 — 012 E2 LANDED (Codex gpt-5.6-sol): Side outcome partition; L=3 −61/−62%, frontier −74.8%
 
 - User ruled E2 next AND wanted Codex gpt-5.6-sol tested on an
