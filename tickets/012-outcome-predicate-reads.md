@@ -1,7 +1,9 @@
 # 012 — 008-B: outcome-predicate reads (value-set constraints)
 
-**Status:** stage 1 (E1) in implementation (2026-07-15 amendment
-below; stage 0 census landed dcaca96) · **Source:** dead-demand
+**Status:** stage 1 (E1) LANDED 2026-07-15 late (worktree commits
+1e9a7d9 substrate+partition, 1ca971c frame-open set conds red-green,
+3bdd880 walk rule; L=2 smokes −35.7%/−35.8% items, verdicts
+unchanged; irq-absence open check RESOLVED below) · **Source:** dead-demand
 census (merged ff6a4b3, journal 2026-07-13) + realness tests (2acc442);
 the read-rule half of ticket 011's superposition program. Line numbers
 below are against master @ 719d66c (engine.rs ~4750 lines,
@@ -97,10 +99,26 @@ micro-spec FIRST, per §3.
 - Stall-class future-grouping (grouping unmet waits by known
   completion cycle from the stim timeline) — needs future-environment
   reasoning; a later stage if the residue measures large.
-- WAIT irq (above). Open check: why were pol=0 irq waits absent from
-  the w12 orbits? (values_into for the idx field under src=irq /
-  canon / emulator semantics — answer in ~30 min of reading, do it
-  before any irq scoping.)
+- WAIT irq (above). Open check RESOLVED (2026-07-15, measured): the
+  w12 body can `jmp 0` back into the prologue slot (JMP targets
+  enumerate 0..slots), so orbit membership required vacuousness at
+  EVERY reachable execution cycle, not just the prologue cycle.
+  Unstimmed gpio/pin levels are time-invariant, but the irq plane is
+  written by both the environment AND the program: flag 0 is
+  stim-latched high from cycle 10 (pol-0 wait on it stalls on any
+  jmp-back re-execution), and flags 1..7 — never stimulated — are
+  settable by body `IRQ set k` words, so `wait 0 irq k` re-executed
+  after one stalls too. Evidence (master engine, re-derived w12
+  decomposition, byte-identical 1,383,452 units): unit fingerprints
+  (items, refuted, cycles_run, walk_cycles, tags_created) —
+  `wait 0 gpio 1 [1]` ≡ `mov pins,pins [1]` EXACTLY
+  (43,367,431 items, all five counters equal — the orbit);
+  `wait 0 irq 1 [1]` differs by −12,115 items (the irq-set→jmp-back
+  paths); `wait 0 irq 0 [1]` by −291,000 items and −125,200 tags (the
+  stim-latched flag). Not an engine artifact — a true semantic
+  non-equivalence. Consequence for any future irq scoping: pol-0 irq
+  grouping would have to condition on flag-plane WRITES (program +
+  stim), not just current flag state; E1's gpio/pin-only scope stands.
 - Delay ladders (73% of monster forks): the companion junk-window
   cleanliness relaxation ("reads with window-invariant values don't
   dirty the window") — separate ticket, sequenced after E1. The
