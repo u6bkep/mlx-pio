@@ -165,7 +165,25 @@ micro-spec FIRST, per §3.
   field against the concrete latch ({no-side, side==latch} → one
   constrained child). Candidate stage E2 — pending user ruling.**
 
-### Candidate stage E2 sketch (2026-07-16 — NOT ruled on, NOT built)
+### Stage E2 — LANDED 2026-07-16 (merge 2089f47; implemented by Codex gpt-5.6-sol per user's tooling test)
+
+Implemented as sketched below, plus one guard the sketch missed and
+Codex found on its own: the emulator applies side-set AFTER the
+opcode, so the fork-time latch compare needs the opcode to be unable
+to first overwrite a side pin (OUT/SET windows disjoint from the side
+window — the tx_a case — or a decided opcode proving no overlapping
+write; PINDIR side-set bails to concrete forking; OUT/MOV EXEC is
+safe because pending_exec words execute as a later step's
+instruction). Re-consult on every re-arrival; latches already in
+KeyCore so no new projected-state bit; frame-open set-cond rule as
+E1. Three red-green micro-specs (grouping-vs-exact-census,
+latch-changes-on-wrap re-consult + carried-seed variant, PINDIR
+fallback). Verified independently (suite green; byte-identical
+smokes): vs post-E1 baselines L=2 0..1 −34.7% / 1..1 −13.9%; L=3
+0..1 −60.8% / 1..1 −62.0%; 0..2 frontier −74.8% (280,384 units).
+Verdicts REFUTED everywhere. Report: docs/analysis/codex-e2-report.md.
+
+Original sketch (for provenance):
 
 Write-side twin of E1, same machinery end to end. At a Side-field
 fork (enable/value bits of the 5-bit shared field, `.side_set opt`):

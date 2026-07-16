@@ -4,6 +4,43 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-16 — 012 E2 LANDED (Codex gpt-5.6-sol): Side outcome partition; L=3 −61/−62%, frontier −74.8%
+
+- User ruled E2 next AND wanted Codex gpt-5.6-sol tested on an
+  implementation task. Ran `codex exec` (reasoning effort HIGH —
+  the config default was NONE, relaunched; session 019f6c04) in a
+  dedicated worktree with a self-contained brief (E2 sketch, E1
+  sites to mirror, red-green convention, gates + baselines).
+- **One-shot success, ~360K tokens.** Implemented the partition,
+  reused the E1 substrate cleanly, and FOUND A REAL HAZARD the brief
+  missed: emulator order is opcode-then-side-set, so the fork-time
+  latch compare needs an overwrite guard (OUT/SET window
+  disjointness, or decided opcode proving no overlapping pin write).
+  I verified the claims myself: mod.rs step() order confirmed;
+  OUT/MOV EXEC safe (pending_exec defers to a later step);
+  values_into already canonicalizes the dead disabled spelling so
+  E2's legal set matches.
+- Red-green micro-specs are genuinely adversarial (RED rig even
+  exercises the overlap guard's decided-opcode branch; re-consult
+  ≥2 partitions asserted; carried-seed path locked; memo on/off
+  champion identity). Note: asserts-correct-on-adversarial-spec
+  style, no compiled wrong-variant canary — same as several S-hole
+  tests.
+- **Independent verification: byte-identical to its report.** Suite
+  115 passed. vs post-E1: L=2 0..1 18,970,614 (−34.7%) / 1..1
+  18,586,940 (−13.9%); L=3 0..1 223,747,402 (−60.8%) / 1..1
+  194,050,234 (−62.0%); 0..2 frontier 1,113,608 → 280,384 (−74.8%).
+  vs PRE-E1: L=3 0..1 is 700.6M → 223.7M, 3.13x. Verdicts REFUTED
+  everywhere, cap_hit=false, overflows rare (≤0.085% of items).
+- Codex-as-implementer verdict: excellent on this task shape (precise
+  brief + existing pattern to mirror + hard gates). Gotchas: config
+  defaults to reasoning effort NONE (must override); sandbox can't
+  write the worktree's git metadata (lives under the main repo's
+  .git) — commit on its behalf; it reported the limitation honestly
+  rather than working around it.
+- Merged 2089f47 (branch commit 4920f24, authored to Codex); report
+  at docs/analysis/codex-e2-report.md; worktree/branch removed.
+
 ## 2026-07-16 — 013 evidence gate: CL7 SOLVED (side-spelling, not phase congruence); "delay-only" class never existed
 
 - Ran the cheap checks before building 013 (user-approved sequence).

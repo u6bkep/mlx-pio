@@ -38,22 +38,29 @@ evidence bin: pio_superopt/src/bin/evidence013.rs):
 - Reproduction gotcha: orbit joins for pre-E1 traces need a pre-E1
   dump_seeds (post-E1 master → 1,113,608 units ≠ trace's 1,383,452).
 
-## 012 E1 merged (9b5ded1) — see journal 07-15 for verification detail
+## 012 E1+E2 merged (9b5ded1, 2089f47) — engine collapses read AND write outcomes
 
-L=2 −35.7%/−35.8%, L=3 −18.5%/−19.3%, frontier −19.5%, verdicts
-unchanged. Wall-clock magnitude gates now UNBLOCKED (box idle).
-008 §3b re-measurement trigger has fired twice.
+E1: L=2 −35.7%/−35.8%, L=3 −18.5%/−19.3%, frontier −19.5%.
+**E2 (Side outcome partition, implemented by Codex gpt-5.6-sol —
+user tooling test, one-shot success; docs/analysis/codex-e2-report.md):
+on top of E1, L=2 0..1 −34.7% / 1..1 −13.9%; L=3 0..1 −60.8%
+(223.7M) / 1..1 −62.0% (194.1M); 0..2 frontier 1,113,608 → 280,384
+(−74.8%).** Combined vs pre-E1: L=3 0..1 700.6M → 223.7M (3.13x).
+Verdicts unchanged everywhere. Codex found the opcode-before-side-set
+ordering hazard itself (overwrite guard). Verified independently:
+suite green, smokes byte-identical. Codex ops gotchas: reasoning
+effort defaults to NONE (override to high); worktree git metadata is
+outside its sandbox (commit on its behalf).
 
 ## Queued (priority order)
 
-1. **USER RULING NEEDED: next engine lever = 012 E2 (Side outcome
-   partition, sketched in ticket 012) vs 013 v1 (window-cleanliness
-   relaxation, evidence recut).** E2 has the named mass and reuses
-   E1 machinery; v1 targets the 74% in-unit Delay wall with unknown
-   magnitude. Evidence gate is DONE (2026-07-16 journal entry).
-2. E1 idle-box wall-clock magnitude gates + 008 §3b re-measurement
-   (revert 95b1b32 to test) — box is now free; fold into the next
-   measurement session to amortize setup.
+1. **013 v1 next?** (recut ticket: in-unit Delay wall 74% is the
+   remaining named mass; v2 mechanism proven, class dead) — or
+   measurement session first now that E1+E2 shrank everything.
+   User call.
+2. E1+E2 idle-box wall-clock magnitude gates + 008 §3b re-measurement
+   (revert 95b1b32 to test) — box is free; the E2 frontier shrink
+   (−74.8% units) changes split economics, worth measuring together.
 3. L=4 ladder design: deeper frontier cycle (3+) before recursive
    split; decide bracket order; seed-quotient DISCUSSION (one-way
    door: verdict replication across proven-equivalent seeds) —
