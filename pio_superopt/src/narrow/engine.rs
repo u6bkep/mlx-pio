@@ -324,6 +324,20 @@ pub struct Stats {
     /// WAIT — so these are contract/measurement counters.)
     pub walk_wait_continues: u64,
     pub walk_wait_bails: u64,
+    /// 013 v1 sizing census — junk_walk bail attribution (counters
+    /// only, behavior-free). `ext_const` = external-read bails whose
+    /// read signal is TABLE-CONSTANT over the family's shift envelope
+    /// (v1's collapsible class; irq reads use the pulse schedule and
+    /// ignore flag-plane staleness, so this UNDERCOUNTS v1);
+    /// `ext_vary` = the read genuinely varies in-envelope; `latch` =
+    /// pin-latch value change; `fork` = any fork edge (fetch demand,
+    /// WaitIdx multi-class, tag value, deferred target, binding);
+    /// `cap` = horizon/cap/OOB-shift-inconclusive exits.
+    pub walk_bail_ext_const: u64,
+    pub walk_bail_ext_vary: u64,
+    pub walk_bail_latch: u64,
+    pub walk_bail_fork: u64,
+    pub walk_bail_cap: u64,
 }
 
 impl Stats {
@@ -4211,6 +4225,33 @@ fn reads_external(w: u16) -> bool {
     }
 }
 
+/// 013 v1 census predicate: is the external signal `w` reads
+/// TABLE-CONSTANT over `[t, t+env]`? Signal-specific where the read
+/// pin is decidable (JMP PIN, WAIT gpio/pin with decided index),
+/// whole-stim-window conservative for IN/MOV PINS, pulse-schedule
+/// check for irq reads (flag-plane staleness ignored — undercounts).
+/// Census only — never a collapse justification by itself.
+fn ext_read_constant(spec: &EngineSpec, cfg: &NCfg, w: u16, t: u32, env: u32) -> bool {
+    let hi = t.saturating_add(env).min(spec.cycles.saturating_sub(1));
+    let base = stim_at(&spec.stim, t);
+    let mut changed = 0u32;
+    for c in t..=hi {
+        changed |= stim_at(&spec.stim, c) ^ base;
+    }
+    let irq_quiet = !spec.irq_sets.iter().any(|&(c, _)| c >= t && c <= hi);
+    match w >> 13 {
+        0 => changed >> (cfg.jmp_pin as u32 & 31) & 1 == 0, // JMP PIN
+        1 => match (w >> 5) & 3 {
+            0 => changed >> (w as u32 & 31) & 1 == 0, // WAIT gpio
+            1 => changed >> ((cfg.in_base as u32 + (w as u32 & 31)) & 31) & 1 == 0, // WAIT pin
+            _ => irq_quiet, // WAIT irq (and jmppin variant: conservative)
+        },
+        2 | 5 => changed == 0, // IN PINS / MOV src PINS: whole window
+        6 => irq_quiet,        // IRQ op
+        _ => false,
+    }
+}
+
 /// Cycle cap for the junk-window collapse walk (measured co-refutation
 /// distance on tx_a L=3: avg ~60 cycles).
 const JUNK_WALK_CAP: u32 = 192;
@@ -4277,6 +4318,7 @@ fn junk_walk(
     let mut shift_points = 1u32;
     let refuted = loop {
         if it.cycle >= end {
+            stats.walk_bail_cap += 1;
             return false; // horizon or cap: never conclude from a walk
         }
         stats.walk_cycles += 1;
@@ -4300,6 +4342,7 @@ fn junk_walk(
             if it.cycle + shift_points * max_delay < spec.cycles {
                 break true; // every shifted spelling also fetches OOB
             }
+            stats.walk_bail_cap += 1;
             return false; // a shifted spelling may outlive the horizon
         }
         if fetching {
@@ -4331,9 +4374,11 @@ fn junk_walk(
                         // fall through: single class, no fork edge
                     } else {
                         stats.walk_wait_bails += 1;
+                        stats.walk_bail_fork += 1;
                         return false; // multi-class partition: fork edge
                     }
                 } else {
+                    stats.walk_bail_fork += 1;
                     return false; // fetch-demand fork edge
                 }
             }
@@ -4350,6 +4395,7 @@ fn junk_walk(
             let xw = it.st.pending_exec.unwrap_or(it.value[fetch_pc & 31]);
             let (nx, ny) = tag_value_needs(xw, &it.st, cfg);
             if (nx && it.tags.x.is_some()) || (ny && it.tags.y.is_some()) {
+                stats.walk_bail_fork += 1;
                 return false; // tag-value read: fork edge
             }
         }
@@ -4362,6 +4408,7 @@ fn junk_walk(
             let w = it.value[fetch_pc];
             if w >> 13 == 0 && jmp_taken(w, &it.st, cfg, gpio_in) {
                 if it.decided[fetch_pc] & 0x001F != 0x001F {
+                    stats.walk_bail_fork += 1;
                     return false; // deferred-target fork edge
                 }
                 if memo_on {
@@ -4373,6 +4420,11 @@ fn junk_walk(
         let exec_pending = it.st.pending_exec.is_some();
         if it.st.delay_count == 0 && peek_tick(&it.st, cfg) {
             if reads_external(exec_word) {
+                if ext_read_constant(spec, cfg, exec_word, it.cycle, shift_points * max_delay) {
+                    stats.walk_bail_ext_const += 1;
+                } else {
+                    stats.walk_bail_ext_vary += 1;
+                }
                 return false; // time-dependent read
             }
             if memo_on {
@@ -4399,6 +4451,7 @@ fn junk_walk(
                 is_pull_empty_read(it.value[fetch_pc & 31], &it.st, cfg) && it.st.x != it.st.y
             };
             if demands_binding {
+                stats.walk_bail_fork += 1;
                 return false; // binding fork edge
             }
         }
@@ -4409,6 +4462,7 @@ fn junk_walk(
             super::step(&mut it.st, cfg, gpio_in);
         }
         if (it.st.out_latch, it.st.dir_latch) != latches {
+            stats.walk_bail_latch += 1;
             return false; // latch value change: window unclean
         }
         let w = capture_word(&it.st, &spec.capture_pins, spec.stim.mask, ext);
@@ -4724,6 +4778,9 @@ fn search_impl(
             }
             if let Some(c) = pred_census.as_ref() {
                 c.print("beat");
+            }
+            if let Some(d) = pair_race.as_ref() {
+                d.print("beat");
             }
             last_beat = std::time::Instant::now();
         }
@@ -6168,6 +6225,11 @@ pub fn merge_stats(into: &mut Stats, s: &Stats) {
     into.constraint_overflows += s.constraint_overflows;
     into.walk_wait_continues += s.walk_wait_continues;
     into.walk_wait_bails += s.walk_wait_bails;
+    into.walk_bail_ext_const += s.walk_bail_ext_const;
+    into.walk_bail_ext_vary += s.walk_bail_ext_vary;
+    into.walk_bail_latch += s.walk_bail_latch;
+    into.walk_bail_fork += s.walk_bail_fork;
+    into.walk_bail_cap += s.walk_bail_cap;
 }
 
 /// Phase-1 product of the split driver: an early verdict, or the
