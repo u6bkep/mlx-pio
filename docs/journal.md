@@ -4,6 +4,34 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-16 — 013 sizing census: v1/v2 MEASURED OUT (0.4–0.5% headroom); walk dies of undecided neighbors
+
+- Built the sizing instrumentation (2277275, behavior-free — L=2 and
+  full 2..2 byte-identical items): walk_bail_* counters at
+  junk_walk's nine bail sites + the v1 constancy predicate
+  (ext_read_constant, signal-specific stim/irq table check over the
+  shift envelope) + pair-race beat print (was final-only; timeboxed
+  mines printed nothing — that cost one 15-min run to discover, and
+  a second to discover check() also needs PIO_NARROW_PROBE_LOG set;
+  the probe log hit 17GB on /data and got deleted after reading).
+- **Bail attribution (0..1 / 1..1 / 2..2): fork edges 99.30 / 99.53 /
+  99.56%; ext-read-CONSTANT (v1's whole class) 0.51 / 0.42 / 0.42%;
+  ext-vary ≤0.02%; latch ≤0.17%.** The walk doesn't die of dirty
+  windows — it dies of UNDECIDED NEIGHBOR SLOTS. v1 addresses <0.5%
+  of bails; v2's confirmed mechanism is unreachable (fork edge kills
+  the walk before any stall can absorb a shift). Ticket 013 marked
+  MEASURED OUT — recommend close.
+- Pair-race census (recursive, 15-min 2..2 mine): **delay-only
+  conflict class EXTINCT** (0 races — stage 2's delay-agnostic
+  records already strip delay conds); surviving wall is cross-opcode,
+  80–82% full co-refutation, only 26–34% external-input-free →
+  record-side signal (008 stage 3 / 012 outcome conds), not a walk
+  signal.
+- Net for the Delay wall (76% of forks): it is generated at DEMAND
+  time against undecided slots. Lever families that can touch it:
+  012 stage 1 (JMP zero-test predicates), record-side outcome conds,
+  or demand-time delay grouping (new design). Ruling needed.
+
 ## 2026-07-16 — 2..2 re-proven under E1+E2 (28.03B items, 33 min = 4.7x/5.3x) + fresh mining for the 013 recut
 
 - Full 2..2 on post-E2 master (gated unit, 3.8G peak): REFUTED,

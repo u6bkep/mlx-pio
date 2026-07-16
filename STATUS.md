@@ -72,13 +72,25 @@ forks; duplicate CPU 41.5% (was 63–71%); E2's side-only class = 0
 groups** (constraint transport works end-to-end). Remaining dup is
 flat/cheap — quotient prize halved. Old exact-twin monsters gone.
 
+## 013 sizing census DONE (2026-07-16): v1/v2 MEASURED OUT — recommend close
+
+Bail attribution (0..1/1..1/2..2): **fork edges 99.3–99.6%; v1's
+ext-read-constant class 0.4–0.5%**; latch/vary/cap noise. The walk
+dies of UNDECIDED NEIGHBORS, not dirty windows; v2's confirmed
+mechanism is unreachable. Pair races: delay-only conflict class
+EXTINCT; surviving wall = cross-opcode, 80–82% co-refute, only
+26–34% ext-free → RECORD-SIDE signal. Instrumentation permanent
+(walk_bail_* stats, 2277275, verified inert). Ticket 013 updated.
+
 ## Queued (priority order)
 
-1. **013 v1 ruling.** Delay is 76% of in-unit forks and the only big
-   named mass left; all split-layer evidence for v1/v2 is dead. Next
-   evidence step (cheap, ~15 min): DelayPair race census on the
-   post-E2 2..2 to size v1's collapsible fraction BEFORE building
-   (07-13 lesson: pair races, not histograms). Then build-or-drop.
+1. **RULING: next lever for the Delay wall (76% of forks).** It is
+   demand-time fork mass against undecided slots — walk amendments
+   can't reach it. Candidates: (a) 012 stage 1 JMP zero-test
+   predicates (queued, designed); (b) record-side outcome conds
+   (008 stage 3 record side — now re-motivated by the pair-race
+   80% co-refute w/ env consults); (c) close 013 and move to the
+   L=4 ladder design with current engine (E1+E2 = 4.7x at 2..2).
 3. L=4 ladder design: deeper frontier cycle (3+) before recursive
    split; decide bracket order; seed-quotient DISCUSSION (one-way
    door: verdict replication across proven-equivalent seeds) —

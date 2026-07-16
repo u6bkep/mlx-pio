@@ -1,7 +1,39 @@
 # 013 — junk-window cleanliness: known-constant reads don't dirty the window
 
-**Status:** design — **RECUT REQUIRED after the 2026-07-16 evidence
-gate (see §Evidence gate results); sequencing decision back to user.**
+**Status:** **MEASURED OUT 2026-07-16 — recommend CLOSE (see §Sizing
+census). v1's collapsible class is 0.4–0.5% of walk bails on every
+bracket; fork edges are 99.3–99.6%. Neither v1 nor v2 can reach the
+Delay wall through this walk.**
+
+## Sizing census (2026-07-16, post-E2 engine; commit 2277275)
+
+Permanent `walk_bail_*` counters at junk_walk's nine bail sites, with
+the v1 constancy predicate (stim-table/irq-schedule check over the
+family shift envelope) applied at the external-read site.
+Instrumentation-inert: L=2 0..1 and full 2..2 byte-identical items.
+
+| bracket | walks refute | bail: fork edge | ext CONST (v1) | ext vary | latch |
+|---|---:|---:|---:|---:|---:|
+| L3 0..1 | 68.9% | 99.30% | 0.51% | 0.01% | 0.17% |
+| L3 1..1 | 70.2% | 99.53% | 0.42% | 0.01% | 0.05% |
+| L3 2..2 | 3.0% | **99.56%** | **0.42%** | 0.02% | 0.00% |
+
+The walk does not die of dirty windows — it dies of UNDECIDED
+NEIGHBORS (fetch-demand fork edges). Relaxing window cleanliness (v1)
+or absorbing shifts at stalls (v2 — mechanism emulator-confirmed but
+unreachable: the walk bails at a fork edge long before a stall can
+absorb anything) addresses <0.5% of bails. The Delay fork wall (76%)
+is generated at demand time against undecided slots; no junk-walk
+amendment touches it.
+
+Companion pair-race census (same session): the delay-only conflict
+class is EXTINCT at the record layer (0 races found — stage 2's
+delay-agnostic records already strip those conds); the surviving
+cond-miss wall is cross-opcode with 80–82% full co-refutation, of
+which only 26–34% are external-input-free — i.e. most co-refuting
+record-sharing opportunities DO consult the environment and co-refute
+anyway. That is a RECORD-SIDE (008 stage 3 / 012 outcome-conds)
+signal, not a walk signal.
 · **Source:** w12 seed-orbit analysis (docs/analysis/w12-seed-orbits.md);
 companion to the 012 E1 amendment. This is an amendment to 008 stage 2
 (junk-window collapse, 89f97c9), not new machinery.
