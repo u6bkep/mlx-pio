@@ -1,5 +1,13 @@
 # w02 (L=3, wrap 0..2) trace mining + seed orbits — 2026-07-15
 
+> **CORRECTED 2026-07-16 — read §CORRECTION first.** The "delay-only
+> class" and "CL7 d≡d+24 congruence" interpretations below are WRONG:
+> under `.side_set 1 opt` the 5-bit field is enable(12)|side(11)|
+> delay(10:8), and the re-census with side bits separated shows the
+> entire "delay-only" class is SIDE-SPELLING (side-1-vs-none); the
+> true-delay-only class has ZERO groups. Measured numbers stand;
+> interpretations are superseded by the CORRECTION section.
+
 Companion to `narrow-split-w12-unit-mining.md` and `w12-seed-orbits.md`.
 Trace: `/data/pio_optimization/runs/narrow-split-l3-w02.jsonl` (1.09 GB,
 complete). Engine rev **024bb2a (pre-E1)** — same engine as w12, so the
@@ -90,6 +98,66 @@ period check + emulator step on one pair).
 4. **Seed quotient before phase 2** remains the general split-layer
    answer (all redundancy is s0-variation); its proof engine is still
    the equiv() supported_config extension (queue #5).
+
+## CORRECTION (2026-07-16) — CL7 solved; the "delay-only" class never existed
+
+Evidence session (bin: `pio_superopt/src/bin/evidence013.rs`; scripts:
+`tools/find_delay_pairs.py`, `tools/side_vs_delay_census.py`):
+
+**The field decode.** tx_a is `.side_set 1 opt`: the 5-bit shared
+field is enable(bit12) | side(bit11) | delay(bits 10:8). "+24" in that
+field is 0b11000 = **side-set enable + side 1**, not delay arithmetic.
+The orbit classifier's "delay" region (0x1F00) conflated them.
+
+**CL7 resolved.** The twins are `wait 1 irq 0 side 1` (the shipped
+tx_a slot-0 instruction) vs plain `wait 1 irq 0` (encodings confirmed:
+0x38C0/0x20C0; side0=0x30C0). The irq schedule has NO 24-cycle period
+(gaps 15,15,30,12,8,...). CL7 is a **known-value side-set write
+no-op** — DI idles high, `side 1` re-writes 1 — the CL1/CL2
+state-conditioned family, not a phase congruence.
+
+**Re-census with side bits separated (both brackets):**
+
+| bucket | w12 | w02 |
+|---|---|---|
+| side-only (bits 12:11) | **18.16%** | **28.90%** |
+| TRUE-delay-only (bits 10:8) | **0 groups** | **0 groups** |
+| other bits involved | 71.35% | 58.27% |
+| shape-varies | 10.49% | 12.83% |
+
+The old "delay-only" classes (18.1% / 28.8%) match the side-only
+buckets to the decimal — they were side-spelling all along. The
+heavy-pair scan found 2,969 same-shape pairs in w02, every one with
+xor exactly 0x1800; zero true-delay pairs.
+
+**The identity is latch-conditioned, not universal.** Trace
+differential over sampled completions: side1-vs-plain diverges on
+968/3200 (side0 control: 3200/3200) — `side 1` is invisible only
+while the DI latch holds 1; wrap-back after a completion drove DI low
+exposes it. Unit-level byte-identity holds anyway because surviving
+items must match the golden trace, which pins the latch at every
+arrival. The engine knows the latch concretely at fork time, so an
+**E1-shaped outcome partition on the Side field** ({no side-set,
+side==latch} → one constrained child; {side≠latch} → concrete) is
+computable exactly, reusing the landed constraint substrate.
+
+**013 v2 self-sync mechanism: CONFIRMED at the emulator** — with a
+stalling WAIT downstream, slot-0 delay shifts d=1..7 produce zero
+trace divergence; with a visible write first, all 7 diverge. But the
+split-layer class it was hypothesized to explain is gone; v2's value
+is now in-unit only, unquantified.
+
+**Revised lever ranking (supersedes "Implications" above):**
+1. **Side outcome rule** (write-side E1 analog) — named split-layer
+   mass 18–29% of redundant CPU, plus unmeasured in-unit subtree
+   duplication (Side forks are only 0.03% of forks but sit high in
+   trees, doubling everything beneath them).
+2. 013 recut required: v1's split-layer evidence was a side-artifact;
+   its remaining target is the in-unit Delay fork wall (74%). v2:
+   mechanism proven, motivating class dead.
+3. Seed-quotient CL7 lemma = known-value write (CL1 family) — likely
+   provable with the existing conditional-lemma machinery, no
+   supported_config extension needed for THIS class.
 
 ## Fork attribution (sum over units)
 

@@ -4,6 +4,40 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-16 — 013 evidence gate: CL7 SOLVED (side-spelling, not phase congruence); "delay-only" class never existed
+
+- Ran the cheap checks before building 013 (user-approved sequence).
+  Bin: pio_superopt/src/bin/evidence013.rs; write-up:
+  docs/analysis/w02-mining-and-orbits.md §CORRECTION.
+- **The 5-bit field under `.side_set 1 opt` is enable(12)|side(11)|
+  delay(10:8) — "+24" = enable+side1.** The w02 twin monsters are
+  `wait 1 irq 0 side 1` (= shipped tx_a slot 0) vs plain. irq gaps
+  have no 24-period. CL7 = known-value side-set write no-op
+  (CL1-family), latch-conditioned: side1-vs-plain diverges on
+  968/3200 random completions (side0 control 3200/3200); unit-level
+  byte-identity holds because golden-trace survival pins the latch.
+- **Re-census with side bits separated: the "delay-only" classes
+  were side-spelling to the decimal (w12 18.16%, w02 28.90%);
+  TRUE-delay-only = 0 groups in BOTH brackets.** 2,969 heavy w02
+  pairs all xor=0x1800; zero true-delay pairs.
+- **013 v2 mechanism CONFIRMED at the emulator** (stalling WAIT
+  absorbs slot-0 delay shifts exactly; visible-write control exposes
+  all) — but its motivating split-layer class is dead; v2 is an
+  in-unit lever candidate only. 013 v1's split-layer evidence void;
+  its remaining target = in-unit Delay wall (74% of forks),
+  magnitude unquantified. Ticket 013 marked RECUT REQUIRED.
+- **Displaced lever: write-side E1 analog on the Side field**
+  (outcome partition vs concrete latch, {no-side, side==latch} → one
+  constrained child; reuses E1 substrate verbatim, no emulator call).
+  Sketched as candidate 012 stage E2 — NOT ruled on, NOT built.
+  Named mass 18–29% split-layer + unmeasured in-unit (Side forks
+  0.03% of forks but high in trees).
+- Yesterday's banked interpretation (commit 9263383: "delay-only
+  largest class, v2 top lever") is superseded; correction notes
+  added in-place to the analysis doc, tickets 012/013, STATUS,
+  memory. Lesson: region-based field classification must respect
+  the side-set overlay — [[sideset-encoding]] strikes again.
+
 ## 2026-07-16 (early) — w02 REFUTED: L=3 ladder COMPLETE (6/6) — footprint ≤3 impossible for tx_a
 
 - 0..2 monster finished 23:23 (9,982s resumed segment; run header rev

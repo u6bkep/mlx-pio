@@ -11,17 +11,28 @@ All six wrap brackets proven. Caveat as always: current-fidelity
 semantics (post shift-counter fix). **L=4 rediscovery ladder is
 unlocked.** No run in flight; box is idle.
 
-## w02 mined (docs/analysis/w02-mining-and-orbits.md)
+## w02 mined + 013 EVIDENCE GATE RUN — CL7 SOLVED, tickets recut
 
-- 012 prediction slot filled: duplicate CPU 63.4% (predicted "well
-  below 71%" — WRONG in spirit). Prologue story dead; mass mutated:
-  **delay-only class 18.1%→28.8% (largest)**; the 126-word no-op
-  alphabet reappeared IN-LOOP (7×126 orbits, 24.5%) → alphabet is
-  loop-invariant; E1 + 013 apply to ALL brackets.
-- **CL7 (d≡d+24) now on STALLING waits**: the bracket's two heaviest
-  units (517.3M items each, byte-identical) are `wait 1 irq 0` seeds
-  24 apart in delay — the 013 v2 shift-absorption shape at the top of
-  the cost table. Verification is cheap and unlocks v2's evidence gate.
+docs/analysis/w02-mining-and-orbits.md (§CORRECTION is authoritative;
+evidence bin: pio_superopt/src/bin/evidence013.rs):
+
+- Duplicate CPU 63.4% (prediction "well below 71%" wrong in spirit);
+  126-word no-op alphabet is LOOP-INVARIANT (24.5% of dup, 7×126
+  orbits); E1's met-now grouping kills its 124 WAIT members.
+- **CL7 ≠ phase congruence. `.side_set 1 opt` ⇒ field =
+  enable(12)|side(11)|delay(10:8); "+24" = side-1 spelling.** The
+  twin monsters = shipped slot-0 `wait 1 irq 0 side 1` vs plain.
+  Latch-conditioned known-value write (CL1 family): diverges on 30%
+  of random completions; unit-identity via golden-trace conditioning.
+- **"Delay-only" class NEVER EXISTED: re-census = side-only 18.16%
+  (w12) / 28.90% (w02), true-delay-only 0 groups in both.**
+- **013 v2 mechanism CONFIRMED** (stall absorbs delay shifts exactly)
+  but its class is dead → ticket 013 RECUT REQUIRED; v1's remaining
+  target = in-unit Delay wall (74% of forks), magnitude unknown.
+- **New top lever candidate: 012 stage E2 (sketched, NOT ruled on):**
+  write-side E1 analog — Side-field outcome partition vs concrete
+  latch; reuses E1 substrate verbatim; named mass 18–29% split-layer
+  + unmeasured in-unit. AWAITING USER RULING: E2 vs 013 v1 order.
 - Scheduling profile = w12 (top 1% ≈ 91% CPU); recursive-split verdict
   unchanged. Effective-cores metric is bogus on resumed traces.
 - Reproduction gotcha: orbit joins for pre-E1 traces need a pre-E1
@@ -35,14 +46,14 @@ unchanged. Wall-clock magnitude gates now UNBLOCKED (box idle).
 
 ## Queued (priority order)
 
-1. **013 evidence gate + v1 build** (user-ruled next engine work):
-   verify CL7 24-cycle congruence against spec.expected + step the
-   emulator on one delay-only group (self-sync) and on the wait-irq
-   twins; then v1 (constant-read windows). Delay is 74% of forks and
-   delay-shaped classes are ~60% of redundant CPU — top lever.
+1. **USER RULING NEEDED: next engine lever = 012 E2 (Side outcome
+   partition, sketched in ticket 012) vs 013 v1 (window-cleanliness
+   relaxation, evidence recut).** E2 has the named mass and reuses
+   E1 machinery; v1 targets the 74% in-unit Delay wall with unknown
+   magnitude. Evidence gate is DONE (2026-07-16 journal entry).
 2. E1 idle-box wall-clock magnitude gates + 008 §3b re-measurement
-   (revert 95b1b32 to test) — box is now free; fold into the first
-   013 measurement session to amortize setup.
+   (revert 95b1b32 to test) — box is now free; fold into the next
+   measurement session to amortize setup.
 3. L=4 ladder design: deeper frontier cycle (3+) before recursive
    split; decide bracket order; seed-quotient DISCUSSION (one-way
    door: verdict replication across proven-equivalent seeds) —

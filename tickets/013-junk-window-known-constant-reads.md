@@ -1,10 +1,38 @@
 # 013 — junk-window cleanliness: known-constant reads don't dirty the window
 
-**Status:** design (small ticket-let; sequenced AFTER 012/E1 merges —
-user ruling 2026-07-15) · **Source:** w12 seed-orbit analysis
-(docs/analysis/w12-seed-orbits.md); companion to the 012 E1 amendment.
-This is an amendment to 008 stage 2 (junk-window collapse, 89f97c9),
-not new machinery.
+**Status:** design — **RECUT REQUIRED after the 2026-07-16 evidence
+gate (see §Evidence gate results); sequencing decision back to user.**
+· **Source:** w12 seed-orbit analysis (docs/analysis/w12-seed-orbits.md);
+companion to the 012 E1 amendment. This is an amendment to 008 stage 2
+(junk-window collapse, 89f97c9), not new machinery.
+
+## Evidence gate results (2026-07-16) — ran before building, per plan
+
+Bin: `pio_superopt/src/bin/evidence013.rs`; full write-up:
+docs/analysis/w02-mining-and-orbits.md §CORRECTION.
+
+- **v2's mechanism is REAL:** at the emulator, a stalling WAIT
+  downstream absorbs slot-0 delay shifts exactly (d=1..7, zero trace
+  divergence); a visible write first exposes all 7. Shift-absorption
+  is confirmed physics.
+- **But v2's motivating class is DEAD:** the "delay-only" redundancy
+  class (18.1% w12 / 28.8% w02) was a classifier artifact — under
+  `.side_set 1 opt`, bits 12:11 of the "delay" region are SIDE-SET.
+  Re-census with the bits separated: side-only spelling = the entire
+  class (to the decimal); **true-delay-only = 0 groups in both
+  brackets**. "CL7 d≡d+24" = side-1-vs-none (known-value write,
+  latch-conditioned; ~30% of random completions diverge — unit-level
+  identity comes from golden-trace conditioning).
+- **Consequences for this ticket:** the split-layer evidence in §Why
+  is void. v1's remaining justification is the IN-UNIT Delay fork
+  wall (74% of fork mass — real, but its collapse magnitude through
+  window-cleanliness relaxation is now unquantified). v2 keeps its
+  proven mechanism but loses its named mass; treat as an in-unit
+  lever candidate only.
+- **The displaced lever:** a write-side E1 analog on the Side field
+  (outcome partition against the concrete latch) now owns the named
+  18–29% split-layer mass — candidate 012 stage E2, sketched in
+  ticket 012. Ranking E2 vs this ticket's v1 is a user decision.
 
 ## Why
 

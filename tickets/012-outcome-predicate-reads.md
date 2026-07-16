@@ -156,6 +156,39 @@ micro-spec FIRST, per §3.
   matter for ALL brackets, not just prologue-bearing ones; the
   delay-only/self-sync class (013 v2) is now the single largest named
   redundancy class. Details: docs/analysis/w02-mining-and-orbits.md.
+  **CORRECTION (2026-07-16, same doc §CORRECTION): the "delay-only"
+  class was a classifier artifact — under `.side_set 1 opt` bits
+  12:11 are side-set; the re-census shows it is 100% SIDE-SPELLING
+  (side-1-vs-none, a latch-conditioned known-value write) and the
+  true-delay-only class has ZERO groups in both w12 and w02. The
+  named lever is a write-side E1 analog: outcome-partition the Side
+  field against the concrete latch ({no-side, side==latch} → one
+  constrained child). Candidate stage E2 — pending user ruling.**
+
+### Candidate stage E2 sketch (2026-07-16 — NOT ruled on, NOT built)
+
+Write-side twin of E1, same machinery end to end. At a Side-field
+fork (enable/value bits of the 5-bit shared field, `.side_set opt`):
+the observable outcome of issuing the instruction depends on the
+side write only through (written pins' new levels vs current
+latches). Partition the field's allowed values by outcome:
+**{no side-set} ∪ {side == current latch}** are outcome-identical →
+ONE child carrying `Constraint(slot, side_field_mask, set)`;
+values that CHANGE a latch fork concretely (each is a distinct
+outcome). All E1 substrate reuses verbatim: set-valued memo conds
+(the fmask<<32 encoding is field-agnostic), P⊆S probing, frame-open
+drop rule, seeds carry constraints, Champion::words() min-member.
+Soundness shape is also E1's: the partition is valid at THIS node
+given the concrete latch; re-execution paths re-consult (same
+argument as met-now WAIT re-arrival; the S1-analog red-green needs a
+side-set variant — a spec where the latch differs on wrap-back so
+the collapsed set must NOT survive frame-open).
+Named mass: 18–29% of redundant split-layer CPU (w12/w02 re-census)
+plus unmeasured in-unit duplication — Side forks are 0.03% of forks
+but sit high in trees. Cost estimate: small fraction of E1 (the
+partition test is a latch compare, no emulator call needed).
+Interaction with delay bits: the Side partition must NOT touch delay
+bits 10:8 (Delay fork kind owns them); mask discipline as in E1.
 
 ---
 
