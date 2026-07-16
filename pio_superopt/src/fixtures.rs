@@ -502,6 +502,7 @@ pub fn tx_a_narrow_spec(cycles: u32) -> (crate::narrow::engine::EngineSpec, Side
         irq_sets,
         expected: vec![],
         seed: vec![],
+        seed_constraints: vec![],
         memo_cap: 1 << 20,
     };
     (spec, side)

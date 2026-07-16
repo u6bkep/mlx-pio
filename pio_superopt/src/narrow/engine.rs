@@ -93,6 +93,16 @@ pub struct EngineSpec {
     /// when a binding fork executes — post-filter if the seed spelling
     /// is load-bearing.
     pub seed: Vec<(u8, u16, u16)>,
+    /// Value-set constraints carried into the root item (ticket 012
+    /// E1): `(slot, fmask, allowed)` — bit i of `allowed` ⇔ raw value
+    /// i of the field is still possible. v1 scope: only the index
+    /// field (fmask 0x001F) of a seeded WAIT gpio/pin slot. The split
+    /// driver's frontier units REQUIRE this: a phase-1 champion that
+    /// closed inside a met-now WAIT class must hand its class to the
+    /// unit re-run, or the unit re-forks the sibling classes and
+    /// duplicates other units' subtrees and champions. Validated at
+    /// search entry (`validate_seed`).
+    pub seed_constraints: Vec<(u8, u16, u32)>,
     /// Consulted-set memo capacity in entries (0 disables). Records are
     /// FAILURE-ONLY (an exhausted, champion-free subtree keyed by its
     /// fork state + the decided fields it consulted) and benefit-gated:
@@ -101,6 +111,73 @@ pub struct EngineSpec {
     /// instead of freezing. Dropping records only loses pruning, never
     /// soundness.
     pub memo_cap: usize,
+}
+
+/// Cap on simultaneous value-set constraints per item (ticket 012 §2).
+/// Overflow collapses the OLDEST constraint (forks its allowed set
+/// fully, freeing the entry) — bounded and deterministic;
+/// `Stats::constraint_overflows` gates it staying rare.
+pub const CONSTRAINT_CAP: usize = 3;
+
+/// A small fixed set of per-field value-set constraints
+/// `(slot, fmask, allowed)` — bit i of `allowed` ⇔ raw value i of the
+/// field is still possible. The lattice point between decided
+/// (singleton) and free (all of `values_into`): tags answer WHERE a
+/// register's value comes from, constraints answer WHAT is known about
+/// a field's value (ticket 012 §5). Entries keep insertion order
+/// (index 0 = oldest); removal shifts and zeroes the tail so the
+/// derived Eq/Hash see one canonical form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+pub struct ConstraintSet {
+    len: u8,
+    entries: [(u8, u16, u32); CONSTRAINT_CAP],
+}
+
+impl ConstraintSet {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    #[inline]
+    pub fn as_slice(&self) -> &[(u8, u16, u32)] {
+        &self.entries[..self.len as usize]
+    }
+    #[inline]
+    pub fn get(&self, slot: u8, fmask: u16) -> Option<u32> {
+        self.as_slice().iter().find(|&&(s, m, _)| s == slot && m == fmask).map(|&(_, _, a)| a)
+    }
+    #[inline]
+    fn full(&self) -> bool {
+        self.len as usize == CONSTRAINT_CAP
+    }
+    /// Insert or replace the entry for (slot, fmask). A NEW entry
+    /// requires a free slot — the caller handles the full case first
+    /// (collapse-oldest overflow fork).
+    fn set(&mut self, slot: u8, fmask: u16, allowed: u32) {
+        debug_assert!(allowed != 0, "empty allowed set");
+        for e in &mut self.entries[..self.len as usize] {
+            if e.0 == slot && e.1 == fmask {
+                e.2 = allowed;
+                return;
+            }
+        }
+        assert!((self.len as usize) < CONSTRAINT_CAP, "constraint overflow unhandled");
+        self.entries[self.len as usize] = (slot, fmask, allowed);
+        self.len += 1;
+    }
+    /// Drop the entry for (slot, fmask) if present (the field decided).
+    fn remove(&mut self, slot: u8, fmask: u16) {
+        if let Some(i) = self.as_slice().iter().position(|&(s, m, _)| s == slot && m == fmask) {
+            self.remove_index(i);
+        }
+    }
+    fn remove_index(&mut self, i: usize) {
+        for j in i..self.len as usize - 1 {
+            self.entries[j] = self.entries[j + 1];
+        }
+        self.len -= 1;
+        self.entries[self.len as usize] = (0, 0, 0);
+    }
 }
 
 /// A surviving candidate subspace: decided fields plus don't-cares.
@@ -114,12 +191,36 @@ pub struct Champion {
     /// path: the register-mirror of this subspace (swap X/Y in every
     /// decided field, `mirror_word`) reproduces the trace too.
     pub binding_free: bool,
+    /// Surviving value-set constraints (ticket 012 E1): each entry
+    /// narrows an UNDECIDED field to a member set — the champion
+    /// covers |allowed| completions of that field, not the full
+    /// don't-care width. (serde default: pre-E1 traces read as
+    /// unconstrained.)
+    #[serde(default)]
+    pub constraints: ConstraintSet,
 }
 
 impl Champion {
-    /// Materialize the canonical concrete program (don't-cares = 0).
+    /// Materialize the canonical concrete program: don't-cares = 0,
+    /// constrained fields = their MINIMUM allowed member (raw 0 may be
+    /// outside the set — ticket 012 §4's `words()` fix).
     pub fn words(&self) -> [u16; 32] {
-        self.value
+        let mut w = self.value;
+        for &(s, m, a) in self.constraints.as_slice() {
+            w[s as usize] |= (a.trailing_zeros() as u16) << m.trailing_zeros();
+        }
+        w
+    }
+    /// Does this champion subspace cover the concrete program? The
+    /// decided-bits match plus every constraint admitting the word's
+    /// field value. Coverage checks must use this, not a bare
+    /// decided-mask compare, once constraints exist.
+    pub fn admits(&self, words: &[u16; 32]) -> bool {
+        (0..32).all(|s| words[s] & self.decided[s] == self.value[s])
+            && self.constraints.as_slice().iter().all(|&(s, m, a)| {
+                let raw = (words[s as usize] & m) >> m.trailing_zeros();
+                a >> raw & 1 != 0
+            })
     }
 }
 
@@ -200,6 +301,23 @@ pub struct Stats {
     /// conflict in their consulted union (`Frame::merge`) — the
     /// conflict-poison source the S2-relaxed `recordable` carries.
     pub merge_conflicts: u64,
+    /// 012 E1 met-now WAIT grouping: WaitIdx partitions that FORKED
+    /// (met class + unmet singles), and partitions where every allowed
+    /// index was met now (one class, no fork — the cycle continued on
+    /// a representative).
+    pub wait_partitions: u64,
+    pub wait_all_met: u64,
+    /// Constraint-block overflows (cap `CONSTRAINT_CAP`): the oldest
+    /// constraint was collapsed (its allowed set forked fully) to free
+    /// an entry. Gate: this must stay rare.
+    pub constraint_overflows: u64,
+    /// junk_walk WaitIdx-demand encounters (012 E1 §4): partitions
+    /// with a single nonempty class let the walk continue; multi-class
+    /// partitions bail as a fork edge. (On the current walk both paths
+    /// end the walk this same cycle — `reads_external` bails every
+    /// WAIT — so these are contract/measurement counters.)
+    pub walk_wait_continues: u64,
+    pub walk_wait_bails: u64,
 }
 
 impl Stats {
@@ -287,6 +405,12 @@ struct Item {
     dd_id: u32,
     /// x/y provenance tags (011 stage b) — see [`RegTags`].
     tags: RegTags,
+    /// Value-set constraints (ticket 012 E1) — see [`ConstraintSet`].
+    /// Written only by the WaitIdx met-now partition; refined
+    /// monotonically (a later partition intersects), consumed when the
+    /// field decides. Constraints ride binding twins unchanged: the
+    /// only constrained field (WAIT index) is mirror-invariant.
+    constraints: ConstraintSet,
 }
 
 /// A forkable bit-field of one slot: contiguous `mask`, candidate raw
@@ -876,6 +1000,60 @@ fn demand(decided: u16, value: u16, cfg: &NCfg) -> Option<Field> {
     None
 }
 
+/// Is this (partial) slot word at the E1 met-now grouping point
+/// (ticket 012): side/opcode/pol/src decided, opcode = WAIT, source =
+/// gpio or pin, index field still undecided? Demand order guarantees
+/// pol/src decide before the index is ever demanded, so when this is
+/// true the WaitIdx demand is the next fetch demand. WAIT irq is
+/// explicitly out of scope (its met arm CLEARS a per-index flag —
+/// each index is its own outcome class).
+#[inline]
+fn wait_idx_groupable(decided: u16, value: u16, side_mask: u16) -> bool {
+    decided & side_mask == side_mask
+        && decided & 0xE000 == 0xE000
+        && (value >> 13) & 0x7 == 1
+        && decided & 0x00E0 == 0x00E0
+        && decided & 0x001F != 0x001F
+        && (value >> 5) & 0x3 < 2
+}
+
+/// Met-now evaluation of a groupable WAIT's index partition (012 E1):
+/// returns `(allowed, met)` raw-value sets for the slot's current
+/// allowed set against the concrete gpio state. The condition is the
+/// emulator's OWN predicate — `still_stalled` on a synthesized Wait
+/// stall is exec_op's WAIT condition verbatim, including the in_base
+/// mapping for pin waits.
+fn wait_met_now(
+    constraints: &ConstraintSet,
+    st: &NState,
+    cfg: &NCfg,
+    gpio_in: u32,
+    slot: u8,
+    w: u16,
+) -> (u32, u32) {
+    let pol = (w >> 7) & 1 != 0;
+    let src = (w >> 5) & 0x3;
+    debug_assert!(src < 2);
+    let allowed = constraints.get(slot, 0x001F).unwrap_or(u32::MAX);
+    debug_assert!(allowed != 0, "empty constraint on a live item");
+    let mut met = 0u32;
+    let mut sc = *st;
+    for raw in 0..32u8 {
+        if allowed >> raw & 1 == 0 {
+            continue;
+        }
+        sc.stall = if src == 0 {
+            Stall::WaitGpio { polarity: pol, index: raw }
+        } else {
+            Stall::WaitPin { polarity: pol, index: raw }
+        };
+        if !still_stalled(&sc, cfg, gpio_in) {
+            met |= 1 << raw;
+        }
+    }
+    (allowed, met)
+}
+
 /// Would the next `step` fetch `code[pc]`? (No pending delay, no forced
 /// word, and any stall resolves this cycle.)
 fn will_fetch(st: &NState, cfg: &NCfg, gpio_in: u32) -> bool {
@@ -1240,6 +1418,51 @@ fn validate_seed(spec: &EngineSpec) {
         for &(m, name) in fields {
             whole(m, name);
         }
+    }
+    // Seed constraints (ticket 012 E1): well-formedness per the
+    // amendment — within values_into (every WaitIdx raw 0..31 is
+    // legal, so any nonempty proper subset qualifies), nonempty,
+    // consistent with the slot's decided bits, and only on the E1
+    // field (the index of a seeded WAIT gpio/pin).
+    assert!(
+        spec.seed_constraints.len() <= CONSTRAINT_CAP,
+        "EngineSpec::seed_constraints: more than {CONSTRAINT_CAP} entries"
+    );
+    for &(s, fm, allowed) in &spec.seed_constraints {
+        assert!(
+            s < spec.slots,
+            "seed constraint slot {s} is outside the searched footprint (slots = {})",
+            spec.slots
+        );
+        let (d, v) = (dm[s as usize], vm[s as usize]);
+        assert!(
+            fm == 0x001F
+                && d & 0xE000 == 0xE000
+                && (v >> 13) & 0x7 == 1
+                && d & 0x00E0 == 0x00E0
+                && (v >> 5) & 0x3 < 2,
+            "seed constraint on slot {s}: value-set constraints exist only for the index \
+             field (fmask 0x001F) of a seeded WAIT gpio/pin (E1 scope)"
+        );
+        assert!(
+            d & fm == 0,
+            "seed constraint on slot {s} overlaps decided bits {:#06x}",
+            d & fm
+        );
+        assert!(allowed != 0, "seed constraint on slot {s}: empty allowed set");
+        assert!(
+            allowed.count_ones() >= 2,
+            "seed constraint on slot {s}: singleton set — seed it as a decided field"
+        );
+        assert!(
+            allowed != u32::MAX,
+            "seed constraint on slot {s}: the full set is vacuous — omit the entry"
+        );
+        assert_eq!(
+            spec.seed_constraints.iter().filter(|&&(s2, m2, _)| s2 == s && m2 == fm).count(),
+            1,
+            "seed constraint on slot {s}: duplicate (slot, fmask) entries"
+        );
     }
 }
 
@@ -1894,11 +2117,14 @@ fn stall_state_reads(stall: Stall) -> u16 {
     }
 }
 
-/// Per-slot consulted-condition set: `(mask, value)` of the DECIDED
-/// fields a subtree's evaluation read. The failure claim quantifies
-/// over everything else. `close_child` emits at most one entry per
-/// slot, in slot order — `RecList` packing relies on both.
-type Conds = Vec<(u8, u16, u16)>;
+/// Per-slot consulted-condition set, PACKED (see `pack_cond` /
+/// `pack_set_cond`): value conds `(mask, value)` on DECIDED fields the
+/// subtree read, plus set conds `(fmask, allowed)` on fields
+/// CONSTRAINED at frame open (012 §3). The failure claim quantifies
+/// over everything else. `close_child` emits at most one value cond
+/// and at most one set cond per slot, in (slot, value-before-set)
+/// order — `RecList` packing and `subsumes` rely on both.
+type Conds = Vec<u64>;
 
 /// The memo maps are hashed with FxHash: SipHash was ~25% of L=3
 /// search CPU (perf, 2026-07-12) and these keys carry no DoS surface.
@@ -1908,32 +2134,107 @@ type Conds = Vec<(u8, u16, u16)>;
 type FxMap<K, V> =
     std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
-/// Pack one cond as `slot << 32 | mask << 16 | value`.
+/// Pack one VALUE cond as `slot << 32 | mask << 16 | value` (bit 63
+/// clear). This singleton encoding is byte-identical pre-E1 — the hot
+/// probe path's common case is untouched.
 #[inline]
 fn pack_cond(s: u8, m: u16, v: u16) -> u64 {
     (s as u64) << 32 | (m as u64) << 16 | v as u64
 }
 
+/// Pack one SET cond (012 §3): discriminator bit 63 set, slot at bits
+/// 48..55, fmask at 32..47, the allowed raw-value set in the low 32.
+#[inline]
+fn pack_set_cond(s: u8, fmask: u16, allowed: u32) -> u64 {
+    (1u64 << 63) | (s as u64) << 48 | (fmask as u64) << 32 | allowed as u64
+}
+
+#[inline]
+fn cond_is_set(p: u64) -> bool {
+    p >> 63 != 0
+}
+
+#[inline]
+fn cond_slot(p: u64) -> u8 {
+    if cond_is_set(p) {
+        (p >> 48) as u8
+    } else {
+        (p >> 32) as u8
+    }
+}
+
+/// P ⊆ S probe test for a set cond (012 §3): the prober's knowledge of
+/// the field — decided singleton, constrained set, or the free full
+/// set — must be contained in the record's set. A free prober matches
+/// only a full-set cond, which emission never produces (a full
+/// frame-open set means no constraint existed) — kept exact anyway.
+#[inline]
+fn set_cond_admits(
+    decided: &[u16; 32],
+    value: &[u16; 32],
+    cons: &ConstraintSet,
+    s: usize,
+    fm: u16,
+    allowed: u32,
+) -> bool {
+    if decided[s] & fm == fm {
+        let raw = (value[s] & fm) >> fm.trailing_zeros();
+        allowed >> raw & 1 != 0
+    } else if let Some(a) = cons.get(s as u8, fm) {
+        a & !allowed == 0
+    } else {
+        let n = fm.count_ones();
+        let full = if n >= 5 { u32::MAX } else { (1u32 << (1u32 << n)) - 1 };
+        full & !allowed == 0
+    }
+}
+
+/// Does cond `pb` imply cond `pa` (every prober satisfying `pb`
+/// satisfies `pa`)? Same-slot only (caller aligns slots).
+/// value ⇒ value: pb demands at least pa's bits with pa's values.
+/// value ⇒ set: a pb-decided field is a singleton — member test.
+/// set ⇒ set: same field, Sb ⊆ Sa.
+/// set ⇒ value: never (a pb-matching prober may be undecided) —
+/// conservative; skipping an implication only costs list space.
+fn cond_implies(pb: u64, pa: u64) -> bool {
+    match (cond_is_set(pb), cond_is_set(pa)) {
+        (false, false) => {
+            let (ma, va) = ((pa >> 16) as u16, pa as u16);
+            let (mb, vb) = ((pb >> 16) as u16, pb as u16);
+            mb & ma == ma && vb & ma == va
+        }
+        (false, true) => {
+            let (fa, sa) = ((pa >> 32) as u16, pa as u32);
+            let (mb, vb) = ((pb >> 16) as u16, pb as u16);
+            mb & fa == fa && sa >> ((vb & fa) >> fa.trailing_zeros()) & 1 != 0
+        }
+        (true, true) => {
+            let (fa, sa) = ((pa >> 32) as u16, pa as u32);
+            let (fb, sb) = ((pb >> 32) as u16, pb as u32);
+            fb == fa && sb & !sa == 0
+        }
+        (true, false) => false,
+    }
+}
+
 /// Does record `a` subsume record `b` — does `a` fire on every item
-/// `b` fires on? True iff every cond of `a` is implied by a cond of
-/// `b` on the same slot: `b` demands at least `a`'s bits with the same
-/// values. Both packed lists are in ascending slot order.
+/// `b` fires on? True iff every cond of `a` is implied by some cond of
+/// `b` on the same slot. Both packed lists are in (slot, value-first)
+/// order; a slot carries at most one cond of each kind, so the
+/// same-slot scan below touches at most two entries.
 fn subsumes(a: &[u64], b: &[u64]) -> bool {
     let mut bi = 0usize;
     'conds: for &pa in a {
-        let (sa, ma, va) = ((pa >> 32) as u8, (pa >> 16) as u16, pa as u16);
-        while bi < b.len() {
-            let (sb, mb, vb) = ((b[bi] >> 32) as u8, (b[bi] >> 16) as u16, b[bi] as u16);
-            if sb < sa {
-                bi += 1;
-            } else if sb == sa {
-                if mb & ma == ma && vb & ma == va {
-                    continue 'conds;
-                }
-                return false;
-            } else {
-                return false;
+        let sa = cond_slot(pa);
+        while bi < b.len() && cond_slot(b[bi]) < sa {
+            bi += 1;
+        }
+        let mut j = bi;
+        while j < b.len() && cond_slot(b[j]) == sa {
+            if cond_implies(b[j], pa) {
+                continue 'conds;
             }
+            j += 1;
         }
         return false;
     }
@@ -2017,11 +2318,10 @@ impl RecList {
     /// unbound-safe record serves strictly more probers than a bound
     /// one). Skipping an absorption only costs list space, never
     /// soundness.
-    fn insert(&mut self, conds: &Conds, benefit: u32, bound: bool) -> i64 {
+    fn insert(&mut self, new_packed: &[u64], benefit: u32, bound: bool) -> i64 {
         // An existing record that subsumes the new one fires strictly
         // more often: the new record adds nothing. Keep the higher
         // benefit as the survivor's purge priority.
-        let new_packed: Vec<u64> = conds.iter().map(|&(s, m, v)| pack_cond(s, m, v)).collect();
         let mut benefit = benefit;
         for i in 0..self.recs.len() {
             if (!self.recs[i].bound || bound) && subsumes(self.conds_of(i), &new_packed) {
@@ -2095,6 +2395,14 @@ struct Frame {
     /// at-or-above-decided fields as record conditions (fields forked
     /// below drop out here: all their values were explored).
     decided: [u16; 32],
+    /// Value-set constraints at fork time (ticket 012 §3): together
+    /// with `decided` this is the FRAME-OPEN field knowledge. A cond
+    /// on a field constrained at open must be expressed as the
+    /// frame-open SET (the subtree's claim is relative to it), never
+    /// as a "current" set — the S1-analog hazard: constraints live on
+    /// the item and cross frames, so a current-set cond would let an
+    /// enclosing frame record a condition its own key state predates.
+    constraints: ConstraintSet,
     /// Children pushed and not yet accounted.
     children_left: u32,
     /// Union of consulted (mask, value) per slot across the subtree.
@@ -2254,11 +2562,31 @@ fn close_child(
         // filler-walk conds were 88% of all cond storage and pure
         // always-match scan overhead. Seeded bits INSIDE searched slots
         // stay: the binding fork mirrors those slots in the twin.)
+        //
+        // 012 §3 — the partition drop rule, generalized to FRAME-OPEN
+        // field knowledge: consulted bits UNDECIDED at frame open that
+        // a frame-open CONSTRAINT covers become a SET cond carrying the
+        // frame-open set (the subtree's claim is relative to it; prober
+        // match = P ⊆ S). Consulted undecided bits with NO frame-open
+        // constraint stay dropped: every partition below explored an
+        // exhaustive partition of the frame-open (free) set, by
+        // induction through the re-partition rule. Emitting the
+        // CURRENT set instead is the S1-analog hole — red-green pinned
+        // by `constraint_frame_open_set_conds`.
         let mut conds: Conds = Vec::new();
         for s in 0..search_slots as usize {
             let m = f.consulted_mask[s] & f.decided[s];
             if m != 0 {
-                conds.push((s as u8, m, f.consulted_value[s] & m));
+                conds.push(pack_cond(s as u8, m, f.consulted_value[s] & m));
+            }
+            let um = f.consulted_mask[s] & !f.decided[s];
+            if um != 0 {
+                for &(cs, cm, ca) in f.constraints.as_slice() {
+                    if cs as usize == s && cm & um != 0 {
+                        debug_assert!(ca.count_ones() >= 2, "singleton constraint survived");
+                        conds.push(pack_set_cond(cs, cm, ca));
+                    }
+                }
             }
         }
         let benefit = (stats.items - f.items_at_open).min(u32::MAX as u64) as u32;
@@ -2302,8 +2630,21 @@ fn close_child(
         // propagation is unsound against the cross-sibling clobber).
         parent.bound_seen |= f.bound_seen;
         parent.recordable &= f.recordable;
-        for &(s, m, v) in &conds {
-            parent.merge(s as usize, m, v);
+        for &p in &conds {
+            if cond_is_set(p) {
+                // Propagate the CONSULT (mask only): the parent's own
+                // finalize re-derives the set from ITS frame-open
+                // knowledge — its constraint snapshot, or the drop
+                // rule if the field was free at its open. The value
+                // bits are undecided at every enclosing frame (the
+                // field never decided above a live constraint), so
+                // the conflict check cannot false-fire.
+                let (s, fm) = (cond_slot(p) as usize, (p >> 32) as u16);
+                parent.merge(s, fm, f.consulted_value[s] & fm);
+            } else {
+                let (s, m, v) = (cond_slot(p) as usize, (p >> 16) as u16, p as u16);
+                parent.merge(s, m, v);
+            }
         }
         champ = f.any_champion;
     }
@@ -2352,8 +2693,16 @@ impl HitDump {
         }
         self.written += 1;
         let st = &key.2;
-        let conds_s: Vec<String> =
-            conds.iter().map(|&(s, m, v)| format!("[{s},{m:#06x},{v:#06x}]")).collect();
+        let conds_s: Vec<String> = conds
+            .iter()
+            .map(|&p| {
+                if cond_is_set(p) {
+                    format!("[{},{:#06x},\"S{:#010x}\"]", cond_slot(p), (p >> 32) as u16, p as u32)
+                } else {
+                    format!("[{},{:#06x},{:#06x}]", cond_slot(p), (p >> 16) as u16, p as u16)
+                }
+            })
+            .collect();
         let prober: Vec<String> = (0..slots as usize)
             .map(|s| format!("[{:#06x},{:#06x}]", it_decided[s], it_value[s]))
             .collect();
@@ -2575,12 +2924,37 @@ impl ProbeLog {
                     let fails: Vec<String> = (0..list.recs.len().min(4))
                         .map(|i| {
                             let benefit = list.recs[i].benefit;
+                            // NOTE: this diagnostic sees no prober
+                            // constraints, so set conds are judged on
+                            // decided-only knowledge (a constrained
+                            // prober may be reported as failing a set
+                            // cond it actually satisfies) — census
+                            // lines stay exact, detail lines are
+                            // best-effort.
                             let f = list.conds_of(i).iter().copied().find(|&p| {
-                                let (s, m, v) =
-                                    ((p >> 32) as usize, (p >> 16) as u16, p as u16);
-                                it_decided[s] & m != m || it_value[s] & m != v
+                                if cond_is_set(p) {
+                                    let (s, fm) = (cond_slot(p) as usize, (p >> 32) as u16);
+                                    !(it_decided[s] & fm == fm
+                                        && p as u32
+                                            >> ((it_value[s] & fm) >> fm.trailing_zeros())
+                                            & 1
+                                            != 0)
+                                } else {
+                                    let (s, m, v) =
+                                        ((p >> 32) as usize, (p >> 16) as u16, p as u16);
+                                    it_decided[s] & m != m || it_value[s] & m != v
+                                }
                             });
                             match f {
+                                Some(p) if cond_is_set(p) => {
+                                    let (s, fm) = (cond_slot(p) as usize, (p >> 32) as u16);
+                                    format!(
+                                        "{{\"slot\":{s},\"fmask\":{fm},\"want_set\":{},\"dec\":{},\"got\":{},\"benefit\":{benefit}}}",
+                                        p as u32,
+                                        it_decided[s] & fm,
+                                        it_value[s] & fm
+                                    )
+                                }
                                 Some(p) => {
                                     let (s, m, v) =
                                         ((p >> 32) as usize, (p >> 16) as u16, p as u16);
@@ -2701,6 +3075,9 @@ fn find_single_conflict(
                 }
                 let mut cand: Option<(usize, u16, u16)> = None;
                 for &p in list.conds_of(i) {
+                    if cond_is_set(p) {
+                        continue 'recs; // set conds: not a value-pair race
+                    }
                     let (s, m, v) = ((p >> 32) as usize, (p >> 16) as u16, p as u16);
                     if it.decided[s] & m != m {
                         continue 'recs; // undecided demand, not a pure pair
@@ -3670,7 +4047,16 @@ impl Snapshotter {
                             .conds_of(i)
                             .iter()
                             .map(|&p| {
-                                format!("[{},{},{}]", p >> 32, (p >> 16) as u16, p as u16)
+                                if cond_is_set(p) {
+                                    format!(
+                                        "[{},{},\"S{}\"]",
+                                        cond_slot(p),
+                                        (p >> 32) as u16,
+                                        p as u32
+                                    )
+                                } else {
+                                    format!("[{},{},{}]", p >> 32, (p >> 16) as u16, p as u16)
+                                }
                             })
                             .collect();
                         let pending = core
@@ -3776,7 +4162,7 @@ fn junk_walk(
     mut y_prov: Prov,
     mut cnt_prov: CntProv,
     mut osr_cnt_prov: CntProv,
-    wcyc: &mut u64,
+    stats: &mut Stats,
     // Dead-demand census out-param: set when the walk's executing
     // words read the start item's armed tag registers. Only meaningful
     // to the caller when the walk refutes (a read seen before the
@@ -3803,7 +4189,7 @@ fn junk_walk(
         if it.cycle >= end {
             return false; // horizon or cap: never conclude from a walk
         }
-        *wcyc += 1;
+        stats.walk_cycles += 1;
         if let Some(&m) = irq_at.get(&it.cycle) {
             it.st.irq_flags |= m;
         }
@@ -3828,7 +4214,38 @@ fn junk_walk(
         }
         if fetching {
             if demand(it.decided[fetch_pc], it.value[fetch_pc], cfg).is_some() {
-                return false; // fetch-demand fork edge
+                // 012 E1 §4: a WaitIdx demand of a gpio/pin WAIT whose
+                // partition has a SINGLE nonempty class (every allowed
+                // index met now) is one outcome class for the whole
+                // family — the walk may continue; anything else is a
+                // fork edge, like every other demanded field. NOTE:
+                // on the current walk this is contract + measurement
+                // only — every WAIT is external-schedule-driven, so
+                // the `reads_external` bail below ends the walk this
+                // same cycle either way (a time-shifted family member
+                // may see different gpio). The rule becomes
+                // load-bearing only if the walk ever gains
+                // schedule-aware windows.
+                let wsm = if cfg.side_count > 0 {
+                    (((1u16 << cfg.side_count) - 1) << (5 - cfg.side_count)) << 8
+                } else {
+                    0
+                };
+                if wait_idx_groupable(it.decided[fetch_pc], it.value[fetch_pc], wsm) {
+                    let (allowed, met) = wait_met_now(
+                        &it.constraints, &it.st, cfg, gpio_in, fetch_pc as u8,
+                        it.value[fetch_pc],
+                    );
+                    if met == allowed {
+                        stats.walk_wait_continues += 1;
+                        // fall through: single class, no fork edge
+                    } else {
+                        stats.walk_wait_bails += 1;
+                        return false; // multi-class partition: fork edge
+                    }
+                } else {
+                    return false; // fetch-demand fork edge
+                }
             }
         }
         // 011 stage (b): the walk cannot collapse a tag — a word that
@@ -4030,6 +4447,7 @@ fn search_impl(
         dd: 0,
         dd_id: 0,
         tags: RegTags::default(),
+        constraints: ConstraintSet::default(),
     };
     for s in spec.slots as usize..32 {
         root.decided[s] = 0xFFFF;
@@ -4044,6 +4462,9 @@ fn search_impl(
         if d & 0xE000 != 0xE000 || word_touches_regs(v) {
             root.named = true;
         }
+    }
+    for &(s, fm, a) in &spec.seed_constraints {
+        root.constraints.set(s, fm, a);
     }
     // S5 guard: the P2/P4 canonicity prunes argue "the canonical
     // representative of this spelling exists as a sibling fork of the
@@ -4076,6 +4497,11 @@ fn search_impl(
 
     let delay_bits = 5 - spec.cfg.side_count.min(5);
     let delay_mask: u16 = if delay_bits == 0 { 0 } else { ((1u16 << delay_bits) - 1) << 8 };
+    let side_mask: u16 = if spec.cfg.side_count > 0 {
+        (((1u16 << spec.cfg.side_count) - 1) << (5 - spec.cfg.side_count)) << 8
+    } else {
+        0
+    };
 
     let mut stack = vec![root];
     let mut champions = Vec::new();
@@ -4143,6 +4569,7 @@ fn search_impl(
     let mut frames: Vec<Frame> = vec![Frame {
         key: (0, 0, root.st, root.tags),
         decided: [0u16; 32],
+        constraints: root.constraints,
         children_left: 1,
         consulted_mask: [0u16; 32],
         consulted_value: [0u16; 32],
@@ -4173,7 +4600,7 @@ fn search_impl(
                 .collect();
             eprintln!("narrow-search: fork attribution: {}", named.join(" "));
             eprintln!(
-                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} walks={} wcyc={} cyc={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={} tags={}/{}c/{}r conf={}",
+                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} walks={} wcyc={} cyc={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={} tags={}/{}c/{}r conf={} wait={}p/{}a/{}o",
                 stats.items,
                 stats.forks,
                 stats.refuted,
@@ -4195,7 +4622,10 @@ fn search_impl(
                 stats.tags_created,
                 stats.tag_collapses,
                 stats.tag_rewrites,
-                stats.merge_conflicts
+                stats.merge_conflicts,
+                stats.wait_partitions,
+                stats.wait_all_met,
+                stats.constraint_overflows
             );
             if let Some(d) = dd.as_ref() {
                 d.print("beat");
@@ -4269,17 +4699,27 @@ fn search_impl(
                             }
                             let conds = list.conds_of(i);
                             if conds.iter().all(|&p| {
-                                let (s, m, v) =
-                                    ((p >> 32) as usize, (p >> 16) as u16, p as u16);
-                                it.decided[s] & m == m && it.value[s] & m == v
+                                if !cond_is_set(p) {
+                                    // Value cond: the pre-E1 hot path,
+                                    // encoding untouched.
+                                    let (s, m, v) =
+                                        ((p >> 32) as usize, (p >> 16) as u16, p as u16);
+                                    it.decided[s] & m == m && it.value[s] & m == v
+                                } else {
+                                    // Set cond (012 §3): P ⊆ S.
+                                    let (s, fm) =
+                                        (cond_slot(p) as usize, (p >> 32) as u16);
+                                    set_cond_admits(
+                                        &it.decided,
+                                        &it.value,
+                                        &it.constraints,
+                                        s,
+                                        fm,
+                                        p as u32,
+                                    )
+                                }
                             }) {
-                                hit = Some((
-                                    conds
-                                        .iter()
-                                        .map(|&p| ((p >> 32) as u8, (p >> 16) as u16, p as u16))
-                                        .collect(),
-                                    mask,
-                                ));
+                                hit = Some((conds.to_vec(), mask));
                                 outcome = PROBE_HIT;
                                 break 'sets;
                             }
@@ -4350,8 +4790,20 @@ fn search_impl(
                 }
                 let top = frames.last_mut().expect("root frame");
                 top.state_reads |= rmask;
-                for &(s, m, v) in &conds {
-                    top.merge(s as usize, m, v);
+                for &p in &conds {
+                    if cond_is_set(p) {
+                        // The skipped subtree consulted the field; the
+                        // enclosing frames re-derive their own
+                        // frame-open sets at finalize (012 §3 —
+                        // sound: the prober's knowledge P ⊆ S shrank
+                        // from each ancestor's frame-open set through
+                        // exhaustive partitions on this very path).
+                        let (s, fm) = (cond_slot(p) as usize, (p >> 32) as u16);
+                        top.merge(s, fm, it.value[s] & fm);
+                    } else {
+                        let (s, m, v) = (cond_slot(p) as usize, (p >> 16) as u16, p as u16);
+                        top.merge(s, m, v);
+                    }
                 }
                 close_child(&mut frames, &mut memo, spec.memo_cap, &mut min_benefit, &mut snap, &mut stats, false, spec.slots);
                 continue 'items;
@@ -4419,7 +4871,172 @@ fn search_impl(
                         fetch_footprint(it.decided[fetch_pc], it.value[fetch_pc], &cfg)
                             & it.decided[fetch_pc];
                 }
-                if let Some(field) = demand(it.decided[fetch_pc], it.value[fetch_pc], &cfg) {
+                // --- 012 E1: met-now WAIT grouping ------------------
+                // The WaitIdx demand of a gpio/pin WAIT is an
+                // ENVIRONMENT-READ PREDICATE on the select field: the
+                // gpio state is concrete here, so met(pol, src, idx)
+                // partitions the field's current allowed set into ONE
+                // met-now class (the met arm writes nothing — all
+                // members share this cycle's execution and state) plus
+                // the unmet values, whose stall futures genuinely
+                // diverge (forked concretely, as today). Re-execution
+                // (loop return) re-partitions the CURRENT allowed set
+                // — the met set only shrinks.
+                let mut wait_grouped = false;
+                if wait_idx_groupable(it.decided[fetch_pc], it.value[fetch_pc], side_mask) {
+                    let w = it.value[fetch_pc];
+                    let (allowed, met) =
+                        wait_met_now(&it.constraints, &it.st, &cfg, gpio_in, fetch_pc as u8, w);
+                    let had = it.constraints.get(fetch_pc as u8, 0x001F).is_some();
+                    // The partition consults the whole index field
+                    // (every allowed value) against core-determined
+                    // gpio (KeyCore latches + the deterministic stim
+                    // schedule — no SC state components). Undecided
+                    // consulted bits route through the frame-open
+                    // constraint rule at record emission.
+                    if memo_on {
+                        seg_mask[fetch_pc] |= 0x001F;
+                    }
+                    if met == allowed {
+                        // One outcome class: no fork at all (012 §2
+                        // rule 2), constraint unchanged. The cycle
+                        // continues concretely on the class MINIMUM as
+                        // representative — every member's execution is
+                        // identical this cycle (a met gpio/pin WAIT is
+                        // a pure no-op). A later re-fetch re-partitions
+                        // before executing (demand still fires while
+                        // the field is undecided), so the patched word
+                        // is never executed stale.
+                        stats.wait_partitions += 1;
+                        stats.wait_all_met += 1;
+                        wait_grouped = true;
+                        cfg.code[fetch_pc] = w | met.trailing_zeros() as u16;
+                    } else {
+                        // Constraint-block overflow: the met class
+                        // needs a NEW entry but the block is full —
+                        // collapse the OLDEST constraint first (fork
+                        // its allowed set fully, freeing the entry);
+                        // children re-enter this cycle and re-run this
+                        // partition.
+                        let needs_entry = met.count_ones() >= 2 && !had;
+                        if needs_entry && it.constraints.full() {
+                            stats.constraint_overflows += 1;
+                            let (os, om, oa) = it.constraints.as_slice()[0];
+                            let osh = om.trailing_zeros() as u16;
+                            let mut pushed = 0u32;
+                            for raw in 0..32u16 {
+                                if oa >> raw as u32 & 1 == 0 {
+                                    continue;
+                                }
+                                let mut child = it;
+                                child.decided[os as usize] |= om;
+                                child.value[os as usize] |= raw << osh;
+                                child.constraints.remove_index(0);
+                                stack.push(child);
+                                stats.forks += 1;
+                                stats.fork_kinds[kind_idx(FieldKind::WaitIdx)] += 1;
+                                pushed += 1;
+                            }
+                            if memo_on {
+                                flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
+                                merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
+                                frames.push(Frame {
+                                    key: (it.cycle, it.next_input, it.st, it.tags),
+                                    decided: it.decided,
+                                    constraints: it.constraints,
+                                    children_left: pushed,
+                                    consulted_mask: [0u16; 32],
+                                    consulted_value: [0u16; 32],
+                                    any_champion: false,
+                                    recordable: true,
+                                    conflicted: false,
+                                    bound_seen: !it.unbound,
+                                    state_reads: 0,
+                                    items_at_open: stats.items,
+                                });
+                            }
+                            continue 'items;
+                        }
+                        stats.wait_partitions += 1;
+                        // Partition fork: ONE child for the met-now
+                        // class (a singleton class decides the field;
+                        // larger classes write/refine the Constraint)
+                        // + one concrete child per unmet index.
+                        // Children pushed in canonical class order —
+                        // ascending minimum member (determinism
+                        // contract).
+                        let met_min =
+                            if met != 0 { met.trailing_zeros() as u16 } else { 32 };
+                        let mut pushed = 0u32;
+                        for raw in 0..32u16 {
+                            if allowed >> raw as u32 & 1 == 0 {
+                                continue;
+                            }
+                            if met >> raw as u32 & 1 != 0 {
+                                if raw != met_min {
+                                    continue; // inside the class child
+                                }
+                                let mut child = it;
+                                if met.count_ones() == 1 {
+                                    child.decided[fetch_pc] |= 0x001F;
+                                    child.value[fetch_pc] |= raw;
+                                    child.constraints.remove(fetch_pc as u8, 0x001F);
+                                } else {
+                                    child.constraints.set(fetch_pc as u8, 0x001F, met);
+                                }
+                                stack.push(child);
+                            } else {
+                                let mut child = it;
+                                child.decided[fetch_pc] |= 0x001F;
+                                child.value[fetch_pc] |= raw;
+                                child.constraints.remove(fetch_pc as u8, 0x001F);
+                                stack.push(child);
+                            }
+                            stats.forks += 1;
+                            stats.fork_kinds[kind_idx(FieldKind::WaitIdx)] += 1;
+                            pushed += 1;
+                        }
+                        if memo_on {
+                            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
+                            merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
+                            frames.push(Frame {
+                                key: (it.cycle, it.next_input, it.st, it.tags),
+                                decided: it.decided,
+                                // PRE-partition snapshot: frame-open
+                                // knowledge (012 §3).
+                                constraints: it.constraints,
+                                children_left: pushed,
+                                consulted_mask: [0u16; 32],
+                                consulted_value: [0u16; 32],
+                                any_champion: false,
+                                recordable: true,
+                                conflicted: false,
+                                bound_seen: !it.unbound,
+                                state_reads: 0,
+                                items_at_open: stats.items,
+                            });
+                            // S7 discipline: the partition
+                            // evaluation's field consult is a
+                            // condition of THIS fork's subtree claim
+                            // too (the frame quantifies over every
+                            // class) — charge it to the fork frame's
+                            // OWN record, mirroring the fetch fork's
+                            // kill accumulators. No state components
+                            // are involved: the wait condition reads
+                            // only gpio, which is core-composed.
+                            frames
+                                .last_mut()
+                                .expect("just pushed")
+                                .merge(fetch_pc, 0x001F, it.value[fetch_pc] & 0x001F);
+                        }
+                        continue 'items;
+                    }
+                }
+                if let Some(field) = if wait_grouped {
+                    None
+                } else {
+                    demand(it.decided[fetch_pc], it.value[fetch_pc], &cfg)
+                } {
                     // Dead-demand census: classify the fork. A fresh
                     // qualifying fork tags its children (dd_fresh); a
                     // qualifying fork on an item whose PENDING tag is
@@ -4655,6 +5272,7 @@ fn search_impl(
                             frames.push(Frame {
                                 key: (it.cycle, it.next_input, it.st, it.tags),
                                 decided: it.decided,
+                                constraints: it.constraints,
                                 children_left: pushed,
                                 consulted_mask: [0u16; 32],
                                 consulted_value: [0u16; 32],
@@ -4781,6 +5399,7 @@ fn search_impl(
                                 // every field value (011 §3).
                                 key: (it.cycle, it.next_input, it.st, it.tags),
                                 decided: it.decided,
+                                constraints: it.constraints,
                                 children_left: values.len() as u32,
                                 consulted_mask: [0u16; 32],
                                 consulted_value: [0u16; 32],
@@ -4858,6 +5477,7 @@ fn search_impl(
                                 frames.push(Frame {
                                     key: (it.cycle, it.next_input, it.st, it.tags),
                                     decided: it.decided,
+                                    constraints: it.constraints,
                                     children_left: pushed,
                                     consulted_mask: [0u16; 32],
                                     consulted_value: [0u16; 32],
@@ -4980,6 +5600,7 @@ fn search_impl(
                         frames.push(Frame {
                             key: (it.cycle, it.next_input, it.st, it.tags),
                             decided: it.decided,
+                            constraints: it.constraints,
                             children_left: pushed,
                             consulted_mask: [0u16; 32],
                             consulted_value: [0u16; 32],
@@ -5132,7 +5753,7 @@ fn search_impl(
                     if junk_walk(
                         spec, &cfg, &irq_at, &it, delay_mask, memo_on,
                         &mut seg_mask, &mut seg_reads, x_prov, y_prov, cnt_prov, osr_cnt_prov,
-                        &mut stats.walk_cycles, &mut dd_walk_read,
+                        &mut stats, &mut dd_walk_read,
                     ) {
                         stats.refuted += 1;
                         stats.look_refuted += 1;
@@ -5189,6 +5810,7 @@ fn search_impl(
                         frames.push(Frame {
                             key: (it.cycle, it.next_input, it.st, it.tags),
                             decided: it.decided,
+                            constraints: it.constraints,
                             children_left: pushed,
                             consulted_mask: [0u16; 32],
                             consulted_value: [0u16; 32],
@@ -5226,6 +5848,7 @@ fn search_impl(
                 decided: it.decided,
                 value: it.value,
                 binding_free: it.unbound,
+                constraints: it.constraints,
             });
         } else {
             champion_cap_hit = true;
@@ -5307,6 +5930,11 @@ pub fn merge_stats(into: &mut Stats, s: &Stats) {
     into.tag_collapses += s.tag_collapses;
     into.tag_rewrites += s.tag_rewrites;
     into.merge_conflicts += s.merge_conflicts;
+    into.wait_partitions += s.wait_partitions;
+    into.wait_all_met += s.wait_all_met;
+    into.constraint_overflows += s.constraint_overflows;
+    into.walk_wait_continues += s.walk_wait_continues;
+    into.walk_wait_bails += s.walk_wait_bails;
 }
 
 /// Phase-1 product of the split driver: an early verdict, or the
@@ -5327,13 +5955,21 @@ pub enum SplitPlan {
     Units(SplitUnits),
 }
 
+/// One phase-1 work unit: the decided-field seed plus the value-set
+/// constraints the frontier champion carried (ticket 012 E1 —
+/// REQUIRED: a phase-1 champion that closed inside a met-now WAIT
+/// class must hand its class to the unit re-run, or the unit re-forks
+/// the sibling met/unmet classes and duplicates other units' subtrees
+/// and champions).
+pub type UnitSeed = (Vec<(u8, u16, u16)>, Vec<(u8, u16, u32)>);
+
 pub struct SplitUnits {
     /// Per-unit seed sets in deterministic enumeration order — the
     /// unit id IS the index (stable across runs of the same spec +
     /// target on the same engine revision; the narrow-split runner's
     /// resume keys on it). Binding-free register-naming units are
     /// already expanded into explicit identity + mirror twins.
-    pub seeds: Vec<Vec<(u8, u16, u16)>>,
+    pub seeds: Vec<UnitSeed>,
     /// Frontier walk stats (LAST widening pass only), with
     /// `champions_found` zeroed — its champions were work units, not
     /// solutions. Merge into the final aggregate exactly once.
@@ -5390,14 +6026,19 @@ pub fn split_units(spec: &EngineSpec, target: usize) -> SplitPlan {
     phase1.champions_found = 0;
 
     // Units -> seeds; binding-free register-naming units get an
-    // explicit mirror twin.
-    let seed_of = |u: &Champion, val: &[u16; 32]| -> Vec<(u8, u16, u16)> {
-        (0..spec.slots as usize)
-            .filter(|&s| u.decided[s] != 0)
-            .map(|s| (s as u8, u.decided[s], val[s] & u.decided[s]))
-            .collect()
+    // explicit mirror twin. Constraints are carried verbatim on both
+    // sides: the only constrained field (the WAIT index) is
+    // mirror-invariant (`mirror_word` does not touch WAIT operands).
+    let seed_of = |u: &Champion, val: &[u16; 32]| -> UnitSeed {
+        (
+            (0..spec.slots as usize)
+                .filter(|&s| u.decided[s] != 0)
+                .map(|s| (s as u8, u.decided[s], val[s] & u.decided[s]))
+                .collect(),
+            u.constraints.as_slice().to_vec(),
+        )
     };
-    let mut seeds: Vec<Vec<(u8, u16, u16)>> = Vec::with_capacity(units.len() * 2);
+    let mut seeds: Vec<UnitSeed> = Vec::with_capacity(units.len() * 2);
     for u in &units {
         let id = seed_of(u, &u.value);
         if u.binding_free {
@@ -5426,13 +6067,14 @@ pub fn split_units(spec: &EngineSpec, target: usize) -> SplitPlan {
 /// narrow-split subcommand dispatch through this.
 pub fn search_unit(
     spec: &EngineSpec,
-    seed: &[(u8, u16, u16)],
+    seed: &UnitSeed,
     champion_cap: usize,
     progress: Option<&std::sync::atomic::AtomicU64>,
     wq: &mut WordQuotient,
 ) -> SearchResult {
     let mut spec_w = spec.clone();
-    spec_w.seed = seed.to_vec();
+    spec_w.seed = seed.0.clone();
+    spec_w.seed_constraints = seed.1.clone();
     search_impl(&spec_w, champion_cap, false, progress, Some(wq))
 }
 
@@ -5686,14 +6328,15 @@ pub fn run_spec_state(spec: &EngineSpec, code: [u16; 32]) -> (Vec<u32>, bool, NS
 #[cfg(test)]
 mod item_size {
     /// Item is Copy and forked by struct copy; ticket 011 measured 252
-    /// bytes pre-census. The dead-demand tag (dd + dd_id, 8 bytes) and
-    /// the 011 stage-(b) x/y tag block (RegTags, 12 bytes) must keep a
-    /// fork a small stack copy (ticket budget: Item ≈ 300-330 with the
-    /// FULL tag design; this build carries only the x/y slice).
+    /// bytes pre-census. The dead-demand tag (dd + dd_id, 8 bytes),
+    /// the 011 stage-(b) x/y tag block (RegTags, 12 bytes), and the
+    /// 012 E1 constraint block (ConstraintSet, 28 bytes: 3 × 8-byte
+    /// entries + count, the ticket's budgeted "+28 bytes") must keep a
+    /// fork a small stack copy (ticket budget: Item ≈ 300-330).
     #[test]
     fn stays_within_budget() {
         let sz = std::mem::size_of::<super::Item>();
-        eprintln!("Item = {sz} bytes (252 pre-census + 8 dd + 12 tags)");
-        assert!(sz <= 280, "Item grew past budget: {sz}");
+        eprintln!("Item = {sz} bytes (252 pre-census + 8 dd + 12 tags + 28 constraints)");
+        assert!(sz <= 312, "Item grew past budget: {sz}");
     }
 }

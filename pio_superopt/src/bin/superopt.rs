@@ -1241,7 +1241,7 @@ fn narrow_split_cmd(args: &[String]) {
             // search (an empty seed = the full seeded space).
             eprintln!("phase 1: frontier never reached target — running as a single unit");
             pio_superopt::narrow::engine::SplitUnits {
-                seeds: vec![vec![]],
+                seeds: vec![(vec![], vec![])],
                 phase1: Stats::default(),
                 frontier_cycle: 0,
                 pre_mirror: 0,
