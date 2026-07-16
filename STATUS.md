@@ -10,16 +10,27 @@ cap_hit=false, all 1,383,452 units settled. 0..0, 0..1, 1..1, 2..2
 already proven. **If 0..2 refutes: footprint ≤3 impossible for tx_a;
 L=4 rediscovery ladder unlocks.**
 
-## RUN LIVE: 0..2 monster (unit `pio-l3-monsters`, detached, resumable)
+## RUN PAUSED: 0..2 monster at 75.5% (1,043,952/1,383,452), ~2.5h left
 
-Started ~12:20 after 1..2 finished; ~51% settled at 17:40, ETA
-~22:45. Log `/data/pio_optimization/runs/l3_monsters.log` (check
-mtime); trace `narrow-split-l3-w02.jsonl`. **If resume is needed, run
-it from the RUNTREE** (`../pio_optimization.runtree`, pinned at launch
-rev 024bb2a, launch binary preserved at its
-`pio_superopt/target/release/superopt`): cd there, rerun the exact
-command (handoff doc §1). Validated live against a copy of the w12
-trace. Master is free to advance.
+Deliberately SIGINT'd 2026-07-15 ~20:00 to give the E1 agent the CPU
+(user ruling). Settled units durable in `narrow-split-l3-w02.jsonl`.
+**Resume from the RUNTREE** (`../pio_optimization.runtree`, pinned at
+launch rev 024bb2a, launch binary at its
+`pio_superopt/target/release/superopt`) in a FRESH gated unit:
+
+```
+cd /home/ben/Documents/programmingSync/pio_optimization.runtree/pio_superopt
+systemd-run --user --collect -p MemoryMax=48G -p MemorySwapMax=0 \
+  --unit=pio-l3-w02-resume bash -c './target/release/superopt \
+  narrow-split --spec tx-a --len 3 --wrap-lo 0 --wrap-hi 2 \
+  --threads 28 --memo-cap 2097152 \
+  --trace /data/pio_optimization/runs/narrow-split-l3-w02.jsonl \
+  >> /data/pio_optimization/runs/l3_monsters.log 2>&1'
+```
+
+Resume after the E1 agent's gate runs finish. Do NOT rebuild the
+runtree binary; do NOT resume with the E1-modified engine (header rev
+mismatch will refuse — correctly).
 
 ## w12 trace mined (docs/analysis/narrow-split-w12-unit-mining.md)
 
