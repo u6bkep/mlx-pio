@@ -4,6 +4,41 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-15 (night) — 012 E1 LANDED: met-now WAIT grouping + constraint substrate; −35.7% L=2, −18.5% L=3
+
+User rulings: E1 = 012's new stage 1 (ticket amended ff09d71);
+seeds carry constraints; junk-window relaxation = ticket 013
+(drafted 9099422); implement before re-measuring; 0..2 monster
+PAUSED at 75.5% for the agent's CPU (clean SIGINT — chose it over
+SIGSTOP because the unit's 24h cap would SIGKILL a frozen process),
+resumed ~22:10 from the runtree (gotcha: systemd-run needs
+-p WorkingDirectory, units don't inherit cwd).
+
+Worktree agent implemented E1 in 4 commits (1e9a7d9/1ca971c/
+3bdd880/3c861a2), merged 9b5ded1 after independent verification:
+diff review of the soundness-critical paths (partition fork site
+with pre-partition frame snapshot + S7 self-charge; set-cond
+encoding, singleton hot path untouched; P⊆S probe incl. free-prober
+full-set case; subsumes via cond_implies with the conservative
+set⇒value=false; close_child frame-open rule; mask-only parent
+propagation with per-ancestor re-derivation; validate_seed), full
+suite re-run green, L=2 smokes reproduced byte-identical.
+
+Numbers: L=2 0..1 45.20M→29.06M (−35.7%), 1..1 33.65M→21.59M
+(−35.8%); L=3 0..1 700.56M→571.12M (−18.5%, 29s→25s), 1..1
+632.8M→510.90M (−19.3%, 25s→21s); frontier 1,383,452→1,113,608
+units (−19.5%); verdicts unchanged everywhere. Red-green: wrong
+frame-open variant loses 31/32 champions (memo-on); with the rule,
+memo on == off + sound extra sharing. Widening gate: ONE champion
+covering a 29-index wait set, census-balanced. SIGINT-at-38% resume
+byte-identical (even across thread-count change). irq-absence
+RESOLVED by measurement: jmp-back re-execution makes pol-0 irq
+waits non-vacuous (flag plane is program+stim-written; orbit
+fingerprints differ by −12K/−291K items). OPEN: 008 §3b trigger
+re-fired (≤32 still_stalled calls per WaitIdx demand);
+constraint-overflow path untested at runtime (stat-gated); walk
+rule behaviorally inert until 013; gene_search flaky hang seen once.
+
 ## 2026-07-15 (evening, later) — seed orbits named: the 71% is prologue respelling; runtree convention
 
 **Runtree convention landed** (73a3e43): long runs launch/resume from

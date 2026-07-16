@@ -10,27 +10,28 @@ cap_hit=false, all 1,383,452 units settled. 0..0, 0..1, 1..1, 2..2
 already proven. **If 0..2 refutes: footprint ≤3 impossible for tx_a;
 L=4 rediscovery ladder unlocks.**
 
-## RUN PAUSED: 0..2 monster at 75.5% (1,043,952/1,383,452), ~2.5h left
+## RUN RESUMED: 0..2 monster (unit `pio-l3-w02-resume2`), ETA ~00:40
 
-Deliberately SIGINT'd 2026-07-15 ~20:00 to give the E1 agent the CPU
-(user ruling). Settled units durable in `narrow-split-l3-w02.jsonl`.
-**Resume from the RUNTREE** (`../pio_optimization.runtree`, pinned at
-launch rev 024bb2a, launch binary at its
-`pio_superopt/target/release/superopt`) in a FRESH gated unit:
+Paused 75.5%→resumed ~22:10 from the runtree (launch binary, header
+accepted at 1,043,952 settled). systemd-run needs
+`-p WorkingDirectory=<runtree>/pio_superopt` (units do NOT inherit
+shell cwd — the first resume attempt failed on that). Old engine on
+purpose; do NOT rebuild the runtree binary.
 
-```
-cd /home/ben/Documents/programmingSync/pio_optimization.runtree/pio_superopt
-systemd-run --user --collect -p MemoryMax=48G -p MemorySwapMax=0 \
-  --unit=pio-l3-w02-resume bash -c './target/release/superopt \
-  narrow-split --spec tx-a --len 3 --wrap-lo 0 --wrap-hi 2 \
-  --threads 28 --memo-cap 2097152 \
-  --trace /data/pio_optimization/runs/narrow-split-l3-w02.jsonl \
-  >> /data/pio_optimization/runs/l3_monsters.log 2>&1'
-```
+## 012 STAGE E1 LANDED + MERGED (9b5ded1) — engine now constraint-capable
 
-Resume after the E1 agent's gate runs finish. Do NOT rebuild the
-runtree binary; do NOT resume with the E1-modified engine (header rev
-mismatch will refuse — correctly).
+Met-now WAIT grouping + full value-set constraint substrate (Item/
+Champion/seeds/memo set-conds with P⊆S probing/frame-open drop rule/
+junk_walk contract). Independently verified after agent handoff:
+full suite green (77+2+6+16+11), L=2 smokes byte-identical
+(0..1 29,055,279 / 1..1 21,591,943, −35.7%/−35.8%), L=3 gates
+0..1 700.56M→571.12M (−18.5%, 25s) / 1..1 632.8M→510.90M (−19.3%,
+21s), verdicts unchanged everywhere, frontier −19.5%. Red-green
+S1-analog canary pinned (31/32 champions lost under the wrong
+variant). irq-absence puzzle RESOLVED with measurement (jmp-back
+re-execution; see ticket 012). NOTE: 008 §3b re-measurement trigger
+fired AGAIN (partition adds ≤32 still_stalled calls per WaitIdx
+demand). Known flaky: lib gene_search hung once at --test-threads=4.
 
 ## w12 trace mined (docs/analysis/narrow-split-w12-unit-mining.md)
 
