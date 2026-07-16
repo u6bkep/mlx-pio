@@ -94,14 +94,14 @@ pub struct EngineSpec {
     /// is load-bearing.
     pub seed: Vec<(u8, u16, u16)>,
     /// Value-set constraints carried into the root item (ticket 012
-    /// E1): `(slot, fmask, allowed)` — bit i of `allowed` ⇔ raw value
-    /// i of the field is still possible. v1 scope: only the index
-    /// field (fmask 0x001F) of a seeded WAIT gpio/pin slot. The split
-    /// driver's frontier units REQUIRE this: a phase-1 champion that
-    /// closed inside a met-now WAIT class must hand its class to the
-    /// unit re-run, or the unit re-forks the sibling classes and
-    /// duplicates other units' subtrees and champions. Validated at
-    /// search entry (`validate_seed`).
+    /// E1/E2): `(slot, fmask, allowed)` — bit i of `allowed` ⇔ raw
+    /// value i of the field is still possible. The supported fields
+    /// are a WAIT gpio/pin index and an outcome-partitioned side-set
+    /// field. The split driver's frontier units REQUIRE this: a
+    /// phase-1 champion that closed inside an outcome class must hand
+    /// its class to the unit re-run, or the unit re-forks sibling
+    /// classes and duplicates other units' subtrees and champions.
+    /// Validated at search entry (`validate_seed`).
     pub seed_constraints: Vec<(u8, u16, u32)>,
     /// Consulted-set memo capacity in entries (0 disables). Records are
     /// FAILURE-ONLY (an exhausted, champion-free subtree keyed by its
@@ -307,6 +307,12 @@ pub struct Stats {
     /// a representative).
     pub wait_partitions: u64,
     pub wait_all_met: u64,
+    /// 012 E2 side-field outcome grouping: partitions that FORKED
+    /// (one no-change class plus concrete changing values), and
+    /// re-consults where every currently allowed value was no-change
+    /// (one class, no fork).
+    pub side_partitions: u64,
+    pub side_all_no_change: u64,
     /// Constraint-block overflows (cap `CONSTRAINT_CAP`): the oldest
     /// constraint was collapsed (its allowed set forked fully) to free
     /// an entry. Gate: this must stay rare.
@@ -405,11 +411,12 @@ struct Item {
     dd_id: u32,
     /// x/y provenance tags (011 stage b) — see [`RegTags`].
     tags: RegTags,
-    /// Value-set constraints (ticket 012 E1) — see [`ConstraintSet`].
-    /// Written only by the WaitIdx met-now partition; refined
-    /// monotonically (a later partition intersects), consumed when the
-    /// field decides. Constraints ride binding twins unchanged: the
-    /// only constrained field (WAIT index) is mirror-invariant.
+    /// Value-set constraints (ticket 012 E1/E2) — see
+    /// [`ConstraintSet`]. Written by the WaitIdx met-now and Side
+    /// no-change partitions; refined monotonically on re-arrival and
+    /// consumed when the field decides. Both supported fields are
+    /// register-mirror-invariant, so constraints ride binding twins
+    /// unchanged.
     constraints: ConstraintSet,
 }
 
@@ -1000,6 +1007,75 @@ fn demand(decided: u16, value: u16, cfg: &NCfg) -> Option<Field> {
     None
 }
 
+#[inline]
+fn pin_field_mask(base: u8, count: u8) -> u32 {
+    let mask = if count == 0 {
+        0
+    } else if count >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << count) - 1
+    };
+    mask.rotate_left(base as u32)
+}
+
+/// Is the fetched slot's side write independent of the instruction's
+/// own latch write? Side-set runs AFTER the opcode, so comparing with
+/// the fork-time latch is sound only when the opcode cannot first
+/// overwrite any side-set pin. A config whose OUT and SET windows are
+/// disjoint from the side window proves that before the opcode is
+/// known; otherwise a sufficiently decided opcode/destination may
+/// prove it for this slot. PINDIR side-set stays outside E2's scope.
+fn side_outcome_groupable(decided: u16, value: u16, cfg: &NCfg) -> bool {
+    if cfg.side_count == 0 || !cfg.side_en || cfg.side_pindir {
+        return false;
+    }
+    let value_bits = cfg.side_count - 1;
+    let side_pins = pin_field_mask(cfg.sideset_base, value_bits);
+    let out_overlap = side_pins & pin_field_mask(cfg.out_base, cfg.out_count) != 0;
+    let set_overlap = side_pins & pin_field_mask(cfg.set_base, cfg.set_count) != 0;
+    if !out_overlap && !set_overlap {
+        return true;
+    }
+    if decided & 0xE000 != 0xE000 {
+        return false;
+    }
+    match (value >> 13) & 0x7 {
+        3 if out_overlap => decided & 0x00E0 == 0x00E0 && (value >> 5) & 0x7 != 0,
+        5 if out_overlap => decided & 0x00E0 == 0x00E0 && (value >> 5) & 0x7 != 0,
+        7 if set_overlap => decided & 0x00E0 == 0x00E0 && (value >> 5) & 0x7 != 0,
+        _ => true,
+    }
+}
+
+/// Current allowed Side raw values and the no-latch-change subset.
+/// Optional side-set has one canonical disabled spelling (raw 0) plus
+/// enabled spellings; the enabled spelling equal to the concrete
+/// output latch joins raw 0. Every other enabled spelling remains a
+/// concrete child because it produces a distinct latch outcome.
+fn side_no_change(
+    constraints: &ConstraintSet,
+    st: &NState,
+    cfg: &NCfg,
+    slot: u8,
+    side_mask: u16,
+) -> (u32, u32) {
+    debug_assert!(cfg.side_count > 0 && cfg.side_en && !cfg.side_pindir);
+    let value_bits = cfg.side_count - 1;
+    let enable = 1u16 << value_bits;
+    let mut legal = 1u32;
+    for val in 0..(1u16 << value_bits) {
+        legal |= 1u32 << (enable | val);
+    }
+    let allowed = constraints.get(slot, side_mask).unwrap_or(legal);
+    debug_assert!(allowed != 0 && allowed & !legal == 0, "invalid Side constraint");
+    let value_mask = if value_bits == 0 { 0 } else { (1u32 << value_bits) - 1 };
+    let latched = st.out_latch.rotate_right(cfg.sideset_base as u32) & value_mask;
+    let matching_write = enable | latched as u16;
+    let no_change = allowed & ((1u32 << 0) | (1u32 << matching_write));
+    (allowed, no_change)
+}
+
 /// Is this (partial) slot word at the E1 met-now grouping point
 /// (ticket 012): side/opcode/pol/src decided, opcode = WAIT, source =
 /// gpio or pin, index field still undecided? Demand order guarantees
@@ -1419,11 +1495,10 @@ fn validate_seed(spec: &EngineSpec) {
             whole(m, name);
         }
     }
-    // Seed constraints (ticket 012 E1): well-formedness per the
-    // amendment — within values_into (every WaitIdx raw 0..31 is
-    // legal, so any nonempty proper subset qualifies), nonempty,
-    // consistent with the slot's decided bits, and only on the E1
-    // field (the index of a seeded WAIT gpio/pin).
+    // Seed constraints (ticket 012 E1/E2): well-formedness within the
+    // field's values_into domain, nonempty and non-vacuous, consistent
+    // with decided bits, and only on a supported outcome-partition
+    // field.
     assert!(
         spec.seed_constraints.len() <= CONSTRAINT_CAP,
         "EngineSpec::seed_constraints: more than {CONSTRAINT_CAP} entries"
@@ -1435,14 +1510,16 @@ fn validate_seed(spec: &EngineSpec) {
             spec.slots
         );
         let (d, v) = (dm[s as usize], vm[s as usize]);
+        let wait_idx = fm == 0x001F
+            && d & 0xE000 == 0xE000
+            && (v >> 13) & 0x7 == 1
+            && d & 0x00E0 == 0x00E0
+            && (v >> 5) & 0x3 < 2;
+        let side = fm == side_mask && side_outcome_groupable(d, v, &spec.cfg);
         assert!(
-            fm == 0x001F
-                && d & 0xE000 == 0xE000
-                && (v >> 13) & 0x7 == 1
-                && d & 0x00E0 == 0x00E0
-                && (v >> 5) & 0x3 < 2,
-            "seed constraint on slot {s}: value-set constraints exist only for the index \
-             field (fmask 0x001F) of a seeded WAIT gpio/pin (E1 scope)"
+            wait_idx || side,
+            "seed constraint on slot {s}: supported value-set fields are a seeded WAIT \
+             gpio/pin index (E1) or a pure-latch optional side-set field (E2)"
         );
         assert!(
             d & fm == 0,
@@ -1454,10 +1531,23 @@ fn validate_seed(spec: &EngineSpec) {
             allowed.count_ones() >= 2,
             "seed constraint on slot {s}: singleton set — seed it as a decided field"
         );
-        assert!(
-            allowed != u32::MAX,
-            "seed constraint on slot {s}: the full set is vacuous — omit the entry"
-        );
+        let full = if wait_idx {
+            u32::MAX
+        } else {
+            let value_bits = spec.cfg.side_count - 1;
+            let enable = 1u16 << value_bits;
+            let mut legal = 1u32;
+            for val in 0..(1u16 << value_bits) {
+                legal |= 1u32 << (enable | val);
+            }
+            assert_eq!(
+                allowed & !legal,
+                0,
+                "seed constraint on slot {s}: Side allowed set contains an illegal raw value"
+            );
+            legal
+        };
+        assert!(allowed != full, "seed constraint on slot {s}: the full set is vacuous — omit the entry");
         assert_eq!(
             spec.seed_constraints.iter().filter(|&&(s2, m2, _)| s2 == s && m2 == fm).count(),
             1,
@@ -4600,7 +4690,7 @@ fn search_impl(
                 .collect();
             eprintln!("narrow-search: fork attribution: {}", named.join(" "));
             eprintln!(
-                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} walks={} wcyc={} cyc={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={} tags={}/{}c/{}r conf={} wait={}p/{}a/{}o",
+                "narrow-search: items={} forks={} refuted={} prefilt={} canon={} quo={} look={} walks={} wcyc={} cyc={} memo_hit={} memo_ent={} minben={} purges={} recs_avg={:.1} recs_max={} champions={} stack={} tags={}/{}c/{}r conf={} wait={}p/{}a side={}p/{}a over={}",
                 stats.items,
                 stats.forks,
                 stats.refuted,
@@ -4625,6 +4715,8 @@ fn search_impl(
                 stats.merge_conflicts,
                 stats.wait_partitions,
                 stats.wait_all_met,
+                stats.side_partitions,
+                stats.side_all_no_change,
                 stats.constraint_overflows
             );
             if let Some(d) = dd.as_ref() {
@@ -4871,6 +4963,141 @@ fn search_impl(
                         fetch_footprint(it.decided[fetch_pc], it.value[fetch_pc], &cfg)
                             & it.decided[fetch_pc];
                 }
+                // --- 012 E2: side-field outcome grouping -----------
+                // Optional side-set raw 0 (no write) and the enabled
+                // value equal to the concrete output latch have the
+                // same state transition. Keep those spellings in one
+                // constraint; every latch-changing value stays
+                // concrete. The comparison is valid only when the
+                // opcode cannot overwrite a side pin before side-set
+                // runs (side_outcome_groupable's scope guard).
+                let side_demand = side_mask != 0
+                    && it.decided[fetch_pc] & side_mask != side_mask
+                    && side_outcome_groupable(it.decided[fetch_pc], it.value[fetch_pc], &cfg);
+                let mut side_grouped = false;
+                if side_demand {
+                    let (allowed, no_change) =
+                        side_no_change(&it.constraints, &it.st, &cfg, fetch_pc as u8, side_mask);
+                    let had = it.constraints.get(fetch_pc as u8, side_mask).is_some();
+                    // Latches are already in KeyCore, so only the
+                    // program-field consult needs recording here.
+                    if memo_on {
+                        seg_mask[fetch_pc] |= side_mask;
+                    }
+                    if no_change == allowed {
+                        stats.side_partitions += 1;
+                        stats.side_all_no_change += 1;
+                        side_grouped = true;
+                        let raw = no_change.trailing_zeros() as u16;
+                        cfg.code[fetch_pc] =
+                            it.value[fetch_pc] | raw << side_mask.trailing_zeros();
+                    } else {
+                        let needs_entry = no_change.count_ones() >= 2 && !had;
+                        if needs_entry && it.constraints.full() {
+                            stats.constraint_overflows += 1;
+                            let (os, om, oa) = it.constraints.as_slice()[0];
+                            let osh = om.trailing_zeros() as u16;
+                            let mut pushed = 0u32;
+                            for raw in 0..32u16 {
+                                if oa >> raw as u32 & 1 == 0 {
+                                    continue;
+                                }
+                                let mut child = it;
+                                child.decided[os as usize] |= om;
+                                child.value[os as usize] |= raw << osh;
+                                child.constraints.remove_index(0);
+                                stack.push(child);
+                                stats.forks += 1;
+                                let k =
+                                    if om == side_mask { FieldKind::Side } else { FieldKind::WaitIdx };
+                                stats.fork_kinds[kind_idx(k)] += 1;
+                                pushed += 1;
+                            }
+                            if memo_on {
+                                flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
+                                merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
+                                frames.push(Frame {
+                                    key: (it.cycle, it.next_input, it.st, it.tags),
+                                    decided: it.decided,
+                                    constraints: it.constraints,
+                                    children_left: pushed,
+                                    consulted_mask: [0u16; 32],
+                                    consulted_value: [0u16; 32],
+                                    any_champion: false,
+                                    recordable: true,
+                                    conflicted: false,
+                                    bound_seen: !it.unbound,
+                                    state_reads: 0,
+                                    items_at_open: stats.items,
+                                });
+                            }
+                            continue 'items;
+                        }
+                        stats.side_partitions += 1;
+                        let class_min =
+                            if no_change != 0 { no_change.trailing_zeros() as u16 } else { 32 };
+                        let shift = side_mask.trailing_zeros() as u16;
+                        let mut pushed = 0u32;
+                        for raw in 0..32u16 {
+                            if allowed >> raw as u32 & 1 == 0 {
+                                continue;
+                            }
+                            if no_change >> raw as u32 & 1 != 0 {
+                                if raw != class_min {
+                                    continue;
+                                }
+                                let mut child = it;
+                                if no_change.count_ones() == 1 {
+                                    child.decided[fetch_pc] |= side_mask;
+                                    child.value[fetch_pc] |= raw << shift;
+                                    child.constraints.remove(fetch_pc as u8, side_mask);
+                                } else {
+                                    child.constraints.set(fetch_pc as u8, side_mask, no_change);
+                                }
+                                stack.push(child);
+                            } else {
+                                let mut child = it;
+                                child.decided[fetch_pc] |= side_mask;
+                                child.value[fetch_pc] |= raw << shift;
+                                child.constraints.remove(fetch_pc as u8, side_mask);
+                                stack.push(child);
+                            }
+                            stats.forks += 1;
+                            stats.fork_kinds[kind_idx(FieldKind::Side)] += 1;
+                            pushed += 1;
+                        }
+                        if memo_on {
+                            flush_prov(x_prov, y_prov, &mut cnt_prov, &mut osr_cnt_prov, &mut seg_mask);
+                            merge_segment(frames.last_mut().expect("root frame"), &seg_mask, seg_reads, &it.value);
+                            frames.push(Frame {
+                                key: (it.cycle, it.next_input, it.st, it.tags),
+                                decided: it.decided,
+                                // PRE-partition snapshot: frame-open
+                                // knowledge, before the no-change set
+                                // is installed/refined.
+                                constraints: it.constraints,
+                                children_left: pushed,
+                                consulted_mask: [0u16; 32],
+                                consulted_value: [0u16; 32],
+                                any_champion: false,
+                                recordable: true,
+                                conflicted: false,
+                                bound_seen: !it.unbound,
+                                state_reads: 0,
+                                items_at_open: stats.items,
+                            });
+                            // S7: the latch-conditioned classification
+                            // belongs to this fork's own failure claim,
+                            // not only to the enclosing segment.
+                            frames.last_mut().expect("just pushed").merge(
+                                fetch_pc,
+                                side_mask,
+                                it.value[fetch_pc] & side_mask,
+                            );
+                        }
+                        continue 'items;
+                    }
+                }
                 // --- 012 E1: met-now WAIT grouping ------------------
                 // The WaitIdx demand of a gpio/pin WAIT is an
                 // ENVIRONMENT-READ PREDICATE on the select field: the
@@ -4883,7 +5110,9 @@ fn search_impl(
                 // (loop return) re-partitions the CURRENT allowed set
                 // — the met set only shrinks.
                 let mut wait_grouped = false;
-                if wait_idx_groupable(it.decided[fetch_pc], it.value[fetch_pc], side_mask) {
+                let fetch_decided =
+                    it.decided[fetch_pc] | if side_grouped { side_mask } else { 0 };
+                if wait_idx_groupable(fetch_decided, it.value[fetch_pc], side_mask) {
                     let w = it.value[fetch_pc];
                     let (allowed, met) =
                         wait_met_now(&it.constraints, &it.st, &cfg, gpio_in, fetch_pc as u8, w);
@@ -4934,7 +5163,9 @@ fn search_impl(
                                 child.constraints.remove_index(0);
                                 stack.push(child);
                                 stats.forks += 1;
-                                stats.fork_kinds[kind_idx(FieldKind::WaitIdx)] += 1;
+                                let k =
+                                    if om == side_mask { FieldKind::Side } else { FieldKind::WaitIdx };
+                                stats.fork_kinds[kind_idx(k)] += 1;
                                 pushed += 1;
                             }
                             if memo_on {
@@ -5035,7 +5266,7 @@ fn search_impl(
                 if let Some(field) = if wait_grouped {
                     None
                 } else {
-                    demand(it.decided[fetch_pc], it.value[fetch_pc], &cfg)
+                    demand(fetch_decided, it.value[fetch_pc], &cfg)
                 } {
                     // Dead-demand census: classify the fork. A fresh
                     // qualifying fork tags its children (dd_fresh); a
@@ -5932,6 +6163,8 @@ pub fn merge_stats(into: &mut Stats, s: &Stats) {
     into.merge_conflicts += s.merge_conflicts;
     into.wait_partitions += s.wait_partitions;
     into.wait_all_met += s.wait_all_met;
+    into.side_partitions += s.side_partitions;
+    into.side_all_no_change += s.side_all_no_change;
     into.constraint_overflows += s.constraint_overflows;
     into.walk_wait_continues += s.walk_wait_continues;
     into.walk_wait_bails += s.walk_wait_bails;
