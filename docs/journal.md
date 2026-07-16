@@ -4,6 +4,35 @@
 > on 2026-07-04. Not required reading — search it for provenance when needed.
 > Current state lives in `STATUS.md`; durable design in `docs/architecture.md`.
 
+## 2026-07-16 (early) — w02 REFUTED: L=3 ladder COMPLETE (6/6) — footprint ≤3 impossible for tx_a
+
+- 0..2 monster finished 23:23 (9,982s resumed segment; run header rev
+  024bb2a clean, resume accepted at 1,043,952 settled). Final:
+  426.66B items, 372.42B refuted, 814.3M memo hits, champions=0,
+  cap_hit=false, all 1,383,452 units settled.
+- **Ladder close-out: 0..0, 0..1, 1..1, 2..2, 1..2, 0..2 all REFUTED
+  → no 3-slot tx_a program exists (current-fidelity semantics). L=4
+  rediscovery ladder unlocks.**
+- Mined + orbit-joined (docs/analysis/w02-mining-and-orbits.md; seeds
+  re-derived with a pre-E1 dump_seeds built at eb0b801 in a scratch
+  worktree — post-E1 master decomposes to 1,113,608 units, NOT the
+  trace's 1,383,452; the runtree was not touched).
+- Ticket 012 prediction slot filled: duplicate fraction 63.4% vs
+  predicted "well below 71%" — **wrong in spirit**. Prologue story
+  dead, mass survived by mutating: delay-only 18.1%→28.8% (now the
+  largest class), the 126-word no-op alphabet reappeared IN-LOOP
+  (7×126 orbits, 24.5%). Alphabet is loop-invariant, not
+  prologue-specific → E1 + 013 apply to all brackets.
+- CL7 (d≡d+24) now seen on STALLING waits: the two heaviest units in
+  the bracket (581417/1273143, 517.3M items each, byte-identical) are
+  `wait 1 irq 0` seeds whose decided delay bits differ by exactly 24 —
+  the 013 v2 shift-absorption shape at the top of the cost table.
+- Scheduling profile matches w12 (top 1% ≈ 91% CPU, max unit ~3% of
+  ideal wall) — recursive-split verdict unchanged. NOTE: effective-
+  cores metric is meaningless on resumed traces (wall covers only the
+  resumed segment).
+- Monitor + scratch worktree cleaned up.
+
 ## 2026-07-15 (night) — 012 E1 LANDED: met-now WAIT grouping + constraint substrate; −35.7% L=2, −18.5% L=3
 
 User rulings: E1 = 012's new stage 1 (ticket amended ff09d71);

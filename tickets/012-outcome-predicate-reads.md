@@ -144,7 +144,18 @@ micro-spec FIRST, per §3.
 - Prediction logged pre-measurement (falsifiable): w02 (wrap 0..2, NO
   prologue slot) should show duplicate-CPU fraction well below w12's
   71%. Record the measured value here when the trace is mined:
-  **[PENDING — w02 lands ~2026-07-15 22:45]**.
+  **MEASURED 2026-07-15: 63.4% — prediction WRONG in spirit.** The
+  fraction fell only 7.7 points. The prologue *story* died with the
+  prologue (w12's ~87%-of-redundancy prologue-respelling class cannot
+  exist in w02), but the redundant mass largely survived by changing
+  shape: the s0:delay-only class GREW 18.1%→28.8%, and the 126-word
+  no-op alphabet reappeared at slot 0 *inside the loop* (7×126-unit
+  orbits, 24.5% of redundant CPU) — the alphabet is loop-invariant,
+  not prologue-specific. Consequence: E1's met-now grouping (which
+  collapses the 124 satisfied-WAIT members) and 013 (delay classes)
+  matter for ALL brackets, not just prologue-bearing ones; the
+  delay-only/self-sync class (013 v2) is now the single largest named
+  redundancy class. Details: docs/analysis/w02-mining-and-orbits.md.
 
 ---
 

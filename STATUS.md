@@ -1,84 +1,63 @@
 # STATUS — current frontier
 
 > REWRITTEN each session (not appended). History → `docs/journal.md`.
-> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-15 (evening).
+> Durable design/lessons → `docs/architecture.md`. Last updated 2026-07-16 (early).
 
-## L=3 ladder: 5 of 6 PROVEN — only 0..2 still running
+## L=3 LADDER COMPLETE: 6/6 REFUTED — footprint ≤3 IMPOSSIBLE for tx_a
 
-**1..2 REFUTED** (2026-07-15, 9.7h): 363.97B items, 657.1M memo hits,
-cap_hit=false, all 1,383,452 units settled. 0..0, 0..1, 1..1, 2..2
-already proven. **If 0..2 refutes: footprint ≤3 impossible for tx_a;
-L=4 rediscovery ladder unlocks.**
+0..2 landed 2026-07-15 23:23 REFUTED (426.66B items, champions=0,
+cap_hit=false, all 1,383,452 units settled; run rev 024bb2a clean).
+All six wrap brackets proven. Caveat as always: current-fidelity
+semantics (post shift-counter fix). **L=4 rediscovery ladder is
+unlocked.** No run in flight; box is idle.
 
-## RUN RESUMED: 0..2 monster (unit `pio-l3-w02-resume2`), ETA ~00:40
+## w02 mined (docs/analysis/w02-mining-and-orbits.md)
 
-Paused 75.5%→resumed ~22:10 from the runtree (launch binary, header
-accepted at 1,043,952 settled). systemd-run needs
-`-p WorkingDirectory=<runtree>/pio_superopt` (units do NOT inherit
-shell cwd — the first resume attempt failed on that). Old engine on
-purpose; do NOT rebuild the runtree binary.
+- 012 prediction slot filled: duplicate CPU 63.4% (predicted "well
+  below 71%" — WRONG in spirit). Prologue story dead; mass mutated:
+  **delay-only class 18.1%→28.8% (largest)**; the 126-word no-op
+  alphabet reappeared IN-LOOP (7×126 orbits, 24.5%) → alphabet is
+  loop-invariant; E1 + 013 apply to ALL brackets.
+- **CL7 (d≡d+24) now on STALLING waits**: the bracket's two heaviest
+  units (517.3M items each, byte-identical) are `wait 1 irq 0` seeds
+  24 apart in delay — the 013 v2 shift-absorption shape at the top of
+  the cost table. Verification is cheap and unlocks v2's evidence gate.
+- Scheduling profile = w12 (top 1% ≈ 91% CPU); recursive-split verdict
+  unchanged. Effective-cores metric is bogus on resumed traces.
+- Reproduction gotcha: orbit joins for pre-E1 traces need a pre-E1
+  dump_seeds (post-E1 master → 1,113,608 units ≠ trace's 1,383,452).
 
-## 012 STAGE E1 LANDED + MERGED (9b5ded1) — engine now constraint-capable
+## 012 E1 merged (9b5ded1) — see journal 07-15 for verification detail
 
-Met-now WAIT grouping + full value-set constraint substrate (Item/
-Champion/seeds/memo set-conds with P⊆S probing/frame-open drop rule/
-junk_walk contract). Independently verified after agent handoff:
-full suite green (77+2+6+16+11), L=2 smokes byte-identical
-(0..1 29,055,279 / 1..1 21,591,943, −35.7%/−35.8%), L=3 gates
-0..1 700.56M→571.12M (−18.5%, 25s) / 1..1 632.8M→510.90M (−19.3%,
-21s), verdicts unchanged everywhere, frontier −19.5%. Red-green
-S1-analog canary pinned (31/32 champions lost under the wrong
-variant). irq-absence puzzle RESOLVED with measurement (jmp-back
-re-execution; see ticket 012). NOTE: 008 §3b re-measurement trigger
-fired AGAIN (partition adds ≤32 still_stalled calls per WaitIdx
-demand). Known flaky: lib gene_search hung once at --test-threads=4.
-
-## w12 trace mined (docs/analysis/narrow-split-w12-unit-mining.md)
-
-- **Recursive-unit-split driver: NOT justified** — 28.0/28 effective
-  cores, max unit 3.1% of wall. At L=4 prefer deeper frontier cycle.
-- **71.1% of CPU was byte-identical repeat subtrees**; seed-orbit
-  analysis (docs/analysis/w12-seed-orbits.md) NAMED it: **~87% of the
-  redundant mass is slot-0 PROLOGUE respelling** — satisfied-WAIT
-  no-ops (CL3, config-exact: pin-idle map + DE + irq stim all
-  visible in the exclusions), self-moves (CL1/CL6), and a d ≡ d+24
-  delay congruence (new CL7, spec-period, unverified). Lever = seed
-  quotient before phase 2 via proven rules; CL3 needs equiv()
-  supported_config extension (tx_a blocked on it → raises queue #5).
-- Fork attribution: Delay 73.1%, BitCount 11.8%, WaitIdx 4.8%.
-- Unit-keying soundness checked: identical unit counts across w12/w02
-  are benign (wrap-back invisible on a 2-cycle prefix; units re-run
-  the full spec with true wrap).
+L=2 −35.7%/−35.8%, L=3 −18.5%/−19.3%, frontier −19.5%, verdicts
+unchanged. Wall-clock magnitude gates now UNBLOCKED (box idle).
+008 §3b re-measurement trigger has fired twice.
 
 ## Queued (priority order)
 
-1. **Bank 0..2 verdict when it lands** (~22:30); then STATUS/journal/
-   memory + ladder close-out. Mine its trace:
-   `python3 tools/mine_narrow_split.py <trace>` (stdout only, never
-   into runs/).
-2. DONE (seed orbits named — see above). Follow-ups: verify the 24-
-   cycle congruence against spec.expected (cheap); confirm self-sync
-   mechanism on one delay-only group; then DISCUSS seed-quotient
-   lever design (one-way door: verdict replication across proven-
-   equivalent seeds).
-3. T1 open follow-up: adversarial rig for tag-blind projection.
-4. 012 stage 1 (JMP zero-test predicates on tags).
-5. Mirror config-coverage extension for equiv() — now doubly
-   motivated (CL3-with-preconditions on tx_a config is the seed-
-   quotient's proof engine); then rule library.
-6. 008 §3b re-measurement (trigger fired); sequential instrumented
-   1..2 slice; ≤4 impossibility re-proof via equiv; runner header
-   rev-pinning fix (build-time rev, see mining doc §5).
+1. **013 evidence gate + v1 build** (user-ruled next engine work):
+   verify CL7 24-cycle congruence against spec.expected + step the
+   emulator on one delay-only group (self-sync) and on the wait-irq
+   twins; then v1 (constant-read windows). Delay is 74% of forks and
+   delay-shaped classes are ~60% of redundant CPU — top lever.
+2. E1 idle-box wall-clock magnitude gates + 008 §3b re-measurement
+   (revert 95b1b32 to test) — box is now free; fold into the first
+   013 measurement session to amortize setup.
+3. L=4 ladder design: deeper frontier cycle (3+) before recursive
+   split; decide bracket order; seed-quotient DISCUSSION (one-way
+   door: verdict replication across proven-equivalent seeds) —
+   equiv() supported_config extension is its proof engine.
+4. T1 adversarial rig for tag-blind projection; 012 stage 2 (JMP
+   zero-tests); runner header rev-pinning fix (build-time rev).
 
 ## Ops rules
 
 Big searches serialized + gated (systemd-run --user, MemoryMax=48G,
 MemorySwapMax=0). Magnitude gates = idle-box WALL-CLOCK + items.
 `systemctl --user` unreliable from monitor shells — use log mtime.
-Runner resume: same command, same rev, same params.
-**Runtree convention (2026-07-15): long runs LAUNCH FROM and RESUME
-FROM `../pio_optimization.runtree`** — before each launch, `git -C
-../pio_optimization.runtree checkout <launch rev>` and build (or copy)
-the binary there; the run's resume identity (runtime HEAD + dirty) is
-then pinned to the runtree, and master/main tree stay free. Never
-commit/build in the runtree mid-run. Details: docs/architecture.md.
+systemd-run units do NOT inherit shell cwd — pass
+`-p WorkingDirectory=`. Runner resume: same command, same rev, same
+params. **Runtree convention: long runs LAUNCH FROM and RESUME FROM
+`../pio_optimization.runtree`** — checkout the launch rev there, build
+there, never commit/build in it mid-run. Details: docs/architecture.md.
+Known flaky: lib gene_search hung once at --test-threads=4.
